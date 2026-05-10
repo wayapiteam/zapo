@@ -9,12 +9,19 @@ import type { Logger } from '@infra/log/types'
 import { PromiseDedup } from '@infra/perf/PromiseDedup'
 import { ensureMessageSecret } from '@message'
 import {
+    isSendMediaMessage,
+    isSendTextMessage,
     needsSecretPersistence,
     resolveEditAttr,
     resolveEncMediaType,
     resolveMessageTypeAttr,
     resolveMetaAttrs
 } from '@message/content'
+import {
+    applyContextInfo,
+    resolveSendContextInfo,
+    type WaSendContextInfo
+} from '@message/context-info'
 import { wrapDeviceSentMessage } from '@message/device-sent'
 import { type IcdcMeta, injectDeviceListMetadata, resolveIcdcMeta } from '@message/icdc'
 import { writeRandomPadMax16 } from '@message/padding'
@@ -90,7 +97,8 @@ interface WaMessageDispatchCoordinatorOptions {
     readonly sendNewsletterMessage?: (
         newsletterJid: string,
         content: WaSendMessageContent,
-        options: WaSendMessageOptions
+        options: WaSendMessageOptions,
+        contextInfo: WaSendContextInfo | null
     ) => Promise<WaMessagePublishResult>
     readonly getIcdcHashLength?: () => number
     readonly mobileMessageIdFormat?: boolean
@@ -134,7 +142,8 @@ export class WaMessageDispatchCoordinator {
         | ((
               newsletterJid: string,
               content: WaSendMessageContent,
-              options: WaSendMessageOptions
+              options: WaSendMessageOptions,
+              contextInfo: WaSendContextInfo | null
           ) => Promise<WaMessagePublishResult>)
         | undefined
     private readonly getIcdcHashLength: (() => number) | undefined
@@ -294,14 +303,29 @@ export class WaMessageDispatchCoordinator {
             if (!this.sendNewsletterMessage) {
                 throw new Error('newsletter sendMessage requires sendNewsletterMessage dependency')
             }
+            const newsletterCtx = resolveSendContextInfo({
+                contentLevel: pickContentContextInfo(content),
+                optionsLevel: options.contextInfo,
+                quote: options.quote,
+                forward: options.forward,
+                mentions: options.mentions
+            })
+            assertNewsletterContextInfoCompatible(newsletterCtx)
             const sendOptions = await this.withResolvedMessageId(options)
-            return this.sendNewsletterMessage(recipientJid, content, sendOptions)
+            return this.sendNewsletterMessage(recipientJid, content, sendOptions, newsletterCtx)
         }
         const [built, sendOptions] = await Promise.all([
             this.buildMessageContent(content),
             this.withResolvedMessageId(options)
         ])
-        const message = built.message
+        const ctx = resolveSendContextInfo({
+            contentLevel: pickContentContextInfo(content),
+            optionsLevel: options.contextInfo,
+            quote: options.quote,
+            forward: options.forward,
+            mentions: options.mentions
+        })
+        const message = ctx ? applyContextInfo(built.message, ctx) : built.message
         const upload = built.upload
         const messageWithSecret = await ensureMessageSecret(message)
         const rawSecret = messageWithSecret.messageContextInfo?.messageSecret
@@ -1264,5 +1288,27 @@ export class WaMessageDispatchCoordinator {
             return meJid
         }
         throw new Error(`${context} requires registered meJid`)
+    }
+}
+
+function pickContentContextInfo(content: WaSendMessageContent): WaSendContextInfo | undefined {
+    if (typeof content !== 'object' || content === null) return undefined
+    if (isSendTextMessage(content) || isSendMediaMessage(content)) {
+        return content.contextInfo
+    }
+    return undefined
+}
+
+function assertNewsletterContextInfoCompatible(ctx: WaSendContextInfo | null): void {
+    if (!ctx) return
+    const unsupported: string[] = []
+    if (ctx.quotedMessageId !== undefined) unsupported.push('quote')
+    if (ctx.mentionedJids?.length) unsupported.push('mentions')
+    if (ctx.isSpoiler === true) unsupported.push('isSpoiler')
+    if (ctx.groupSubject !== undefined || ctx.parentGroupJid !== undefined) {
+        unsupported.push('group invite reply (groupSubject/parentGroupJid)')
+    }
+    if (unsupported.length > 0) {
+        throw new Error(`newsletter sends do not support: ${unsupported.join(', ')}`)
     }
 }
