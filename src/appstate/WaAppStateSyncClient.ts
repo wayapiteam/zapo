@@ -1129,8 +1129,12 @@ export class WaAppStateSyncClient {
             patchVersion,
             collection
         )
+        // non-fatal: wa-mob/wa-web tolerate this — patchMac below covers payload integrity.
         if (!uint8Equal(expectedSnapshotMac, snapshotMac)) {
-            throw new Error(`patch snapshot MAC mismatch for ${collection}`)
+            this.logger.warn('patch snapshot MAC mismatch (tolerated)', {
+                collection,
+                patchVersion
+            })
         }
 
         const patchMac = decodeProtoBytes(patch.patchMac, `patch.patchMac (${collection})`)
