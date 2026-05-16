@@ -11,13 +11,41 @@ type PinoLikeLogger = {
 
 type PinoFactory = (options?: Readonly<Record<string, unknown>>) => PinoLikeLogger
 
+export interface PinoPrettyOptions {
+    readonly colorize?: boolean
+    readonly colorizeObjects?: boolean
+    readonly translateTime?: boolean | string
+    readonly ignore?: string
+    readonly include?: string
+    readonly singleLine?: boolean
+    readonly hideObject?: boolean
+    readonly levelFirst?: boolean
+    readonly messageKey?: string
+    readonly messageFormat?: string
+    readonly timestampKey?: string
+    readonly levelKey?: string
+    readonly levelLabel?: string
+    readonly minimumLevel?: LogLevel
+    readonly errorLikeObjectKeys?: readonly string[]
+    readonly errorProps?: string
+    readonly customColors?: string
+    readonly customLevels?: string
+    readonly useOnlyCustomProps?: boolean
+    readonly crlf?: boolean
+    readonly destination?: number | string
+    readonly append?: boolean
+    readonly mkdir?: boolean
+    readonly sync?: boolean
+    readonly [key: string]: unknown
+}
+
 export interface PinoLoggerOptions {
     readonly level?: LogLevel
     readonly name?: string
     readonly base?: Readonly<Record<string, unknown>> | null
     readonly pinoOptions?: Readonly<Record<string, unknown>>
     readonly pretty?: boolean
-    readonly prettyOptions?: Readonly<Record<string, unknown>>
+    readonly prettyOptions?: PinoPrettyOptions
 }
 
 const PINO_MODULE = 'pino'
