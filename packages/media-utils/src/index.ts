@@ -3,6 +3,7 @@ import type { WaMediaProcessor, WaMediaProcessorInput } from 'zapo-js/media'
 import {
     computeWaveformWithFfmpeg,
     generateVideoThumbnailWithFfmpeg,
+    normalizeVoiceNoteWithFfmpeg,
     probeWithFfmpeg
 } from './ffmpeg'
 import { generateImageThumbnail, generateStickerThumbnail } from './sharp'
@@ -38,6 +39,16 @@ export function createMediaProcessor(options?: WaMediaProcessorOptions): WaMedia
 
         async computeWaveform(input: WaMediaProcessorInput) {
             return computeWaveformWithFfmpeg(input, opts.ffmpegPath, opts.waveformPoints, warn)
+        },
+
+        async normalizeVoiceNote(input: WaMediaProcessorInput) {
+            return normalizeVoiceNoteWithFfmpeg(input, {
+                bitRate: opts.voiceNoteBitRate,
+                sampleRate: opts.voiceNoteSampleRate,
+                application: opts.voiceNoteApplication,
+                ffmpegPath: opts.ffmpegPath,
+                onWarning: warn
+            })
         },
 
         async generateStickerThumbnail(input: WaMediaProcessorInput, maxEdge: number) {

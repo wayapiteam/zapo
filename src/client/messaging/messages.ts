@@ -12,7 +12,8 @@ import {
     readFileHead,
     resolveMediaInputs,
     runMediaProcessor,
-    selectMediaUploadHost
+    selectMediaUploadHost,
+    shouldNormalizeVoiceNote
 } from '@client/media'
 import type { ResolvedLinkPreviewResult } from '@client/messaging/link-preview'
 import type { WaMediaOptions } from '@client/types'
@@ -42,8 +43,10 @@ import { proto } from '@proto'
 import { WA_DEFAULTS } from '@protocol/constants'
 import { buildMediaConnIq } from '@transport/node/builders/media'
 import type { BinaryNode } from '@transport/types'
-import { bytesToBase64 } from '@util/bytes'
+import { bytesToBase64, toBytesView } from '@util/bytes'
 import { toError } from '@util/primitives'
+
+const VOICE_NOTE_MIMETYPE = 'audio/ogg; codecs=opus'
 
 export interface WaMediaMessageOptions {
     readonly logger: Logger
@@ -143,6 +146,21 @@ async function buildMediaMessage(
 ): Promise<WaMessageBuildResult> {
     if (content.type === 'sticker-pack') {
         return buildStickerPackMediaMessage(options, content)
+    }
+    if (shouldNormalizeVoiceNote(options.media, content)) {
+        const sourceInput =
+            content.media instanceof ArrayBuffer ? toBytesView(content.media) : content.media
+        try {
+            const normalizedStream =
+                await options.media!.processor!.normalizeVoiceNote!(sourceInput)
+            if (normalizedStream) {
+                content = { ...content, media: normalizedStream, mimetype: VOICE_NOTE_MIMETYPE }
+            }
+        } catch (error) {
+            options.logger.warn('voice note normalize failed, sending original media', {
+                message: toError(error).message
+            })
+        }
     }
     const needsTempFile =
         hasMediaProcessingTasks(options.media, content) ||
