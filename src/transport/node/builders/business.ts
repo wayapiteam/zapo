@@ -1,4 +1,5 @@
-import { WA_DEFAULTS, WA_IQ_TYPES, WA_XMLNS } from '@protocol/constants'
+import { WA_DEFAULTS, WA_IQ_TYPES, WA_NODE_TAGS, WA_XMLNS } from '@protocol/constants'
+import { WA_BUSINESS_NOTIFICATION_TAGS } from '@protocol/notification'
 import { buildIqNode } from '@transport/node/query'
 import type { BinaryNode } from '@transport/types'
 
@@ -144,6 +145,14 @@ export type BuildCoverPhotoIqInput =
           readonly op: 'delete'
           readonly id: string
       }
+
+export function buildGetBusinessUsyncQueryNode(): BinaryNode {
+    return {
+        tag: WA_NODE_TAGS.BUSINESS,
+        attrs: {},
+        content: [{ tag: WA_BUSINESS_NOTIFICATION_TAGS.VERIFIED_NAME, attrs: {} }]
+    }
+}
 
 export function buildCoverPhotoIq(input: BuildCoverPhotoIqInput): BinaryNode {
     const attrs: Record<string, string> =
