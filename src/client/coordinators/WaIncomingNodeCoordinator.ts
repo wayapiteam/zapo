@@ -21,9 +21,9 @@ import type {
     WaAccountTakeoverNoticeEvent,
     WaBusinessEvent,
     WaGroupEvent,
-    WaIncomingBaseEvent,
     WaIncomingCallEvent,
     WaIncomingChatstateEvent,
+    WaIncomingErrorStanzaEvent,
     WaIncomingFailureEvent,
     WaIncomingNodeHandler,
     WaIncomingNodeHandlerRegistration,
@@ -40,6 +40,7 @@ import type { Logger } from '@infra/log/types'
 import {
     WA_IQ_TYPES,
     WA_MESSAGE_TAGS,
+    WA_MESSAGE_TYPES,
     WA_NODE_TAGS,
     WA_NOTIFICATION_TYPES,
     WA_SIGNALING
@@ -81,7 +82,7 @@ interface WaIncomingNodeRuntime {
     readonly emitIncomingChatstate: (event: WaIncomingChatstateEvent) => void
     readonly emitIncomingCall: (event: WaIncomingCallEvent) => void
     readonly emitIncomingFailure: (event: WaIncomingFailureEvent) => void
-    readonly emitIncomingErrorStanza: (event: WaIncomingBaseEvent) => void
+    readonly emitIncomingErrorStanza: (event: WaIncomingErrorStanzaEvent) => void
     readonly emitIncomingNotification: (event: WaIncomingNotificationEvent) => void
     readonly emitMexNotification: (event: WaMexNotificationEvent) => void
     readonly emitRegistrationCode: (event: WaRegistrationCodeEvent) => void
@@ -291,7 +292,10 @@ export class WaIncomingNodeCoordinator {
     }
 
     private isRetryReceiptType(type: string | undefined): boolean {
-        return type === 'retry' || type === 'enc_rekey_retry'
+        return (
+            type === WA_MESSAGE_TYPES.RECEIPT_TYPE_RETRY ||
+            type === WA_MESSAGE_TYPES.RECEIPT_TYPE_ENC_REKEY_RETRY
+        )
     }
 
     private registerDefaultIncomingHandlers(): void {
@@ -424,7 +428,11 @@ export class WaIncomingNodeCoordinator {
             tag: WA_NODE_TAGS.ERROR,
             // eslint-disable-next-line @typescript-eslint/require-await
             handler: async (node) => {
-                runtime.emitIncomingErrorStanza(createIncomingBaseEvent(node))
+                runtime.emitIncomingErrorStanza({
+                    ...createIncomingBaseEvent(node),
+                    code: parseOptionalInt(node.attrs.code),
+                    text: node.attrs.text
+                })
                 return true
             }
         })
