@@ -121,7 +121,8 @@ Each package's README has the install + config + integration notes.
 ## Documentation
 
 - **[zapo.to](https://zapo.to/)** - guides, full API reference, examples,
-  protocol notes
+  protocol notes ([llms.txt](https://zapo.to/llms.txt) index or
+  [llms-full.txt](https://zapo.to/llms-full.txt) for LLM context)
 - **[`vinikjkkj/zapo-docs`](https://github.com/vinikjkkj/zapo-docs)** -
   source of zapo.to (open issues/PRs there for doc fixes)
 - **Per-package READMEs** under [`packages/`](packages/) - one per
