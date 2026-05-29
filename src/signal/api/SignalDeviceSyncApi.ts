@@ -203,7 +203,52 @@ export class SignalDeviceSyncApi {
             users: result.length,
             found
         })
+        await this.propagateAltUserJids(result)
         return result
+    }
+
+    /**
+     * Enriches existing device-list snapshots with the resolved LID equivalents
+     * so {@link WaDeviceListStore.findByAnyUserJid} can later match a retry
+     * receipt arriving in LID form against an eligible list stored in PN form
+     * (and vice versa). Skips users with no cached snapshot — the alt gets
+     * recorded on the next {@link syncDeviceList} sweep.
+     */
+    private async propagateAltUserJids(results: readonly SignalLidSyncResult[]): Promise<void> {
+        if (!this.deviceListStore || results.length === 0) return
+        const nowMs = Date.now()
+        const lidByPhoneJid = new Map<string, string>()
+        const phoneJids: string[] = []
+        for (const entry of results) {
+            if (entry.lidJid && entry.phoneJid) {
+                lidByPhoneJid.set(entry.phoneJid, entry.lidJid)
+                phoneJids.push(entry.phoneJid)
+            }
+        }
+        if (phoneJids.length === 0) return
+        const existing = await this.deviceListStore.getUserDevicesBatch(phoneJids, nowMs)
+        const updates: {
+            readonly userJid: string
+            readonly altUserJid: string
+            readonly deviceJids: readonly string[]
+            readonly updatedAtMs: number
+        }[] = []
+        for (let index = 0; index < phoneJids.length; index += 1) {
+            const snapshot = existing[index]
+            if (!snapshot) continue
+            const phoneJid = phoneJids[index]
+            const lidJid = lidByPhoneJid.get(phoneJid)
+            if (!lidJid || snapshot.altUserJid === lidJid) continue
+            updates.push({
+                userJid: snapshot.userJid,
+                altUserJid: lidJid,
+                deviceJids: snapshot.deviceJids,
+                updatedAtMs: nowMs
+            })
+        }
+        if (updates.length > 0) {
+            await this.deviceListStore.upsertUserDevicesBatch(updates)
+        }
     }
 
     private async collectUsersToQuery(
