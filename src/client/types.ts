@@ -427,10 +427,14 @@ export interface WaIncomingNodeHandlerRegistration {
 export type WaIncomingStanzaFilter = (node: BinaryNode) => boolean | Promise<boolean>
 
 export interface WaIncomingBaseEvent {
+    /** The raw decoded stanza, kept for forward-compat parsing of fields the typed event does not expose. */
     readonly rawNode: BinaryNode
     readonly stanzaId?: string
+    /** Resolved from the stanza's `from` attr. */
     readonly chatJid?: string
+    /** Inner-payload discriminator (notification subtype, message kind, ...). */
     readonly stanzaType?: string
+    /** `true` when the stanza arrived as part of an offline catch-up batch rather than live. */
     readonly offline?: boolean
 }
 
@@ -467,6 +471,7 @@ export interface WaIncomingMessageEvent extends Omit<WaIncomingBaseEvent, 'chatJ
      * old top-level `chatJid`/`stanzaId`.
      */
     readonly key: WaIncomingMessageKey
+    /** Stanza `t` attr (seconds since epoch). */
     readonly timestampSeconds?: number
     /**
      * Disappearing-message TTL the sender attached to this message, in seconds.
@@ -475,8 +480,16 @@ export interface WaIncomingMessageEvent extends Omit<WaIncomingBaseEvent, 'chatJ
      * not ephemeral.
      */
     readonly expirationSeconds?: number
+    /** Sender's display name from the stanza's `notify` attr. */
     readonly pushName?: string
+    /**
+     * Signal envelope used to decrypt this message: `'pkmsg'` (PreKeySignalMessage),
+     * `'msg'` (1:1 SignalMessage), `'skmsg'` (group sender-key), `'msmsg'`
+     * (Meta-AI streaming), `'placeholder_recovery'` (retry-recovered placeholder),
+     * or `'plaintext'` (newsletter, no Signal layer).
+     */
     readonly encryptionType?: string
+    /** Decrypted bytes before protobuf parsing. Kept so consumers can re-derive addon decryption material. */
     readonly plaintext?: Uint8Array
     readonly message?: Proto.IMessage
 }
@@ -497,7 +510,9 @@ export interface WaIncomingReceiptEvent extends WaIncomingBaseEvent {
 
 export interface WaIncomingPresenceEvent extends WaIncomingBaseEvent {
     readonly type: IncomingPresenceType
+    /** Only populated for 1:1 chats when `type === 'unavailable'` and the peer ships a `last` attr. */
     readonly lastSeen?: PresenceLastSeen
+    /** Only populated for group JIDs. Falls back to `0` when the server marks the group `unavailable`. */
     readonly groupOnlineCount?: number
 }
 
@@ -516,7 +531,7 @@ export interface WaIncomingCallEvent extends WaIncomingBaseEvent {
     readonly callId?: string
     /** JID of the device that initiated the call. */
     readonly callCreatorJid?: string
-    /** Sender LID of the call stanza, when present. */
+    /** `sender_lid` attr from the outer `<call>` stanza – distinct from `callCreatorJid` which lives on the inner payload. */
     readonly senderLidJid?: string
     /** Phone-number JID of the caller, when present. */
     readonly callerPnJid?: string
@@ -527,7 +542,9 @@ export interface WaIncomingCallEvent extends WaIncomingBaseEvent {
     readonly callerUsername?: string
     readonly callerCountryCode?: string
     readonly callerPushName?: string
+    /** Peer platform string from the outer call stanza. */
     readonly peerPlatform?: string
+    /** Peer app version string from the outer call stanza. */
     readonly peerAppVersion?: string
     /** Stanza timestamp (`t` attr, seconds since epoch). */
     readonly timestampSeconds?: number
@@ -541,7 +558,14 @@ export interface WaIncomingCallEvent extends WaIncomingBaseEvent {
 
 export interface WaIncomingNotificationEvent extends WaIncomingBaseEvent {
     readonly notificationType?: string
+    /**
+     * Routing bucket the lib chose: `'core'` (a typed handler exists – this debug event
+     * mirrors it), `'out_of_scope'` (recognized server type intentionally not modeled),
+     * `'unknown'` (server type the lib has not seen), or `'info_bulletin'` (the dedicated
+     * `info_bulletin` notification type).
+     */
     readonly classification?: 'core' | 'out_of_scope' | 'unknown' | 'info_bulletin'
+    /** Decoded payload bag for notifications without a dedicated typed event. */
     readonly details?: Readonly<Record<string, unknown>>
 }
 
@@ -612,6 +636,7 @@ export interface WaMexUsernameDeleteEvent extends WaMexNotificationBaseFields {
     readonly kind: 'username_delete'
     readonly operationName: 'UsernameDeleteNotification'
     readonly lidJid: string
+    /** `null` when the server omits the fallback display name (treat as cleared). */
     readonly displayName: string | null
 }
 
@@ -625,6 +650,7 @@ export interface WaMexOwnUsernameSyncEvent extends WaMexNotificationBaseFields {
     readonly kind: 'own_username_sync'
     readonly operationName: 'AccountSyncUsernameNotification'
     readonly ownLidJid: string
+    /** `null` means the username was removed. */
     readonly username: string | null
     readonly state: string | null
     readonly pin: string | null
@@ -634,7 +660,9 @@ export interface WaMexTextStatusUpdateEvent extends WaMexNotificationBaseFields 
     readonly kind: 'text_status_update'
     readonly operationName: 'TextStatusUpdateNotification'
     readonly jid: string
+    /** `null` clears the status. */
     readonly text: string | null
+    /** `null` clears the emoji. */
     readonly emoji: string | null
     readonly ephemeralDurationSec: number | null
     readonly lastUpdateTime: number | null
@@ -674,6 +702,7 @@ export interface WaMexMessageCappingEvent extends WaMexNotificationBaseFields {
 }
 
 export interface WaMexNotificationUnknownEvent extends WaMexNotificationBaseFields {
+    /** Catch-all bucket for any `operationName` without a typed variant. */
     readonly kind: 'unknown'
     readonly data: unknown
 }
@@ -691,12 +720,15 @@ export type WaMexNotificationEvent =
 
 export interface WaRegistrationCodeEvent extends WaIncomingBaseEvent {
     readonly code: string
+    /** Expiry deadline (ms since epoch). */
     readonly expiryTimestampMs: number
     readonly fromDeviceId: string
 }
 
 export interface WaAccountTakeoverNoticeEvent extends WaIncomingBaseEvent {
+    /** Opaque token to feed back into the takeover-decision API. */
     readonly serverToken: string
+    /** Ms since epoch. */
     readonly attemptTimestampMs: number
     readonly newDeviceName?: string
     readonly newDevicePlatform?: string
@@ -721,8 +753,11 @@ export interface WaIncomingAddonEvent extends Omit<WaIncomingBaseEvent, 'chatJid
      */
     readonly key: WaIncomingMessageKey
     readonly kind: WaAddonKind
+    /** Stanza id of the parent message this addon attaches to. */
     readonly targetMessageId: string
+    /** Decoded addon payload (shape varies per `kind`). */
     readonly decrypted: WaDecodedAddon
+    /** Parent proto message the addon was extracted from. */
     readonly raw: Proto.IMessage
 }
 
@@ -733,16 +768,19 @@ export interface WaIncomingBotChunkEvent extends Omit<WaIncomingBaseEvent, 'chat
      * / `senderJid`.
      */
     readonly key: WaIncomingMessageKey
+    /** Stanza id of the parent bot reply the chunks reassemble into. */
     readonly targetMessageId: string
     readonly editType: WaBotMsgEditType
     readonly editTargetId?: string
     readonly saltId: string
+    /** Decrypted bytes for this chunk – concat in arrival order until `editType` is `'full'` or `'last'`. */
     readonly plaintext: Uint8Array
     readonly message: Proto.IMessage
     readonly raw: Proto.IMessage
 }
 
 export interface WaIncomingFailureEvent extends WaIncomingBaseEvent {
+    /** Server-side reason number (`reason` attr). Drives the client's logout/disconnect behavior – specific values trigger credential wipe. */
     readonly failureReason?: number
     readonly failureCode?: number
     readonly failureMessage?: string
@@ -750,6 +788,7 @@ export interface WaIncomingFailureEvent extends WaIncomingBaseEvent {
 }
 
 export interface WaIncomingUnhandledStanzaEvent extends WaIncomingBaseEvent {
+    /** Short reason describing why the dispatcher did not match a typed handler. */
     readonly reason: string
 }
 
@@ -759,6 +798,7 @@ export interface WaIncomingErrorStanzaEvent extends WaIncomingBaseEvent {
 }
 
 export interface WaNewsletterPollVoteEntry {
+    /** Hash to match against `pollCreation.options[].optionHash`. */
     readonly optionHash: Uint8Array
     readonly count?: number
 }
@@ -806,6 +846,7 @@ export interface WaIncomingNewsletterEvent extends WaIncomingBaseEvent {
     readonly newsletterJid: string
     readonly action: WaNewsletterEventAction
     readonly subType?: string
+    /** Decoded payload bag for actions without dedicated fields. */
     readonly details?: Readonly<Record<string, unknown>>
 }
 
@@ -850,12 +891,15 @@ export type WaGroupEventAction =
     | 'missing_participant_identification'
 
 export interface WaGroupEventParticipant {
+    /** Primary participant addressing as carried in the stanza – LID or PN. */
     readonly jid?: string
+    /** Role label from the participant's `type` attr (`'admin'`, `'superadmin'`, or absent for plain members). */
     readonly role?: string
     readonly lidJid?: string
     readonly phoneJid?: string
     readonly displayName?: string
     readonly username?: string
+    /** Ephemeral TTL the participant joined under, in seconds (set on `add`). */
     readonly expirationSeconds?: number
 }
 
@@ -863,6 +907,7 @@ export interface WaGroupEventLinkedGroup {
     readonly jid?: string
     readonly subject?: string
     readonly subjectTimestampSeconds?: number
+    /** `true` when the linked subgroup stanza carries a `<hidden_group/>` marker. */
     readonly hiddenSubgroup?: boolean
 }
 
@@ -878,6 +923,7 @@ export interface WaGroupEventSubgroupSuggestion {
     readonly subject?: string
     readonly description?: string
     readonly timestampSeconds?: number
+    /** `true` when the suggestion points at an existing group; `false` when it would create one. */
     readonly isExistingGroup?: boolean
     readonly participantCount?: number
     readonly reason?: string
@@ -969,12 +1015,19 @@ export interface WaBusinessFeatureFlag {
 export interface WaBusinessEvent extends WaIncomingBaseEvent {
     readonly action: WaBusinessEventAction
     readonly timestampSeconds?: number
+    /** Set on `verified_name_update`, `business_removed` (when the stanza identifies the business by JID), and `profile_update` (falls back to the stanza's `from` attr). */
     readonly bizJid?: string
+    /** Certificate / payload hash on `verified_name_stale`, `business_removed` (when identified by hash), and `profile_update` (when the server signals just an unchanged hash). */
     readonly bizHash?: string
+    /** Set on `verified_name_update`. */
     readonly verifiedName?: WaVerifiedNameResult
+    /** Set on `product_update`. */
     readonly productIds?: readonly string[]
+    /** Set on `collection_update`. */
     readonly collections?: readonly WaBusinessCollectionUpdate[]
+    /** Set on `subscriptions_update`. Empty array when the stanza only carries feature flags. */
     readonly subscriptions?: readonly WaBusinessSubscription[]
+    /** Set on `subscriptions_update`. Empty array when the stanza only carries subscriptions. */
     readonly featureFlags?: readonly WaBusinessFeatureFlag[]
 }
 
@@ -982,43 +1035,60 @@ export type WaPictureEventAction = 'set' | 'delete' | 'request' | 'set_avatar'
 
 export interface WaPictureEvent extends WaIncomingBaseEvent {
     readonly action: WaPictureEventAction
+    /** Entity whose picture changed (contact, group, community). */
     readonly targetJid?: string
+    /** Actor that performed the change, when distinct from `targetJid`. */
     readonly authorJid?: string
     readonly timestampSeconds?: number
+    /** Only populated on `action === 'set'`. Pass to the picture-fetch API to download the new bytes. */
     readonly pictureId?: number
     readonly contactHash?: string
 }
 
 export interface WaGroupEvent extends WaIncomingBaseEvent {
+    /** Inner action node, kept for forward-compat parsing of fields the typed event does not expose. */
     readonly rawActionNode: BinaryNode
+    /** Same value as `chatJid` – exposed under the group-specific name for clarity. */
     readonly groupJid?: string
+    /** Actor that triggered the action (`participant` attr on the notification). */
     readonly authorJid?: string
     readonly timestampSeconds?: number
     readonly action: WaGroupEventAction
+    /** Set on add / remove / promote / demote / invite. */
     readonly participants?: readonly WaGroupEventParticipant[]
+    /** Set on `linked_group_*` / `link` / `unlink`. */
     readonly linkedGroups?: readonly WaGroupEventLinkedGroup[]
+    /** Set on `created_membership_requests` / `revoked_membership_requests`. */
     readonly membershipRequests?: readonly WaGroupEventMembershipRequest[]
+    /** Set on `created_sub_group_suggestion` / `revoked_sub_group_suggestions`. */
     readonly subgroupSuggestions?: readonly WaGroupEventSubgroupSuggestion[]
     readonly contextGroupJid?: string
     readonly requestMethod?: string
+    /** Set on `subject`. */
     readonly subject?: string
     readonly subjectOwnerJid?: string
+    /** Set on `description`. */
     readonly description?: string
     readonly descriptionId?: string
+    /** Set on `invite` / `revoke_invite`. */
     readonly code?: string
+    /** Set on `ephemeral`. */
     readonly expirationSeconds?: number
     readonly mode?: string
     readonly enabled?: boolean
     readonly reason?: string
+    /** Decoded payload bag for actions without dedicated fields above. */
     readonly details?: Readonly<Record<string, unknown>>
 }
 
 export interface WaHistorySyncChunkEvent {
+    /** Numeric value of `proto.Message.HistorySyncType` (`RECENT`, `ON_DEMAND`, …). */
     readonly syncType: number
     readonly messagesCount: number
     readonly conversationsCount: number
     readonly pushnamesCount: number
     readonly chunkOrder?: number
+    /** Server-reported progress, 0–100. */
     readonly progress?: number
 }
 
@@ -1051,12 +1121,15 @@ export type WaConnectionEvent =
           readonly reason: WaConnectionOpenReason
           readonly code: null
           readonly isLogout: false
+          /** `true` for the first session after a fresh pair, `false` on resume. */
           readonly isNewLogin: boolean
       }
     | {
           readonly status: 'close'
           readonly reason: WaDisconnectReason
+          /** `null` for client-initiated closes; populated when the server / transport emits one. */
           readonly code: WaConnectionCode | null
+          /** `true` means the device was unlinked – do not reconnect, re-pair. */
           readonly isLogout: boolean
           readonly isNewLogin: false
       }
@@ -1236,13 +1309,17 @@ export interface WaClientEventMap {
 export interface WaOfflineResumeEvent {
     readonly status: 'resuming' | 'complete'
     readonly totalStanzas: number
+    /** `0` on the terminal `'complete'` event. */
     readonly remainingStanzas: number
+    /** `true` when triggered by an explicit catch-up request rather than auto-resume on reconnect. */
     readonly forced: boolean
 }
 
 export interface WaPrivacyTokenUpdateEvent {
+    /** Peer whose trusted-contact-token (TC token) changed. */
     readonly jid: string
     readonly timestampS: number
     readonly type: string
+    /** Live `'notification'` vs. backfill via `'history_sync'`. */
     readonly source: 'notification' | 'history_sync'
 }

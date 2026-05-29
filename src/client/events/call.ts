@@ -18,9 +18,11 @@ export type WaCallType = WaCallPayloadTag | 'unknown'
 const KNOWN_CALL_PAYLOAD_TAGS: ReadonlySet<string> = new Set(Object.values(WA_CALL_PAYLOAD_TAGS))
 
 export interface WaCallGroupParticipant {
+    /** Primary participant addressing inside the call – typically a LID. */
     readonly jid: string
     readonly userPnJid?: string
     readonly username?: string
+    /** Display name for unregistered guests dialled into the call. */
     readonly guestName?: string
 }
 
