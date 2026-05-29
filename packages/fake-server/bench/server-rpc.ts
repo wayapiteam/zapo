@@ -21,6 +21,26 @@ interface RpcResponse {
     readonly error?: string
 }
 
+/**
+ * Shape of a media-receive descriptor that the lib needs to download +
+ * decrypt an inbound media message. Used by {@link peerSendImageMessage}
+ * and {@link peerSendVideoMessage} as the payload sent to the child to
+ * have a FakePeer publish a media-bearing stanza.
+ *
+ * `Uint8Array` fields cross the IPC boundary in place because the child
+ * is forked with `serialization: 'advanced'` (V8 structured clone),
+ * which preserves typed-array byte buffers without the `number[]`
+ * round-trip the default JSON serializer would force.
+ */
+export interface MediaDescriptor {
+    readonly directPath: string
+    readonly mediaKey: Uint8Array
+    readonly fileSha256: Uint8Array
+    readonly fileEncSha256: Uint8Array
+    readonly fileLength: number
+    readonly mimetype?: string
+}
+
 export interface RemotePeerHandle {
     readonly peerId: string
     sendConversation(text: string): Promise<void>
@@ -56,9 +76,15 @@ export class ServerRpc {
 
     public async spawn(): Promise<void> {
         const entry = resolvePath(__dirname, 'server-process.ts')
+        // serialization: 'advanced' switches IPC to V8's structured
+        // clone, which preserves Uint8Array / Buffer in place. Without
+        // it every typed-array crossing the boundary would round-trip
+        // through `number[]` + JSON, inflating memory and CPU for
+        // multi-MB media payloads (publishMediaBlob, peerSend*Message).
         this.child = fork(entry, [], {
             execArgv: ['--import', 'tsx'],
-            stdio: ['pipe', 'inherit', 'inherit', 'ipc']
+            stdio: ['pipe', 'inherit', 'inherit', 'ipc'],
+            serialization: 'advanced'
         })
         this.child.on('message', (msg: RpcResponse & { ready?: boolean }) => {
             if (msg.ready) return // handled by readyPromise
@@ -109,7 +135,10 @@ export class ServerRpc {
             publicKey: new Uint8Array(result.noiseRootCa.publicKey),
             serial: result.noiseRootCa.serial
         }
-        this.mediaProxyAgent = new https.Agent({ rejectUnauthorized: false })
+        // keepAlive: true mirrors what real-world WhatsApp clients do and
+        // matches the in-process FakeWaServer.mediaProxyAgent so the
+        // --separate-process bench numbers stay comparable.
+        this.mediaProxyAgent = new https.Agent({ rejectUnauthorized: false, keepAlive: true })
     }
 
     public async waitForAuthenticatedPipeline(): Promise<void> {
@@ -161,6 +190,7 @@ export class ServerRpc {
     public async createFakePeer(input: {
         jid: string
         skipOneTimePreKey?: boolean
+        enableReplayCache?: boolean
     }): Promise<{ peerId: string }> {
         return (await this.call('createFakePeer', input)) as { peerId: string }
     }
@@ -177,8 +207,115 @@ export class ServerRpc {
         await this.call('ensurePreKeyPool', { requiredHeadroom })
     }
 
-    public async peerSendConversation(peerId: string, text: string): Promise<void> {
-        await this.call('peerSendConversation', { peerId, text })
+    public async peerSendConversation(
+        peerId: string,
+        text: string,
+        options: { id?: string; tamperMode?: 'last-byte-xor-ff' } = {}
+    ): Promise<void> {
+        await this.call('peerSendConversation', {
+            peerId,
+            text,
+            ...(options.id !== undefined ? { id: options.id } : {}),
+            ...(options.tamperMode !== undefined ? { tamperMode: options.tamperMode } : {})
+        })
+    }
+
+    public async peerSendImageMessage(peerId: string, descriptor: MediaDescriptor): Promise<void> {
+        await this.call('peerSendImageMessage', { peerId, descriptor })
+    }
+
+    public async peerSendVideoMessage(peerId: string, descriptor: MediaDescriptor): Promise<void> {
+        await this.call('peerSendVideoMessage', { peerId, descriptor })
+    }
+
+    public async publishMediaBlob(input: {
+        readonly mediaType:
+            | 'image'
+            | 'video'
+            | 'audio'
+            | 'document'
+            | 'sticker'
+            | 'gif'
+            | 'ptt'
+            | 'history'
+            | 'md-app-state'
+        readonly plaintext: Uint8Array
+    }): Promise<{
+        readonly path: string
+        readonly mediaKey: Uint8Array
+        readonly fileSha256: Uint8Array
+        readonly fileEncSha256: Uint8Array
+        readonly fileLength: number
+    }> {
+        return (await this.call('publishMediaBlob', {
+            mediaType: input.mediaType,
+            plaintext: input.plaintext
+        })) as {
+            readonly path: string
+            readonly mediaKey: Uint8Array
+            readonly fileSha256: Uint8Array
+            readonly fileEncSha256: Uint8Array
+            readonly fileLength: number
+        }
+    }
+
+    public async mediaUrl(path: string): Promise<string> {
+        const result = (await this.call('mediaUrl', { path })) as { url: string }
+        return result.url
+    }
+
+    public async peerExpectMessage(
+        peerId: string,
+        timeoutMs = 30_000
+    ): Promise<{ conversation: string | null; encType: 'pkmsg' | 'msg' | 'skmsg' }> {
+        return (await this.call('peerExpectMessage', { peerId, timeoutMs })) as {
+            conversation: string | null
+            encType: 'pkmsg' | 'msg' | 'skmsg'
+        }
+    }
+
+    public async peerReplaySentMessage(
+        peerId: string,
+        originalMsgId: string,
+        options: { resendId?: string } = {}
+    ): Promise<void> {
+        await this.call('peerReplaySentMessage', {
+            peerId,
+            originalMsgId,
+            ...(options.resendId !== undefined ? { resendId: options.resendId } : {})
+        })
+    }
+
+    public async peerRotateForRetry(peerId: string): Promise<void> {
+        await this.call('peerRotateForRetry', { peerId })
+    }
+
+    public async peerSendRetryReceipt(
+        peerId: string,
+        originalMsgId: string,
+        options: {
+            includeKeys?: boolean
+            count?: number
+            receiptId?: string
+            t?: number
+        } = {}
+    ): Promise<void> {
+        await this.call('peerSendRetryReceipt', {
+            peerId,
+            originalMsgId,
+            ...options
+        })
+    }
+
+    public async waitForRetryReceipt(stanzaId: string, timeoutMs = 60_000): Promise<void> {
+        await this.call('waitForRetryReceipt', { stanzaId, timeoutMs })
+    }
+
+    public async waitForRetryReceipts(count: number, timeoutMs = 60_000): Promise<string[]> {
+        const result = (await this.call('waitForRetryReceipts', { count, timeoutMs })) as {
+            ids: string[]
+        }
+        return result.ids
     }
 
     public async peerSendGroupConversation(
