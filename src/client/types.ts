@@ -455,6 +455,36 @@ export interface WaIgnoreKey {
     readonly only?: readonly WaIgnoreStanzaKind[]
 }
 
+/**
+ * Parsed view of an inbound stanza passed to {@link WaIgnoreKeyPredicate}.
+ * Lib derives `kind` from the stanza tag and resolves `fromMe` by comparing
+ * every from-candidate (`from`, `sender_pn`, `sender_lid`) against `meJid`.
+ *
+ * `remoteJid` and `participant` expose the **raw** `from` / `participant`
+ * attrs verbatim and do NOT include the descriptor-style alt-attr lookups
+ * (`sender_pn` / `sender_lid` / `participant_pn` / `participant_lid`) or
+ * PN↔LID normalization. If the predicate needs to match by user identity
+ * regardless of addressing mode, run the raw JID through `parseJidFull` and
+ * compare on `userJid`, or use the descriptor form which handles it.
+ */
+export interface WaIgnoreKeyContext {
+    readonly kind: WaIgnoreStanzaKind
+    /** Raw `from` attr (group JID for groups, PN or LID device JID for 1:1). */
+    readonly remoteJid: string | null
+    readonly fromMe: boolean
+    readonly id: string | undefined
+    /** Raw `participant` attr; `null` for non-group stanzas. */
+    readonly participant: string | null
+}
+
+/**
+ * Predicate form of {@link WaClient.ignoreKey}. Return `true` to drop the
+ * stanza, `false` to let it through. Receives a {@link WaIgnoreKeyContext}
+ * with the raw `from`/`participant` attrs (see the context's JSDoc for the
+ * PN↔LID caveat) plus lib-resolved `kind` and `fromMe`.
+ */
+export type WaIgnoreKeyPredicate = (ctx: WaIgnoreKeyContext) => boolean
+
 export interface WaIncomingBaseEvent {
     /** The raw decoded stanza, kept for forward-compat parsing of fields the typed event does not expose. */
     readonly rawNode: BinaryNode
