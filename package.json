@@ -163,7 +163,7 @@
         "argo-codec": "^0.2.1",
         "pino": "^9.0.0",
         "pino-pretty": "^13.0.0",
-        "ws": "^8.18.3"
+        "ws": "^8.20.1"
     },
     "peerDependenciesMeta": {
         "argo-codec": {
@@ -197,9 +197,20 @@
         "prettier": "^3.8.1",
         "tsc-alias": "^1.8.16",
         "tsx": "^4.20.6",
-        "turbo": "^2.8.20",
+        "turbo": "^2.9.14",
         "typescript": "^5.7.3",
         "typescript-eslint": "^8.56.1",
-        "ws": "^8.18.3"
+        "ws": "^8.20.1"
+    },
+    "overrides": {
+        "ws": "^8.20.1",
+        "qs": "6.15.2",
+        "flatted": "^3.4.2",
+        "picomatch@<2.3.2": "2.3.2",
+        "picomatch@4": "^4.0.4",
+        "brace-expansion@1": "1.1.13",
+        "brace-expansion@2": "^2.0.3",
+        "brace-expansion@4": "^4.0.2",
+        "brace-expansion@5": "^5.0.6"
     }
 }
