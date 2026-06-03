@@ -1,5 +1,18 @@
 # zapo-js
 
+## 1.1.0
+
+### Minor Changes
+
+- Add a standalone `downloadMediaMessage(source, options)` helper that resolves a message's encrypted media payload and streams it from the WhatsApp CDN without a connected `WaClient`, with a per-call proxy option; also export `resolveMediaPayload` and `WaResolvedMediaPayload` for standalone media-key extraction.
+- Surface every id from batch `<list>` read/delivery receipts as `WaIncomingReceiptEvent.messageIds`, instead of dropping all but the top-level id.
+
+### Patch Changes
+
+- Emit quote `contextInfo.remoteJid` only for cross-chat quotes and clear an inherited value on a same-chat reply, matching wa-web so a 1:1 reply is not treated as a cross-chat reference.
+- Read top-level `fromMe` from `WaMessageKey` quotes, so quoting a self-sent DM resolves to the correct participant instead of the peer.
+- Resolve the vendored spec bridges in the emitted `.d.ts` types and the ESM build, fixing `TS2307` on the published types and a runtime "Cannot find module" on `import 'zapo-js'` under ESM that shipped in 1.0.1.
+
 ## 1.0.1
 
 ### Patch Changes
