@@ -1,5 +1,16 @@
 # zapo-js
 
+## 1.1.1
+
+### Patch Changes
+
+- Strip the `:device` segment from incoming 1:1 `key.remoteJid` so it carries the deviceless chat identity; the device stays exposed via `senderDevice`.
+- Assert the IQ result on the companion hello during pairing so server-side errors surface instead of being swallowed.
+- Omit `recipient` from group decrypt-failure retry receipts (wa-web only sets it for 1:1 peer messages), so the server resends instead of going silent.
+- Ack `hist_sync` chunks even when history sync is disabled, matching wa-web which always acks.
+- Strip the `:device` segment from the `ignoreKey` predicate context so a predicate comparing against a deviceless JID also matches device-suffixed stanzas.
+- Prevent a stopped comms from being resurrected by a stale keepalive resume, which left an orphan socket reconnecting forever until process restart.
+
 ## 1.1.0
 
 ### Minor Changes
