@@ -1,5 +1,17 @@
 # zapo-js
 
+## 1.1.3
+
+### Patch Changes
+
+- Attach the trusted-contact (privacy) token to presence-subscribe, profile-picture get, and about/status usync queries, not just message send, matching wa-web so privacy-gated reads against a trusted contact are accepted instead of going out tokenless.
+- Resolve `fromMe` and the chat jid for a 1:1 message authored by another of your own devices, instead of surfacing it as inbound from yourself with the wrong `remoteJid`.
+- Key own-account self traffic (msg/skmsg from your own primary) onto a single LID Signal session so it decrypts directly, instead of failing on an incomplete LID fork and recovering only via the slow placeholder/PDO round-trip.
+- Map the signal "invalid message mac" error to the bad-MAC retry reason; the previous "invalid mac" match missed it (the word "message" sits in between), so bad-MAC retries went out with `error=0`.
+- Always emit the `error` attribute on the `<retry>` receipt (defaulting to 0) and map the "message too far in future" signal variant to the future-message retry reason.
+- Drop the noisy `clear-pending` warn on a disconnect with no in-flight query, and lower the remaining log to debug.
+- Build via the `prepare` lifecycle hook instead of `prepack`, so installing `zapo-js` straight from a git URL ships a built `dist/` (npm runs `prepare`, not `prepack`, for git dependencies).
+
 ## 1.1.2
 
 ### Patch Changes
