@@ -1,5 +1,11 @@
 # zapo-js
 
+## 1.2.1
+
+### Patch Changes
+
+- Tolerate a poisoned (server-side LT-hash inconsistent) collection snapshot MAC: warn and continue with the partial state so the version advances instead of throwing into an endless refetch loop that re-requests the same unverifiable snapshot forever.
+
 ## 1.2.0
 
 ### Minor Changes

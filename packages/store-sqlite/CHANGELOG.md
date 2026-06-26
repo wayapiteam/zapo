@@ -1,5 +1,15 @@
 # @zapo-js/store-sqlite
 
+## 1.0.2
+
+### Patch Changes
+
+- perf(store): write only the index/value delta in setCollectionStates
+
+    Diff against the persisted state and write only the delta (upsert
+    changed/new entries, delete removed ones, leave unchanged rows untouched)
+    instead of rewriting the entire index_value set on every change.
+
 ## 1.0.1
 
 ### Patch Changes
