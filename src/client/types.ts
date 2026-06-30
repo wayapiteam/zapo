@@ -8,6 +8,7 @@ import type {
 } from '@auth/types'
 import type { WaCallGroupParticipant, WaCallType } from '@client/events/call'
 import type { IncomingPresenceType, PresenceLastSeen } from '@client/events/presence'
+import type { WaClientPluginDefinition } from '@client/plugins/types'
 import type { WaMediaProcessor } from '@media/processor'
 import type { WaLinkPreviewOptions } from '@message/addons/link-preview/types'
 import type { WaQuoteRef, WaSendContextInfo } from '@message/context-info'
@@ -186,6 +187,11 @@ export interface WaClientOptions extends WaAuthClientOptions, WaAuthSocketOption
      * default auto-fetch globally.
      */
     readonly linkPreview?: WaLinkPreviewOptions
+    /**
+     * Optional client plugins – behavior hooks and/or coordinators exposed at
+     * `client[exposeAs]`. See {@link defineWaClientPlugin}.
+     */
+    readonly plugins?: readonly WaClientPluginDefinition[]
     /**
      * Test-only overrides intended for running against a fake server.
      *

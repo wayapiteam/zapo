@@ -19,6 +19,12 @@ import { createIgnoreKeyFilter, validateIgnoreKey } from '@client/messaging/igno
 import { runHistorySyncNotification } from '@client/persistence/history-sync'
 import { persistIncomingMailboxEntities } from '@client/persistence/mailbox'
 import { WriteBehindPersistence } from '@client/persistence/WriteBehindPersistence'
+import { installWaClientPlugins } from '@client/plugins/install'
+import type {
+    WaClientExposedFromPlugins,
+    WaClientPluginDefinition,
+    WaClientPluginEventsFromPlugins
+} from '@client/plugins/types'
 import type {
     WaClientEventMap,
     WaClientOptions,
@@ -53,55 +59,8 @@ const SYNC_RELATED_PROTOCOL_TYPES = new Set<WaIncomingProtocolType>([
     proto.Message.ProtocolMessage.Type.PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE
 ])
 
-/**
- * Top-level WhatsApp client. Owns the transport, auth, signal, and per-feature
- * coordinators (accessible via getters such as {@link message}, {@link group},
- * {@link newsletter}, etc.) and re-emits every {@link WaClientEventMap} event.
- *
- * Lifecycle: construct with {@link WaClientOptions}, call {@link connect} to
- * open the socket, react to `connection`/`auth_qr`/`auth_pairing_code` events,
- * then use the coordinator getters to drive the session. Call {@link disconnect}
- * to shut down cleanly or {@link logout} to remove the companion device.
- *
- * @example
- * ```ts
- * import { createPinoLogger, createStore, WaClient } from 'zapo-js'
- * import { createSqliteStore } from '@zapo-js/store-sqlite'
- *
- * const store = createStore({
- *     backends: { sqlite: createSqliteStore({ path: '.auth/state.sqlite' }) },
- *     providers: {
- *         auth: 'sqlite',
- *         signal: 'sqlite',
- *         preKey: 'sqlite',
- *         session: 'sqlite',
- *         identity: 'sqlite',
- *         senderKey: 'sqlite',
- *         appState: 'sqlite',
- *         privacyToken: 'sqlite',
- *         messages: 'sqlite',
- *         threads: 'sqlite',
- *         contacts: 'sqlite'
- *     }
- * })
- *
- * const client = new WaClient(
- *     { store, sessionId: 'default' },
- *     await createPinoLogger({ level: 'info', pretty: true })
- * )
- *
- * client.on('auth_qr', ({ qr, ttlMs }) => console.log('scan:', qr, ttlMs))
- * client.on('connection', (event) => console.log('connection', event))
- * client.on('message', async (event) => {
- *     if (event.message?.conversation === 'ping') {
- *         await client.message.send(event.chatJid!, 'pong')
- *     }
- * })
- *
- * await client.connect()
- * ```
- */
-export class WaClient extends EventEmitter {
+/** @internal Implementation backing the exported {@link WaClient}. */
+class WaClientImpl extends EventEmitter {
     private readonly options!: Readonly<WaClientOptions>
     private readonly logger!: Logger
     private readonly stores!: ReturnType<WaClientOptions['store']['session']>
@@ -113,6 +72,7 @@ export class WaClient extends EventEmitter {
     private acceptingIncomingEvents = true
     private activeIncomingHandlers = 0
     private readonly incomingHandlersDrainedWaiters: Array<() => void> = []
+    private disposePlugins: (() => Promise<void>) | null = null
 
     /**
      * @param options Client configuration (store, transport, addons, history...).
@@ -165,6 +125,18 @@ export class WaClient extends EventEmitter {
         this.deps = dependencies
         this.appStateSync = dependencies.appStateSync
         this.mediaTransfer = dependencies.mediaTransfer
+
+        this.disposePlugins = installWaClientPlugins(
+            this,
+            {
+                options: this.options,
+                logger: this.logger,
+                stores: this.stores,
+                deps: this.deps,
+                queryWithContext: this.queryWithContext.bind(this)
+            },
+            this.options.plugins ?? []
+        )
 
         this.bindNodeTransportEvents()
         this.on('connection', (event) => {
@@ -496,6 +468,11 @@ export class WaClient extends EventEmitter {
                 remaining: writeBehindFlush.remaining
             })
         }
+        if (this.disposePlugins) {
+            const dispose = this.disposePlugins
+            this.disposePlugins = null
+            await dispose()
+        }
         await this.deps.connectionManager.disconnect()
         this.emit('connection', {
             status: 'close',
@@ -721,3 +698,100 @@ export class WaClient extends EventEmitter {
         this.emit('debug_client_error', { error })
     }
 }
+
+/**
+ * A WhatsApp client instance: per-feature coordinator getters ({@link message},
+ * {@link group}, {@link newsletter}, ...) plus typed `on`/`once`/`off`/`emit`.
+ *
+ * `TPluginEvents` carries the events of the plugins installed on this client.
+ * Prefer deriving the precise type from the construction site (e.g.
+ * `type AppClient = ReturnType<typeof createClient>`) over the bare `WaClient`,
+ * which only knows the core events and no plugin getters.
+ */
+export interface WaClient<TPluginEvents = {}> extends WaClientImpl {
+    on<K extends keyof (WaClientEventMap & TPluginEvents)>(
+        event: K,
+        listener: (WaClientEventMap & TPluginEvents)[K]
+    ): this
+    once<K extends keyof (WaClientEventMap & TPluginEvents)>(
+        event: K,
+        listener: (WaClientEventMap & TPluginEvents)[K]
+    ): this
+    off<K extends keyof (WaClientEventMap & TPluginEvents)>(
+        event: K,
+        listener: (WaClientEventMap & TPluginEvents)[K]
+    ): this
+    emit<K extends keyof (WaClientEventMap & TPluginEvents)>(
+        event: K,
+        payload: Parameters<
+            Extract<(WaClientEventMap & TPluginEvents)[K], (...args: never[]) => unknown>
+        >[0]
+    ): boolean
+}
+
+/**
+ * Constructor surface for {@link WaClient}. `new WaClient({ plugins })` infers the
+ * exposed plugin getters (e.g. `client.voip`) from the plugin values passed:
+ * no global type augmentation, so a getter exists only when its plugin is installed.
+ */
+export interface WaClientConstructor {
+    new <const P extends readonly WaClientPluginDefinition[] = []>(
+        options: Omit<WaClientOptions, 'plugins'> & { readonly plugins?: P },
+        logger?: Logger
+    ): WaClient<WaClientPluginEventsFromPlugins<P>> & WaClientExposedFromPlugins<P>
+}
+
+/**
+ * Top-level WhatsApp client. Owns the transport, auth, signal, and per-feature
+ * coordinators (accessible via getters such as {@link message}, {@link group},
+ * {@link newsletter}, etc.) and re-emits every {@link WaClientEventMap} event.
+ *
+ * Lifecycle: construct with {@link WaClientOptions}, call {@link connect} to
+ * open the socket, react to `connection`/`auth_qr`/`auth_pairing_code` events,
+ * then use the coordinator getters to drive the session. Call {@link disconnect}
+ * to shut down cleanly or {@link logout} to remove the companion device.
+ *
+ * Pass `plugins` to expose plugin getters and events on the returned client,
+ * typed from the values you pass: e.g. `plugins: [voipPlugin()]` adds
+ * `client.voip` and the `voip_*` events, and only then. See
+ * {@link WaClientConstructor}.
+ *
+ * @example
+ * ```ts
+ * import { createPinoLogger, createStore, WaClient } from 'zapo-js'
+ * import { createSqliteStore } from '@zapo-js/store-sqlite'
+ *
+ * const store = createStore({
+ *     backends: { sqlite: createSqliteStore({ path: '.auth/state.sqlite' }) },
+ *     providers: {
+ *         auth: 'sqlite',
+ *         signal: 'sqlite',
+ *         preKey: 'sqlite',
+ *         session: 'sqlite',
+ *         identity: 'sqlite',
+ *         senderKey: 'sqlite',
+ *         appState: 'sqlite',
+ *         privacyToken: 'sqlite',
+ *         messages: 'sqlite',
+ *         threads: 'sqlite',
+ *         contacts: 'sqlite'
+ *     }
+ * })
+ *
+ * const client = new WaClient(
+ *     { store, sessionId: 'default' },
+ *     await createPinoLogger({ level: 'info', pretty: true })
+ * )
+ *
+ * client.on('auth_qr', ({ qr, ttlMs }) => console.log('scan:', qr, ttlMs))
+ * client.on('connection', (event) => console.log('connection', event))
+ * client.on('message', async (event) => {
+ *     if (event.message?.conversation === 'ping') {
+ *         await client.message.send(event.chatJid!, 'pong')
+ *     }
+ * })
+ *
+ * await client.connect()
+ * ```
+ */
+export const WaClient = WaClientImpl as unknown as WaClientConstructor

@@ -2,8 +2,6 @@ import { createWriteStream, mkdirSync, type WriteStream } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 
-import { createMediaProcessor } from '@zapo-js/media-utils'
-import { createSqliteStore } from '@zapo-js/store-sqlite'
 import {
     createStore,
     type Logger,
@@ -13,6 +11,9 @@ import {
     type WaStore
 } from 'zapo-js'
 import { hexToBytes, resolvePositive, toError } from 'zapo-js/util'
+
+import { createMediaProcessor } from '@zapo-js/media-utils'
+import { createSqliteStore } from '@zapo-js/store-sqlite'
 
 import { encodeForJson } from './serializer'
 
@@ -44,32 +45,55 @@ export interface LogEntry {
  */
 class BoundLogger implements Logger {
     public readonly level: LogLevel
-    private readonly parent: Logger
+    private readonly parent: BufferedTeeLogger
     private readonly bindings: Readonly<Record<string, unknown>>
+    private readonly minPriority: number
 
-    public constructor(parent: Logger, bindings: Readonly<Record<string, unknown>>) {
+    public constructor(
+        parent: BufferedTeeLogger,
+        bindings: Readonly<Record<string, unknown>>,
+        level?: LogLevel
+    ) {
         this.parent = parent
-        this.level = parent.level
+        this.level = level ?? parent.level
         this.bindings = bindings
+        this.minPriority = LOG_LEVEL_PRIORITY[this.level]
     }
 
     public trace(message: string, context?: Readonly<Record<string, unknown>>): void {
-        this.parent.trace(message, this.merge(context))
+        if (LOG_LEVEL_PRIORITY.trace >= this.minPriority) {
+            this.parent.record('trace', message, this.merge(context))
+        }
     }
     public debug(message: string, context?: Readonly<Record<string, unknown>>): void {
-        this.parent.debug(message, this.merge(context))
+        if (LOG_LEVEL_PRIORITY.debug >= this.minPriority) {
+            this.parent.record('debug', message, this.merge(context))
+        }
     }
     public info(message: string, context?: Readonly<Record<string, unknown>>): void {
-        this.parent.info(message, this.merge(context))
+        if (LOG_LEVEL_PRIORITY.info >= this.minPriority) {
+            this.parent.record('info', message, this.merge(context))
+        }
     }
     public warn(message: string, context?: Readonly<Record<string, unknown>>): void {
-        this.parent.warn(message, this.merge(context))
+        if (LOG_LEVEL_PRIORITY.warn >= this.minPriority) {
+            this.parent.record('warn', message, this.merge(context))
+        }
     }
     public error(message: string, context?: Readonly<Record<string, unknown>>): void {
-        this.parent.error(message, this.merge(context))
+        if (LOG_LEVEL_PRIORITY.error >= this.minPriority) {
+            this.parent.record('error', message, this.merge(context))
+        }
     }
-    public child(bindings: Readonly<Record<string, unknown>>): Logger {
-        return new BoundLogger(this.parent, { ...this.bindings, ...bindings })
+    public child(
+        bindings: Readonly<Record<string, unknown>>,
+        options?: { readonly level?: LogLevel }
+    ): Logger {
+        return new BoundLogger(
+            this.parent,
+            { ...this.bindings, ...bindings },
+            options?.level ?? this.level
+        )
     }
 
     private merge(
@@ -127,8 +151,11 @@ class BufferedTeeLogger implements Logger {
     public error(message: string, context?: Record<string, unknown>): void {
         this.write('error', message, context)
     }
-    public child(bindings: Readonly<Record<string, unknown>>): Logger {
-        return new BoundLogger(this, { ...bindings })
+    public child(
+        bindings: Readonly<Record<string, unknown>>,
+        options?: { readonly level?: LogLevel }
+    ): Logger {
+        return new BoundLogger(this, { ...bindings }, options?.level)
     }
 
     public listLogs(
@@ -200,6 +227,10 @@ class BufferedTeeLogger implements Logger {
         if (LOG_LEVEL_PRIORITY[level] < this.minPriority) {
             return
         }
+        this.record(level, message, context)
+    }
+
+    public record(level: LogLevel, message: string, context?: Record<string, unknown>): void {
         const ts = Date.now()
         const iso = new Date(ts).toISOString()
         const safeCtx = context && Object.keys(context).length > 0 ? safeStringify(context) : null
