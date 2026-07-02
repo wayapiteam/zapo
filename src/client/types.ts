@@ -1,5 +1,6 @@
 import type { AppStateCollectionName } from '@appstate/types'
 import type { DataForKey, WaAppstateActionKey, WaAppstateIndexArgs } from '@appstate-spec'
+import type { WaShortcakeAssertionSigner } from '@auth/pairing/WaShortcakeFlow'
 import type {
     WaAuthClientOptions,
     WaAuthCredentials,
@@ -206,6 +207,14 @@ export interface WaClientOptions extends WaAuthClientOptions, WaAuthSocketOption
      * disables a security check the production code path enforces.
      */
     readonly dangerous?: WaClientDangerousOptions
+    /**
+     * External WebAuthn signer. Configuring it enables handling a server-forced
+     * passkey ("Shortcake") prologue – e.g. when the server demands a passkey
+     * right after a successful pairing-code `companion_finish`. Called with the
+     * server's request options; returns the assertion + credential id. The
+     * credential source (real/virtual authenticator) stays outside the library.
+     */
+    readonly signPasskeyAssertion?: WaShortcakeAssertionSigner
 }
 
 export interface WaClientDangerousOptions extends WaAuthDangerousOptions {
@@ -1280,6 +1289,14 @@ export interface WaClientEventMap {
      * shortly after.
      */
     readonly auth_paired: (event: { readonly credentials: WaAuthCredentials }) => void
+    /**
+     * The server is forcing a passkey (Shortcake) to link this device – emitted
+     * when the server pushes the prologue request. `hasSigner` is `true` when a
+     * `signPasskeyAssertion` is configured (the handshake proceeds) and `false`
+     * when none is set (the request is acked but the link cannot complete
+     * headless, so the user should be told a passkey is required).
+     */
+    readonly auth_passkey_required: (event: { readonly hasSigner: boolean }) => void
     /**
      * Connection-state transitions: `'open'` (handshake + auth complete),
      * `'connecting'`, or `'close'` (with a `reason` and optional `code`). The

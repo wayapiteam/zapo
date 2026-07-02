@@ -5,6 +5,7 @@ import {
 } from '@auth/credentials-flow'
 import { WaPairingFlow } from '@auth/pairing/WaPairingFlow'
 import { WaQrFlow } from '@auth/pairing/WaQrFlow'
+import { type WaShortcakeAssertionSigner, WaShortcakeFlow } from '@auth/pairing/WaShortcakeFlow'
 import type {
     WaAuthClientOptions,
     WaAuthCredentials,
@@ -12,10 +13,12 @@ import type {
     WaSuccessPersistAttributes
 } from '@auth/types'
 import type { Logger } from '@infra/log/types'
-import { getWaCompanionPlatformId, WA_DEFAULTS } from '@protocol/constants'
+import { getWaCompanionPlatformId, WA_DEFAULTS, WA_NOTIFICATION_TYPES } from '@protocol/constants'
 import type { WaAuthStore } from '@store/contracts/auth.store'
 import type { WaPreKeyStore } from '@store/contracts/pre-key.store'
 import type { WaSignalStore } from '@store/contracts/signal.store'
+import { buildAckNode } from '@transport/node/builders/global'
+import { resolveDevicePropsPlatformType } from '@transport/noise/WaClientPayload'
 import type { WaNoiseRootCa } from '@transport/noise/WaNoiseCert'
 import type { BinaryNode, WaCommsConfig } from '@transport/types'
 import { uint8Equal } from '@util/bytes'
@@ -38,6 +41,10 @@ type WaAuthClientDeps = Readonly<{
         readonly onPairingRefresh?: (forceManual: boolean) => void
         readonly onPaired?: (credentials: WaAuthCredentials) => void
         readonly onError?: (error: Error) => void
+        /** Server forced a passkey (Shortcake) prologue; `hasSigner` = a signer is configured. */
+        readonly onPasskeyRequired?: (hasSigner: boolean) => void
+        /** External WebAuthn signer – enables handling forced passkey (Shortcake) prologues. */
+        readonly signPasskeyAssertion?: WaShortcakeAssertionSigner
     }
 }>
 
@@ -60,6 +67,8 @@ export class WaAuthClient {
     private readonly isConnected?: () => boolean
     private readonly qrFlow: WaQrFlow
     private readonly pairingFlow: WaPairingFlow
+    private readonly socket: WaAuthClientDeps['socket']
+    private readonly shortcakeFlow: WaShortcakeFlow | null
     private credentials: WaAuthCredentials | null
     private versionOverride: string | null = null
 
@@ -107,6 +116,24 @@ export class WaAuthClient {
             },
             dangerous: options.dangerous
         })
+
+        this.socket = deps.socket
+        const signAssertion = deps.callbacks?.signPasskeyAssertion
+        this.shortcakeFlow = signAssertion
+            ? new WaShortcakeFlow({
+                  logger: this.logger,
+                  socket: {
+                      sendNode: deps.socket.sendNode,
+                      query: (node, timeoutMs) => deps.socket.query(node, timeoutMs)
+                  },
+                  signAssertion,
+                  auth: {
+                      getCredentials: () => this.credentials,
+                      updateCredentials: this.updateCredentials.bind(this)
+                  },
+                  deviceType: resolveDevicePropsPlatformType(deviceBrowser)
+              })
+            : null
     }
 
     /**
@@ -194,6 +221,7 @@ export class WaAuthClient {
         this.logger.trace('auth client clear transient state')
         this.qrFlow.clear()
         this.pairingFlow.clearSession()
+        this.shortcakeFlow?.clearSession()
     }
 
     /**
@@ -381,8 +409,40 @@ export class WaAuthClient {
 
     /** Dispatcher: returns `true` when `node` is a link-code companion notification. */
     public async handleLinkCodeNotification(node: BinaryNode): Promise<boolean> {
+        const type = node.attrs.type
+        if (
+            type === WA_NOTIFICATION_TYPES.PASSKEY_PROLOGUE_REQUEST ||
+            type === WA_NOTIFICATION_TYPES.CRSC_CONTINUATION
+        ) {
+            return this.runHandled(() => this.handleShortcakeNotification(node))
+        }
         this.logger.trace('auth client handleLinkCodeNotification', { id: node.attrs.id })
         return this.runHandled(() => this.pairingFlow.handleLinkCodeNotification(node))
+    }
+
+    /**
+     * Handles the server-forced passkey (Shortcake) prologue. With a configured
+     * `signPasskeyAssertion` the full handshake runs; without one we just ack
+     * and warn instead of silently stalling – which is what happens today when
+     * the server demands a passkey after a successful pairing-code
+     * `companion_finish`.
+     */
+    private async handleShortcakeNotification(node: BinaryNode): Promise<boolean> {
+        if (node.attrs.type === WA_NOTIFICATION_TYPES.PASSKEY_PROLOGUE_REQUEST) {
+            this.callbacks.onPasskeyRequired?.(this.shortcakeFlow !== null)
+        }
+        if (this.shortcakeFlow) {
+            return this.shortcakeFlow.handleIncomingNotification(node)
+        }
+        if (node.attrs.type === WA_NOTIFICATION_TYPES.PASSKEY_PROLOGUE_REQUEST) {
+            this.logger.warn(
+                'auth client: server requested passkey prologue but no signPasskeyAssertion configured',
+                { id: node.attrs.id }
+            )
+            await this.socket.sendNode(buildAckNode({ kind: 'notification', node }))
+            return true
+        }
+        return false
     }
 
     /** Dispatcher: returns `true` when `node` is a companion-registration refresh notification. */
