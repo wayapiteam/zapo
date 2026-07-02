@@ -1,5 +1,15 @@
 # zapo-js
 
+## 1.4.0
+
+### Minor Changes
+
+- Add the companion side of WhatsApp's "Shortcake" (CRSC) passkey device-linking handshake, which the server can force right after a pairing-code `companion_finish`. Drives the `passkey_prologue_request` + `crsc_continuation` exchange, derives a pairing handoff proof from the ADV secret (rotating it) so the server can skip the code-matching UX, and auto-confirms headless. The WebAuthn assertion is the only external input via the new `signPasskeyAssertion` option (`WaShortcakeAssertionSigner` is exported for typing it), and a typed `auth_passkey_required` event fires when the server pushes the prologue. Previously such a prologue fell through the link-code handler and stalled the link.
+
+### Patch Changes
+
+- Resend a group `pkmsg` retry without the device-identity node on a mobile primary (device 0), which has no self-signed device-identity, instead of dropping the resend as ineligible. The missing-identity warn is now scoped to companion sessions where the absence is actually anomalous.
+
 ## 1.3.0
 
 ### Minor Changes
