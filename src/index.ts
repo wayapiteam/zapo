@@ -64,6 +64,7 @@ export type {
     WaMexUsernameSetEvent,
     WaMexUsernameUpdateHintEvent,
     WaOfflineResumeEvent,
+    WaOutgoingMessageEvent,
     WaPictureEvent,
     WaPictureEventAction,
     WaPrivacyTokenUpdateEvent,
@@ -226,7 +227,13 @@ export type {
     WaSendStickerPackTrayIcon,
     WaSendTextMessage
 } from '@message/types'
-export { getContentType, resolveMessageTarget } from '@message/encode/content'
+export {
+    getContentType,
+    resolveEncMediaType,
+    resolveMessageTarget,
+    unwrapMessage
+} from '@message/encode/content'
+export { getContextInfo } from '@message/context-info'
 export { resolveMediaPayload } from '@message/encode/media-payload'
 export { unpadPkcs7, writeRandomPadMax16 } from '@message/encode/padding'
 export type { WaResolvedMediaPayload } from '@message/encode/media-payload'
@@ -255,6 +262,7 @@ export { PinoLogger, createPinoLogger } from '@infra/log/PinoLogger'
 export type { PinoLoggerOptions } from '@infra/log/PinoLogger'
 export { createNoopLogger } from '@infra/log/types'
 export type { Logger, LogLevel } from '@infra/log/types'
+export { WA_VERSION } from '@version-spec'
 export { createStore, WaAuthMemoryStore } from '@store'
 export type {
     WaAppStateCollectionStoreState,

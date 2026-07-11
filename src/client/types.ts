@@ -165,6 +165,7 @@ export interface WaClientOptions extends WaAuthClientOptions, WaAuthSocketOption
      * Chat-event emission tuning. `emitSnapshotMutations: true` re-emits
      * `app_state_mutation` events for every mutation seen during a snapshot
      * sync (off by default – those mutations represent historical state).
+     * This client's own outbound app-state actions surface on `mutation_send`.
      */
     readonly chatEvents?: {
         readonly emitSnapshotMutations?: boolean
@@ -591,6 +592,23 @@ export interface WaIncomingMessageEvent extends Omit<WaIncomingBaseEvent, 'chatJ
     /** Sender's display name from the stanza's `notify` attr. */
     readonly pushName?: string
     readonly message?: Proto.IMessage
+}
+
+/**
+ * An outbound message this client sent, surfaced with its decrypted
+ * {@link Proto.IMessage} – the symmetric counterpart to
+ * {@link WaIncomingMessageEvent}. Fires from {@link WaMessageCoordinator.send}
+ * as the stanza is built, so plugins/loggers can observe outgoing content
+ * (forwards, reactions, polls, media) that the encrypted `<message>` on the
+ * wire does not reveal.
+ */
+export interface WaOutgoingMessageEvent {
+    /** Destination jid (chat / group / status). */
+    readonly to: string
+    /** Outgoing stanza id, when assigned. */
+    readonly id?: string
+    /** The decrypted message proto being sent. */
+    readonly message: Proto.IMessage
 }
 
 export interface WaIncomingProtocolMessageEvent extends WaIncomingMessageEvent {
@@ -1225,7 +1243,7 @@ export interface WaHistorySyncChunkEvent {
     readonly progress?: number
 }
 
-export type WaAppStateMutationSource = 'snapshot' | 'patch'
+export type WaAppStateMutationSource = 'snapshot' | 'patch' | 'local'
 
 type MutationEventBase = {
     readonly source: WaAppStateMutationSource
@@ -1247,6 +1265,13 @@ export type WaAppStateMutationEvent = {
         | ({ readonly schema: K; readonly operation: 'remove' } & MutationEventBase &
               WaAppstateIndexArgs<K>)
 }[WaAppstateActionKey]
+
+/**
+ * Listener shared by the inbound `mutation` and outbound `mutation_send`
+ * events. A single named alias so the (large) `WaAppStateMutationEvent` union
+ * is referenced once by the event map rather than expanded per event.
+ */
+type WaAppStateMutationListener = (event: WaAppStateMutationEvent) => void
 
 export type WaConnectionEvent =
     | {
@@ -1322,6 +1347,13 @@ export interface WaClientEventMap {
      */
     readonly message: (event: WaIncomingMessageEvent) => void
     /**
+     * An outbound message this client is sending, with its decrypted
+     * {@link Proto.IMessage} – the symmetric counterpart to `message`. Lets
+     * plugins/loggers observe outgoing content (forwards, reactions, polls,
+     * media) the encrypted wire stanza hides.
+     */
+    readonly message_send: (event: WaOutgoingMessageEvent) => void
+    /**
      * A decrypted addon (poll vote, reaction, edit, comment, ...) attached to
      * a previous message. Fires unless `addons.autoDecrypt` is explicitly
      * set to `false`, and the parent message secret is available in the
@@ -1380,11 +1412,20 @@ export interface WaClientEventMap {
     /** Profile/group/community picture change notification – the new picture must still be fetched explicitly. */
     readonly picture: (event: WaPictureEvent) => void
     /**
-     * A parsed app-state mutation crossed the sync boundary – chat mute/star/
-     * read/pin/archive/contact/label/etc. Use the discriminator
-     * (`event.action`) to branch on the mutation kind.
+     * A parsed app-state mutation arriving from a sync – chat mute/star/read/
+     * pin/archive/contact/label/etc. changed on another device. Inbound only;
+     * this client's own outbound actions surface on `mutation_send`. Use the
+     * discriminator (`event.schema`) to branch on the mutation kind.
      */
-    readonly mutation: (event: WaAppStateMutationEvent) => void
+    readonly mutation: WaAppStateMutationListener
+    /**
+     * An app-state action this client is sending (mute/star/read/pin/archive/
+     * clear/delete/…) surfaced at action time – the outbound counterpart to
+     * `mutation`, symmetric to how `message_send` pairs with `message`.
+     * `event.source` is always `'local'`. Optimistic: emitted as the mutation
+     * is enqueued, before the server flush confirms it.
+     */
+    readonly mutation_send: WaAppStateMutationListener
     /**
      * One chunk of history-sync data, fired both during the initial
      * bootstrap that the primary device pushes after pairing and for any

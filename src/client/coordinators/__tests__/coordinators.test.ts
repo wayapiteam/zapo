@@ -13,7 +13,12 @@ import { WaMessageDispatchCoordinator } from '@client/coordinators/WaMessageDisp
 import { WaPassiveTasksCoordinator } from '@client/coordinators/WaPassiveTasksCoordinator'
 import { createStreamControlHandler } from '@client/coordinators/WaStreamControlCoordinator'
 import { createGroupMetadataCache } from '@client/messaging/group-metadata'
-import type { WaGroupEvent, WaGroupEventAction } from '@client/types'
+import type {
+    WaAppStateMutationEvent,
+    WaGroupEvent,
+    WaGroupEventAction,
+    WaOutgoingMessageEvent
+} from '@client/types'
 import { createNoopLogger } from '@infra/log/types'
 import type { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
 import {
@@ -116,6 +121,7 @@ function createMessageDispatchCoordinator(
         readonly deviceListStore?: {
             readonly findByAnyUserJid: (jid: string) => Promise<unknown>
         }
+        readonly emitMessageSend?: (event: WaOutgoingMessageEvent) => void
     }
 ): WaMessageDispatchCoordinator {
     const groupMetadataCache = createGroupMetadataCache({
@@ -126,6 +132,7 @@ function createMessageDispatchCoordinator(
 
     return new WaMessageDispatchCoordinator({
         logger: createNoopLogger(),
+        emitMessageSend: overrides?.emitMessageSend,
         messageClient: {} as never,
         retryTracker: {} as never,
         sessionResolver: {} as never,
@@ -179,6 +186,22 @@ function callResolvePeerRecipientPn(
         }
     ).resolvePeerRecipientPn(recipientUserJid, directRecipientJid)
 }
+
+test('message dispatch emits message_send with the outbound proto and destination', async () => {
+    const events: WaOutgoingMessageEvent[] = []
+    const coordinator = createMessageDispatchCoordinator(new WaGroupMetadataMemoryStore(), {
+        meJid: '5511000000000@s.whatsapp.net',
+        emitMessageSend: (event) => events.push(event)
+    })
+    // The mocked signal/crypto deps throw after the proto is built; the event
+    // fires before encryption, so it lands even though the send itself rejects.
+    await coordinator
+        .sendMessage('5511999999999@s.whatsapp.net', { text: 'oi' } as never, {})
+        .catch(() => undefined)
+    assert.equal(events.length, 1)
+    assert.equal(events[0]?.to, '5511999999999@s.whatsapp.net')
+    assert.ok(events[0]?.message)
+})
 
 test('resolvePeerRecipientPn: a PN-addressed caller on a LID envelope stamps that PN', async () => {
     const coordinator = createMessageDispatchCoordinator(new WaGroupMetadataMemoryStore())
@@ -917,6 +940,37 @@ test('app-state mutation coordinator emits pin + archive mutations when pinning 
     }
     assert.equal(typeof syncCalls[0][0].value.timestamp, 'number')
     assert.equal(typeof syncCalls[0][1].value.timestamp, 'number')
+})
+
+test('app-state mutation coordinator emits mutation_send for a local action, not the inbound mutation event', async () => {
+    const messageStore = new WaMessageMemoryStore()
+    const sent: WaAppStateMutationEvent[] = []
+    const inbound: WaAppStateMutationEvent[] = []
+    const coordinator = new WaAppStateMutationCoordinator({
+        serverClock: { nowMs: () => 1_000_000, nowSeconds: () => 1_000 },
+        logger: createNoopLogger(),
+        messageStore,
+        emitMutation: (event) => inbound.push(event),
+        emitMutationSend: (event) => sent.push(event),
+        ...fakeSyncImpl(async (options = {}) =>
+            buildAppStateSyncResult(
+                options.pendingMutations ?? [],
+                WA_APP_STATE_COLLECTION_STATES.SUCCESS
+            )
+        )
+    })
+
+    await coordinator.setChatMute('551100000000@s.whatsapp.net', true, 2_000_000)
+
+    const send = sent.find((e) => e.schema === 'Mute')
+    assert.ok(send)
+    assert.equal(send?.source, 'local')
+    if (send?.schema === 'Mute' && send.operation === 'set') {
+        assert.equal(send.chatJid, '551100000000@s.whatsapp.net')
+        assert.equal(send.muted, true)
+    }
+    // Local actions surface only on `mutation_send`, never on the inbound `mutation` stream.
+    assert.equal(inbound.length, 0)
 })
 
 test('app-state mutation coordinator flushes only targeted collections for queued mutation batch', async () => {
