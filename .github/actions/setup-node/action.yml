@@ -6,8 +6,10 @@ runs:
     steps:
         - uses: actions/setup-node@v4
           with:
-              node-version: 22
-              cache: npm
+            node-version: 22
+            cache: npm
+            registry-url: 'https://npm.pkg.github.com'
+            scope: '@wayapiteam'
 
         - name: install dependencies
           run: npm ci
