@@ -15,7 +15,7 @@ concurrency:
 jobs:
     publish:
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GHCR_PAT }}
+          CR_PAT: ${{ secrets.GHCR_PAT }}
         runs-on: ubuntu-latest
         timeout-minutes: 20
         permissions:
@@ -50,3 +50,5 @@ jobs:
                   else
                     npm publish
                   fi
+              env:
+                NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
