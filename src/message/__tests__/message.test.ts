@@ -372,6 +372,10 @@ test('padding and phash generation cover success and edge paths', async () => {
 
     const hash = computePhashV2(['5511:0@c.us', '5511:2@s.whatsapp.net'])
     assert.match(hash, /^2:/)
+
+    const participants = Array.from({ length: 2_526 }, (_, index) => `5511${index}@s.whatsapp.net`)
+    assert.match(computePhashV2(participants, 4_096), /^2:/)
+    assert.throws(() => computePhashV2(participants, 2_048), /exceeds maxParticipants 2048/)
 })
 
 test('reporting token helpers cover secret injection and deterministic token generation', async () => {

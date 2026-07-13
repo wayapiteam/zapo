@@ -20,7 +20,7 @@ import {
     type WaSendContextInfo
 } from '@message/context-info'
 import { type IcdcMeta, injectDeviceListMetadata, resolveIcdcMeta } from '@message/crypto/icdc'
-import { computePhashV2 } from '@message/crypto/phash'
+import { computePhashV2, WA_DEFAULT_PHASH_MAX_PARTICIPANTS } from '@message/crypto/phash'
 import {
     buildReportingTokenArtifacts,
     type BuildReportingTokenArtifactsResult
@@ -98,6 +98,7 @@ import { toError } from '@util/primitives'
 
 interface WaMessageDispatchCoordinatorOptions {
     readonly logger: Logger
+    readonly phashMaxParticipants?: number
     /** Emits the outbound decrypted message (`message_send` event); best-effort. */
     readonly emitMessageSend?: (event: WaOutgoingMessageEvent) => void
     readonly messageClient: WaMessageClient
@@ -169,6 +170,7 @@ interface WaOutboundEnvelope {
 export class WaMessageDispatchCoordinator {
     private readonly deps: WaMessageDispatchCoordinatorOptions
     private readonly mobileMessageIdFormat: () => boolean
+    private readonly phashMaxParticipants: number
     private readonly serverClock: ServerClock
     private readonly icdcDedup = new PromiseDedup()
     private readonly privacyTokenDedup = new PromiseDedup()
@@ -177,6 +179,8 @@ export class WaMessageDispatchCoordinator {
     public constructor(options: WaMessageDispatchCoordinatorOptions) {
         this.deps = options
         this.mobileMessageIdFormat = options.mobileMessageIdFormat ?? (() => false)
+        this.phashMaxParticipants =
+            options.phashMaxParticipants ?? WA_DEFAULT_PHASH_MAX_PARTICIPANTS
         this.serverClock = options.serverClock
     }
 
@@ -717,7 +721,9 @@ export class WaMessageDispatchCoordinator {
                 }
                 phashTargets[phashTargetCount] = senderJid
                 phashTargets.length = phashTargetCount + 1
-                return Promise.resolve({ phash: computePhashV2(phashTargets) })
+                return Promise.resolve({
+                    phash: computePhashV2(phashTargets, this.phashMaxParticipants)
+                })
             }
         })
     }
@@ -964,7 +970,7 @@ export class WaMessageDispatchCoordinator {
         }
         phashTargets[phashTargetCount] = senderForPhash
         phashTargets.length = phashTargetCount + 1
-        const localPhash = computePhashV2(phashTargets)
+        const localPhash = computePhashV2(phashTargets, this.phashMaxParticipants)
         const reportingArtifacts = await this.tryBuildReportingTokenArtifacts({
             message,
             stanzaId: sendOptions.id,
@@ -1156,7 +1162,7 @@ export class WaMessageDispatchCoordinator {
         }
         phashTargets[phashTargetCount] = senderJid
         phashTargets.length = phashTargetCount + 1
-        const localPhash = computePhashV2(phashTargets)
+        const localPhash = computePhashV2(phashTargets, this.phashMaxParticipants)
         const reportingArtifacts = await this.tryBuildReportingTokenArtifacts({
             message,
             stanzaId: sendOptions.id,

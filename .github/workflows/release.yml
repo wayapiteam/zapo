@@ -38,15 +38,12 @@ jobs:
                   npm run build
                   npm run build:packages
 
-            - name: publish core (zapo-js), skip if version already on npm
+            - name: publish core (wayapiteam/zapo-js), skip if version already on npm
               run: |
                   VERSION="$(node -p "require('./package.json').version")"
-                  PUBLISHED="$(npm view "zapo-js@$VERSION" version 2>/dev/null || true)"
+                  PUBLISHED="$(npm view "wayapiteam/zapo@$VERSION" version 2>/dev/null || true)"
                   if [ -n "$PUBLISHED" ]; then
-                    echo "zapo-js@$VERSION already on npm, skipping"
+                    echo "wayapiteam/zapo@$VERSION already on npm, skipping"
                   else
                     npm publish
                   fi
-
-            - name: publish add-ons (@zapo-js/*)
-              run: npx changeset publish # publishes only the @zapo-js/* whose version is not yet on npm

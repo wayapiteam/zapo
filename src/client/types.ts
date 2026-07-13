@@ -131,6 +131,12 @@ export interface WaClientOptions extends WaAuthClientOptions, WaAuthSocketOption
     /** Delay (ms) between message-send retry attempts. */
     readonly messageRetryDelayMs?: number
     /**
+     * Maximum recipient-device count included in an outgoing message participant hash.
+     * Defaults to `4_096`. Values above `16_384` are rejected to bound CPU and memory
+     * usage while hashing and sorting recipients.
+     */
+    readonly phashMaxParticipants?: number
+    /**
      * Initial presence sent right after the post-connect passive task runs.
      * - `false` (default): announce as unavailable – matches wa-web when the
      *   tab is not focused (or the Windows app is minimized to tray) at login
