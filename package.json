@@ -1,6 +1,6 @@
 {
-    "name": "zapo-js",
-    "version": "1.5.0",
+    "name": "@wayapiteam/zapo",
+    "version": "1.5.1",
     "description": "High-performance WhatsApp Web TypeScript library",
     "license": "MIT",
     "author": "vinikjkkj <contact@vinicius.email> (https://github.com/vinikjkkj)",
@@ -10,7 +10,7 @@
     },
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/vinikjkkj/zapo.git"
+        "url": "git+https://github.com/wayapiteam/zapo.git"
     },
     "packageManager": "npm@10.0.0",
     "main": "dist/index.js",

@@ -92,6 +92,10 @@ import {
 } from '@message/primitives/peer-data-operation'
 import { WaMessageClient } from '@message/WaMessageClient'
 import {
+    WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS,
+    WA_DEFAULT_PHASH_MAX_PARTICIPANTS
+} from '@message/crypto/phash'
+import {
     resolveWaDeviceIdentity,
     WA_DEFAULTS,
     WA_DISCONNECT_REASONS,
@@ -259,6 +263,17 @@ function validateProxyOptions(options: WaClientOptions): void {
 export function resolveWaClientBase(options: WaClientOptions, logger: Logger): WaClientBase {
     validateProxyOptions(options)
 
+    const phashMaxParticipants = options.phashMaxParticipants ?? WA_DEFAULT_PHASH_MAX_PARTICIPANTS
+    if (
+        !Number.isSafeInteger(phashMaxParticipants) ||
+        phashMaxParticipants < 1 ||
+        phashMaxParticipants > WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS
+    ) {
+        throw new Error(
+            `phashMaxParticipants must be an integer between 1 and ${WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS}`
+        )
+    }
+
     const device = resolveWaDeviceIdentity(options)
     const sessionId = options.sessionId.trim()
     if (sessionId.length === 0) {
@@ -285,7 +300,8 @@ export function resolveWaClientBase(options: WaClientOptions, logger: Logger): W
             WA_DEFAULTS.SIGNAL_FETCH_KEY_BUNDLES_TIMEOUT_MS,
         messageAckTimeoutMs: options.messageAckTimeoutMs ?? WA_DEFAULTS.MESSAGE_ACK_TIMEOUT_MS,
         messageMaxAttempts: options.messageMaxAttempts ?? WA_DEFAULTS.MESSAGE_MAX_ATTEMPTS,
-        messageRetryDelayMs: options.messageRetryDelayMs ?? WA_DEFAULTS.MESSAGE_RETRY_DELAY_MS
+        messageRetryDelayMs: options.messageRetryDelayMs ?? WA_DEFAULTS.MESSAGE_RETRY_DELAY_MS,
+        phashMaxParticipants
     })
 
     return {
@@ -745,6 +761,7 @@ export function buildWaClientDependencies(input: {
 
     messageDispatch = new WaMessageDispatchCoordinator({
         logger,
+        phashMaxParticipants: options.phashMaxParticipants,
         emitMessageSend: (event) => runtime.emitEvent('message_send', event),
         messageClient,
         retryTracker,

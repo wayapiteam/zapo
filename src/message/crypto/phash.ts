@@ -12,43 +12,70 @@ const CHAR_C = 0x63
 const CHAR_U = 0x75
 const CHAR_S = 0x73
 
-const MAX_PARTICIPANTS = 2048
+export const WA_DEFAULT_PHASH_MAX_PARTICIPANTS = 4_096
+export const WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS = 16_384
+
+const INITIAL_PARTICIPANT_CAPACITY = 2_048
 const PER_WID_BYTES = 96
 
-const SCRATCH = new Uint8Array(MAX_PARTICIPANTS * PER_WID_BYTES)
-const OFFSETS = new Uint32Array(MAX_PARTICIPANTS + 1)
-const ORDER = new Uint32Array(MAX_PARTICIPANTS)
+let scratch = new Uint8Array(INITIAL_PARTICIPANT_CAPACITY * PER_WID_BYTES)
+let offsets = new Uint32Array(INITIAL_PARTICIPANT_CAPACITY + 1)
+let order = new Uint32Array(INITIAL_PARTICIPANT_CAPACITY)
 
-export function computePhashV2(participants: readonly string[]): string {
+export function computePhashV2(
+    participants: readonly string[],
+    maxParticipants: number = WA_DEFAULT_PHASH_MAX_PARTICIPANTS
+): string {
+    if (
+        !Number.isSafeInteger(maxParticipants) ||
+        maxParticipants < 1 ||
+        maxParticipants > WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS
+    ) {
+        throw new Error(
+            `phash maxParticipants must be an integer between 1 and ${WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS}`
+        )
+    }
     if (participants.length === 0) return '2:'
     const n = participants.length
-    if (n > MAX_PARTICIPANTS) {
-        throw new Error(`phash participant count ${n} exceeds MAX_PARTICIPANTS ${MAX_PARTICIPANTS}`)
+    if (n > maxParticipants) {
+        throw new Error(`phash participant count ${n} exceeds maxParticipants ${maxParticipants}`)
     }
+    ensurePhashCapacity(n)
 
     let off = 0
     for (let i = 0; i < n; i += 1) {
-        OFFSETS[i] = off
-        const nextOff = writeCanonicalUtf8(SCRATCH, off, participants[i])
-        if (nextOff > SCRATCH.length) {
+        offsets[i] = off
+        const nextOff = writeCanonicalUtf8(scratch, off, participants[i])
+        if (nextOff > scratch.length) {
             throw new Error(
-                `phash canonical buffer overflow at participant ${i}: needs ${nextOff} bytes, scratch is ${SCRATCH.length}`
+                `phash canonical buffer overflow at participant ${i}: needs ${nextOff} bytes, scratch is ${scratch.length}`
             )
         }
         off = nextOff
     }
-    OFFSETS[n] = off
+    offsets[n] = off
 
-    for (let i = 0; i < n; i += 1) ORDER[i] = i
-    ORDER.subarray(0, n).sort((a, b) => compareScratchSlice(SCRATCH, OFFSETS, a, b))
+    for (let i = 0; i < n; i += 1) order[i] = i
+    order.subarray(0, n).sort((a, b) => compareScratchSlice(scratch, offsets, a, b))
 
     const parts = new Array<Uint8Array>(n)
     for (let i = 0; i < n; i += 1) {
-        const idx = ORDER[i]
-        parts[i] = SCRATCH.subarray(OFFSETS[idx], OFFSETS[idx + 1])
+        const idx = order[i]
+        parts[i] = scratch.subarray(offsets[idx], offsets[idx + 1])
     }
     const digest = sha256(parts)
     return `2:${bytesToBase64(digest.subarray(0, PHASH_DIGEST_PREFIX))}`
+}
+
+function ensurePhashCapacity(required: number): void {
+    if (required <= order.length) return
+
+    let capacity = order.length
+    while (capacity < required) capacity *= 2
+
+    scratch = new Uint8Array(capacity * PER_WID_BYTES)
+    offsets = new Uint32Array(capacity + 1)
+    order = new Uint32Array(capacity)
 }
 
 function writeCanonicalUtf8(out: Uint8Array, start: number, jid: string): number {
