@@ -15,11 +15,12 @@ concurrency:
 jobs:
     publish:
         env:
-          CR_PAT: ${{ secrets.GHCR_PAT }}
+          NODE_AUTH_TOKEN: ${{ secrets.GHCR_PAT }}
         runs-on: ubuntu-latest
         timeout-minutes: 20
         permissions:
             contents: read
+            packages: write
             id-token: write # OIDC token exchanged for npm publish credentials
         # environment: npm-publish   # optional: gate publishes behind required reviewers
 
