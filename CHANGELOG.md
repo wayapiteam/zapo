@@ -1,5 +1,11 @@
 # zapo-js
 
+## 1.5.2
+
+### Patch Changes
+
+- Add sanitized negative message publish acknowledgement diagnostics to structured logs, including acknowledgement attributes and outbound group addressing context.
+
 ## 1.5.0
 
 ### Minor Changes

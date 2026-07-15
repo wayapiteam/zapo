@@ -1,6 +1,6 @@
 {
     "name": "@wayapiteam/zapo",
-    "version": "1.5.1",
+    "version": "1.5.2",
     "description": "High-performance WhatsApp Web TypeScript library",
     "license": "MIT",
     "author": "vinikjkkj <contact@vinicius.email> (https://github.com/vinikjkkj)",
