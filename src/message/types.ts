@@ -24,7 +24,7 @@ export interface WaMessagePublishNackNodeSummary {
 }
 
 /**
- * JSON-safe diagnostics attached to a negative message publish error.
+ * JSON-safe context emitted when logging a negative message publish acknowledgement.
  * Binary and text node content is reduced to type and length metadata.
  */
 export type WaMessagePublishNackDiagnostics = Readonly<Record<string, unknown>> & {

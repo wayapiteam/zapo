@@ -1,5 +1,11 @@
 # zapo-js
 
+## 1.5.4
+
+### Patch Changes
+
+- Keep sanitized negative message publish acknowledgement diagnostics exclusively in structured logs instead of attaching them to thrown errors.
+
 ## 1.5.3
 
 ### Patch Changes

@@ -39,34 +39,11 @@ interface WaMessageClientOptions {
 
 class MessagePublishNackError extends Error {
     public readonly retryable: boolean
-    public readonly diagnostics: WaMessagePublishNackDiagnostics
 
-    public constructor(
-        ackNode: BinaryNode,
-        outboundNode: BinaryNode,
-        attempt: number,
-        maxAttempts: number
-    ) {
-        const message = `negative publish ack: ${describeAckNode(ackNode)}`
-        const retryable = isRetryableNegativeAck(ackNode)
+    public constructor(message: string, retryable: boolean) {
         super(message)
         this.name = 'MessagePublishNackError'
         this.retryable = retryable
-        this.diagnostics = {
-            attempt,
-            maxAttempts,
-            nackRetryable: retryable,
-            message,
-            ackTag: ackNode.tag,
-            ackAttrs: ackNode.attrs,
-            ackContent: summarizeNodeContent(ackNode.content),
-            outboundTo: outboundNode.attrs.to,
-            outboundId: outboundNode.attrs.id,
-            outboundType: outboundNode.attrs.type,
-            outboundParticipant: outboundNode.attrs.participant,
-            outboundPhash: outboundNode.attrs.phash,
-            outboundAddressingMode: outboundNode.attrs.addressing_mode
-        }
     }
 }
 
@@ -131,6 +108,7 @@ export class WaMessageClient {
 
         let lastError: Error | null = null
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+            let nackLogContext: WaMessagePublishNackDiagnostics | null = null
             try {
                 this.logger.debug('message publish attempt', {
                     attempt,
@@ -148,7 +126,24 @@ export class WaMessageClient {
                     throw new Error(`unexpected publish response: ${describeAckNode(ackNode)}`)
                 }
                 if (isNegativeAckNode(ackNode)) {
-                    throw new MessagePublishNackError(ackNode, node, attempt, maxAttempts)
+                    const message = `negative publish ack: ${describeAckNode(ackNode)}`
+                    const retryable = isRetryableNegativeAck(ackNode)
+                    nackLogContext = {
+                        attempt,
+                        maxAttempts,
+                        nackRetryable: retryable,
+                        message,
+                        ackTag: ackNode.tag,
+                        ackAttrs: ackNode.attrs,
+                        ackContent: summarizeNodeContent(ackNode.content),
+                        outboundTo: node.attrs.to,
+                        outboundId: node.attrs.id,
+                        outboundType: node.attrs.type,
+                        outboundParticipant: node.attrs.participant,
+                        outboundPhash: node.attrs.phash,
+                        outboundAddressingMode: node.attrs.addressing_mode
+                    }
+                    throw new MessagePublishNackError(message, retryable)
                 }
                 if (attempt > 1) {
                     this.logger.info('message publish acknowledged after retry', {
@@ -178,7 +173,7 @@ export class WaMessageClient {
                 lastError = toError(error)
                 const nackError = error instanceof MessagePublishNackError ? error : null
                 const nackRetryable = nackError?.retryable ?? false
-                const logContext = nackError?.diagnostics ?? {
+                const logContext = nackLogContext ?? {
                     attempt,
                     maxAttempts,
                     nackRetryable,
