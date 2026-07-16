@@ -12,6 +12,37 @@ export interface WaMessagePublishOptions {
     readonly retryDelayMs?: number
 }
 
+export type WaMessagePublishNackContentSummary =
+    | { readonly kind: 'bytes'; readonly byteLength: number }
+    | { readonly kind: 'text'; readonly charLength: number }
+    | readonly WaMessagePublishNackNodeSummary[]
+
+export interface WaMessagePublishNackNodeSummary {
+    readonly tag: string
+    readonly attrs: Readonly<Record<string, string>>
+    readonly content?: WaMessagePublishNackContentSummary
+}
+
+/**
+ * JSON-safe diagnostics attached to a negative message publish error.
+ * Binary and text node content is reduced to type and length metadata.
+ */
+export type WaMessagePublishNackDiagnostics = Readonly<Record<string, unknown>> & {
+    readonly attempt: number
+    readonly maxAttempts: number
+    readonly nackRetryable: boolean
+    readonly message: string
+    readonly ackTag: string
+    readonly ackAttrs: Readonly<Record<string, string>>
+    readonly ackContent?: WaMessagePublishNackContentSummary
+    readonly outboundTo?: string
+    readonly outboundId?: string
+    readonly outboundType?: string
+    readonly outboundParticipant?: string
+    readonly outboundPhash?: string
+    readonly outboundAddressingMode?: string
+}
+
 export interface WaMessageAckMetadata {
     readonly t?: string
     readonly sync?: string

@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import { createNoopLogger, type Logger } from '@infra/log/types'
 import { WaMessageClient } from '@message/WaMessageClient'
+import type { WaMessagePublishNackDiagnostics } from '@message/types'
 import type { BinaryNode } from '@transport/types'
 
 interface CapturedLog {
@@ -57,10 +58,19 @@ test('message publish NACK logs sanitized ack and outbound diagnostics', async (
         content: new Uint8Array([9, 8, 7])
     }
 
-    await assert.rejects(() => client.publishNode(outboundNode), /error=420/)
+    let publishError: (Error & { readonly diagnostics?: WaMessagePublishNackDiagnostics }) | null =
+        null
+    try {
+        await client.publishNode(outboundNode)
+    } catch (error) {
+        assert.ok(error instanceof Error)
+        publishError = error
+    }
 
+    assert.match(publishError?.message ?? '', /error=420/)
     assert.equal(warnings.length, 1)
     assert.equal(warnings[0].message, 'message publish attempt failed')
+    assert.strictEqual(warnings[0].context, publishError?.diagnostics)
     assert.deepEqual(warnings[0].context?.ackAttrs, ackNode.attrs)
     assert.equal(warnings[0].context?.ackTag, 'ack')
     assert.deepEqual(warnings[0].context?.ackContent, [

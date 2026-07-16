@@ -1,5 +1,11 @@
 # zapo-js
 
+## 1.5.3
+
+### Patch Changes
+
+- Attach the sanitized negative message publish acknowledgement diagnostics to the thrown error so downstream services can preserve them without rebuilding protocol context.
+
 ## 1.5.2
 
 ### Patch Changes

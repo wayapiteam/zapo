@@ -8,6 +8,8 @@ import {
 import type {
     WaEncryptedMessageInput,
     WaMessageAckMetadata,
+    WaMessagePublishNackContentSummary,
+    WaMessagePublishNackDiagnostics,
     WaMessagePublishOptions,
     WaMessagePublishResult,
     WaSendReceiptInput
@@ -35,30 +37,42 @@ interface WaMessageClientOptions {
     readonly defaultRetryDelayMs?: number
 }
 
-type LogSafeNodeContent =
-    | { readonly kind: 'bytes'; readonly byteLength: number }
-    | { readonly kind: 'text'; readonly charLength: number }
-    | readonly LogSafeNode[]
-
-interface LogSafeNode {
-    readonly tag: string
-    readonly attrs: Readonly<Record<string, string>>
-    readonly content?: LogSafeNodeContent
-}
-
 class MessagePublishNackError extends Error {
     public readonly retryable: boolean
-    public readonly ackNode: BinaryNode
+    public readonly diagnostics: WaMessagePublishNackDiagnostics
 
-    public constructor(ackNode: BinaryNode) {
-        super(`negative publish ack: ${describeAckNode(ackNode)}`)
+    public constructor(
+        ackNode: BinaryNode,
+        outboundNode: BinaryNode,
+        attempt: number,
+        maxAttempts: number
+    ) {
+        const message = `negative publish ack: ${describeAckNode(ackNode)}`
+        const retryable = isRetryableNegativeAck(ackNode)
+        super(message)
         this.name = 'MessagePublishNackError'
-        this.retryable = isRetryableNegativeAck(ackNode)
-        this.ackNode = ackNode
+        this.retryable = retryable
+        this.diagnostics = {
+            attempt,
+            maxAttempts,
+            nackRetryable: retryable,
+            message,
+            ackTag: ackNode.tag,
+            ackAttrs: ackNode.attrs,
+            ackContent: summarizeNodeContent(ackNode.content),
+            outboundTo: outboundNode.attrs.to,
+            outboundId: outboundNode.attrs.id,
+            outboundType: outboundNode.attrs.type,
+            outboundParticipant: outboundNode.attrs.participant,
+            outboundPhash: outboundNode.attrs.phash,
+            outboundAddressingMode: outboundNode.attrs.addressing_mode
+        }
     }
 }
 
-function summarizeNodeContent(content: BinaryNode['content']): LogSafeNodeContent | undefined {
+function summarizeNodeContent(
+    content: BinaryNode['content']
+): WaMessagePublishNackContentSummary | undefined {
     if (content === undefined) return undefined
     if (content instanceof Uint8Array) {
         return { kind: 'bytes', byteLength: content.byteLength }
@@ -134,7 +148,7 @@ export class WaMessageClient {
                     throw new Error(`unexpected publish response: ${describeAckNode(ackNode)}`)
                 }
                 if (isNegativeAckNode(ackNode)) {
-                    throw new MessagePublishNackError(ackNode)
+                    throw new MessagePublishNackError(ackNode, node, attempt, maxAttempts)
                 }
                 if (attempt > 1) {
                     this.logger.info('message publish acknowledged after retry', {
@@ -164,24 +178,11 @@ export class WaMessageClient {
                 lastError = toError(error)
                 const nackError = error instanceof MessagePublishNackError ? error : null
                 const nackRetryable = nackError?.retryable ?? false
-                const logContext = {
+                const logContext = nackError?.diagnostics ?? {
                     attempt,
                     maxAttempts,
                     nackRetryable,
-                    message: lastError.message,
-                    ...(nackError
-                        ? {
-                              ackTag: nackError.ackNode.tag,
-                              ackAttrs: nackError.ackNode.attrs,
-                              ackContent: summarizeNodeContent(nackError.ackNode.content),
-                              outboundTo: node.attrs.to,
-                              outboundId: node.attrs.id,
-                              outboundType: node.attrs.type,
-                              outboundParticipant: node.attrs.participant,
-                              outboundPhash: node.attrs.phash,
-                              outboundAddressingMode: node.attrs.addressing_mode
-                          }
-                        : {})
+                    message: lastError.message
                 }
                 const canRetry =
                     attempt < maxAttempts &&
