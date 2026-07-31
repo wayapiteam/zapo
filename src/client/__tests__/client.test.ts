@@ -1106,3 +1106,53 @@ test('uploadNewsletterMedia builds plaintext URL and parses response', async () 
     assert.equal(result.fileLength, 4)
     assert.equal(result.fileSha256.byteLength, 32)
 })
+
+test('uploadNewsletterLinkPreviewThumbnail uses the public newsletter thumbnail endpoint', async () => {
+    const { uploadNewsletterLinkPreviewThumbnail } = await import('@client/newsletter/content')
+    const thumbnail = new Uint8Array([0xff, 0xd8, 0xff, 0xd9])
+    const captured: { url?: string; body?: Uint8Array } = {}
+    const responseBody = new TextEncoder().encode(
+        JSON.stringify({
+            url: 'https://media.example/link-thumbnail',
+            direct_path: '/newsletter/link-thumbnail'
+        })
+    )
+    const mediaTransfer = {
+        uploadStream: async (request: { url: string; body: Uint8Array }) => {
+            captured.url = request.url
+            captured.body = request.body
+            return {
+                url: request.url,
+                status: 200,
+                ok: true,
+                headers: {},
+                body: null
+            }
+        },
+        readResponseBytes: async () => responseBody
+    } as unknown as Parameters<typeof uploadNewsletterLinkPreviewThumbnail>[0]['mediaTransfer']
+
+    const result = await uploadNewsletterLinkPreviewThumbnail(
+        { mediaTransfer, logger: createNoopLogger() },
+        {
+            thumbnail: { bytes: thumbnail, width: 200, height: 100 },
+            mediaConn: {
+                auth: 'AUTH-TOKEN',
+                expiresAtMs: Date.now() + 60_000,
+                hosts: [{ hostname: 'mmg.whatsapp.net', isFallback: false }]
+            }
+        }
+    )
+
+    assert.match(
+        captured.url ?? '',
+        /^https:\/\/mmg\.whatsapp\.net\/newsletter\/newsletter-thumbnail-link\//
+    )
+    assert.deepEqual(captured.body, thumbnail)
+    assert.equal(result.thumbnailDirectPath, '/newsletter/link-thumbnail')
+    assert.equal(result.thumbnailSha256?.byteLength, 32)
+    assert.equal(result.thumbnailWidth, 200)
+    assert.equal(result.thumbnailHeight, 100)
+    assert.equal(result.thumbnailEncSha256, undefined)
+    assert.equal(result.mediaKey, undefined)
+})

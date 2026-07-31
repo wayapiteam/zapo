@@ -28,6 +28,10 @@ import { toError } from '@util/primitives'
 
 const INLINE_THUMBNAIL_MAX_BYTES = 64 * 1024
 
+export type WaLinkPreviewThumbnailUploader = (
+    thumbnail: WaLinkPreviewThumbnailInput
+) => Promise<WaLinkPreviewThumbnailFields>
+
 export interface ResolveLinkPreviewDeps {
     readonly logger: Logger
     readonly mediaTransfer: WaMediaTransferClient
@@ -35,6 +39,7 @@ export interface ResolveLinkPreviewDeps {
     readonly fetcher: WaLinkPreviewFetcher
     readonly options: WaLinkPreviewOptions
     readonly serverClock: ServerClock
+    readonly thumbnailUploader?: WaLinkPreviewThumbnailUploader
 }
 
 export interface ResolvedLinkPreviewResult {
@@ -106,7 +111,9 @@ async function resolveBytesThumbnailFields(
         return inlineFields
     }
     try {
-        const hqFields = await uploadHqFromBytes(deps, thumbnail)
+        const hqFields = deps.thumbnailUploader
+            ? await deps.thumbnailUploader(thumbnail)
+            : await uploadHqFromBytes(deps, thumbnail)
         return { ...inlineFields, ...hqFields }
     } catch (error) {
         deps.logger.warn('link preview thumbnail upload failed', {
@@ -125,7 +132,9 @@ async function resolveStreamThumbnailFields(
         return {}
     }
     try {
-        return await uploadHqFromStream(deps, thumbnail)
+        return deps.thumbnailUploader
+            ? await deps.thumbnailUploader(thumbnail)
+            : await uploadHqFromStream(deps, thumbnail)
     } catch (error) {
         deps.logger.warn('link preview thumbnail upload failed', {
             message: toError(error).message

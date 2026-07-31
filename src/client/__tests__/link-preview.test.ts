@@ -221,6 +221,39 @@ test('resolveLinkPreview uploads HQ thumbnail when oversize and upload enabled',
     assert.equal(r?.thumbnailFields.thumbnailHeight, 100)
 })
 
+test('resolveLinkPreview uses a destination-specific thumbnail uploader', async () => {
+    const thumbnail = new Uint8Array([0xff, 0xd8, 0xff, 0xd9])
+    let uploadedThumbnail: unknown
+    const r = await resolveLinkPreview(
+        'see https://example.com',
+        { thumbnail: { bytes: thumbnail, width: 200, height: 100 } },
+        {
+            logger: createNoopLogger(),
+            mediaTransfer: uploadStubMediaTransfer('').transfer,
+            getMediaConn: () => Promise.resolve(fakeMediaConn),
+            serverClock: localServerClock,
+            fetcher: noopFetcher(),
+            options: {},
+            thumbnailUploader: async (input) => {
+                uploadedThumbnail = input
+                return {
+                    thumbnailDirectPath: '/newsletter/thumbnail',
+                    thumbnailSha256: new Uint8Array(32),
+                    thumbnailWidth: input.width,
+                    thumbnailHeight: input.height
+                }
+            }
+        }
+    )
+
+    assert.deepEqual(uploadedThumbnail, { bytes: thumbnail, width: 200, height: 100 })
+    assert.equal(r?.thumbnailFields.jpegThumbnail, thumbnail)
+    assert.equal(r?.thumbnailFields.thumbnailDirectPath, '/newsletter/thumbnail')
+    assert.equal(r?.thumbnailFields.thumbnailSha256?.byteLength, 32)
+    assert.equal(r?.thumbnailFields.thumbnailEncSha256, undefined)
+    assert.equal(r?.thumbnailFields.mediaKey, undefined)
+})
+
 test('resolveLinkPreview drops thumbnail on upload failure', async () => {
     const failingTransfer = {
         async uploadStream(): Promise<{ status: number; url: string }> {

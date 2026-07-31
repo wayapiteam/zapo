@@ -12,6 +12,8 @@ import { NEWSLETTER_MEDIA_UPLOAD_PATHS, type NewsletterMediaKind } from '@media/
 import { createStickerPackZipStream } from '@media/sticker/sticker-pack'
 import type { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
 import type { WaMediaConn } from '@media/types'
+import type { WaLinkPreviewThumbnailFields } from '@message/addons/link-preview/builder'
+import type { WaLinkPreviewThumbnailInput } from '@message/addons/link-preview/types'
 import { applyContextInfo, type WaSendContextInfo } from '@message/context-info'
 import {
     isSendEventMessage,
@@ -113,6 +115,31 @@ export async function uploadNewsletterMedia(
         fileSha256: upload.fileSha256,
         fileLength: upload.byteLength,
         mediaId: upload.mediaId
+    }
+}
+
+export async function uploadNewsletterLinkPreviewThumbnail(
+    options: {
+        readonly mediaTransfer: WaMediaTransferClient
+        readonly logger: Logger
+    },
+    input: {
+        readonly thumbnail: WaLinkPreviewThumbnailInput
+        readonly mediaConn: WaMediaConn
+    }
+): Promise<WaLinkPreviewThumbnailFields> {
+    const thumbnail = input.thumbnail
+    const upload = await uploadNewsletterMedia(options, {
+        mediaKind: 'thumbnail-link',
+        media: 'bytes' in thumbnail ? thumbnail.bytes : thumbnail.stream,
+        mimetype: 'image/jpeg',
+        mediaConn: input.mediaConn
+    })
+    return {
+        thumbnailDirectPath: upload.directPath,
+        thumbnailSha256: upload.fileSha256,
+        ...(thumbnail.width !== undefined ? { thumbnailWidth: thumbnail.width } : {}),
+        ...(thumbnail.height !== undefined ? { thumbnailHeight: thumbnail.height } : {})
     }
 }
 

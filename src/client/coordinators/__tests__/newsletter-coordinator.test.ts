@@ -220,7 +220,10 @@ test('coordinator send(jid, "text") wraps as conversation proto', async () => {
 })
 
 test('coordinator send preserves link preview thumbnail in newsletter plaintext', async () => {
-    const thumbnail = new Uint8Array([1, 2, 3])
+    const thumbnail = Buffer.from(
+        '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAEf/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABAf/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPxB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPxB//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxB//9k=',
+        'base64'
+    )
     const newsletterJid = '120363025343298869@newsletter'
     const text = 'see https://example.com'
     const env = createTestCoordinator(
@@ -235,6 +238,8 @@ test('coordinator send preserves link preview thumbnail in newsletter plaintext'
                 },
                 thumbnailFields: {
                     jpegThumbnail: thumbnail,
+                    thumbnailDirectPath: '/newsletter/link-thumbnail',
+                    thumbnailSha256: new Uint8Array(32),
                     thumbnailWidth: 320,
                     thumbnailHeight: 160
                 }
@@ -260,7 +265,13 @@ test('coordinator send preserves link preview thumbnail in newsletter plaintext'
     assert.equal(message.extendedTextMessage?.matchedText, 'https://example.com')
     assert.equal(message.extendedTextMessage?.title, 'Example')
     assert.equal(message.extendedTextMessage?.description, 'Example description')
-    assert.deepEqual(Array.from(message.extendedTextMessage?.jpegThumbnail ?? []), [1, 2, 3])
+    assert.deepEqual(message.extendedTextMessage?.jpegThumbnail, thumbnail)
+    assert.equal(message.extendedTextMessage?.jpegThumbnail?.[0], 0xff)
+    assert.equal(message.extendedTextMessage?.jpegThumbnail?.[1], 0xd8)
+    assert.equal(message.extendedTextMessage?.thumbnailDirectPath, '/newsletter/link-thumbnail')
+    assert.equal(message.extendedTextMessage?.thumbnailSha256?.byteLength, 32)
+    assert.equal(message.extendedTextMessage?.thumbnailEncSha256, null)
+    assert.equal(message.extendedTextMessage?.mediaKey, null)
     assert.equal(message.extendedTextMessage?.thumbnailWidth, 320)
     assert.equal(message.extendedTextMessage?.thumbnailHeight, 160)
 })
