@@ -254,6 +254,65 @@ test('coordinator listSubscribed parses metadata array', async () => {
     assert.equal(list[1].viewerRole, 'OWNER')
 })
 
+test('coordinator fetch sends all variables required by the current mex operation', async () => {
+    const newsletterJid = '120363025343298869@newsletter'
+    const env = createTestCoordinator({
+        resultData: {
+            xwa2_newsletter: {
+                id: newsletterJid,
+                state: { type: 'ACTIVE' }
+            }
+        }
+    })
+
+    const metadata = await env.coordinator.fetch(newsletterJid)
+
+    assert.equal(metadata.jid, newsletterJid)
+    const queryNode = env.mexCalls[0].node.content?.[0] as BinaryNode | undefined
+    assert.ok(queryNode)
+    const body = JSON.parse(queryNode.content as string)
+    assert.deepEqual(body.variables, {
+        input: {
+            key: newsletterJid,
+            type: 'JID',
+            view_role: 'SUBSCRIBER'
+        },
+        fetch_viewer_metadata: true,
+        fetch_full_image: true,
+        fetch_creation_time: true,
+        fetch_wamo_sub: false,
+        fetch_pinned_messages: false,
+        fetch_status_metadata: false
+    })
+})
+
+test('coordinator fetchDehydrated disables pinned messages in the mex request', async () => {
+    const newsletterJid = '120363025343298869@newsletter'
+    const env = createTestCoordinator({
+        resultData: {
+            xwa2_newsletter: {
+                id: newsletterJid
+            }
+        }
+    })
+
+    const metadata = await env.coordinator.fetchDehydrated(newsletterJid)
+
+    assert.equal(metadata.jid, newsletterJid)
+    const queryNode = env.mexCalls[0].node.content?.[0] as BinaryNode | undefined
+    assert.ok(queryNode)
+    const body = JSON.parse(queryNode.content as string)
+    assert.deepEqual(body.variables, {
+        input: {
+            key: newsletterJid,
+            type: 'JID',
+            view_role: 'SUBSCRIBER'
+        },
+        fetch_wamo_sub: false,
+        fetch_pinned_messages: false
+    })
+})
+
 test('coordinator send with media uploads plaintext blob and emits media stanza', async () => {
     const responseBody = new TextEncoder().encode(
         JSON.stringify({
