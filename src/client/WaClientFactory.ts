@@ -665,6 +665,7 @@ export function buildWaClientDependencies(input: {
         generateStanzaId: () => messageDispatch.generateOutgoingMessageId(),
         mediaTransfer,
         getMediaConn: () => getClientMediaConn(mediaMessageBuildOptions),
+        linkPreviewResolver: mediaMessageBuildOptions.linkPreviewResolver,
         getAbPropString: (name) => abPropsCoordinator.getConfigValue<string>(name),
         logger
     })

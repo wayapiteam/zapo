@@ -6,6 +6,7 @@ import {
     parseNewsletterMetadata
 } from '@client/coordinators/WaNewsletterCoordinator'
 import { createNoopLogger } from '@infra/log/types'
+import { proto } from '@proto'
 import { WA_NEWSLETTER_MUTE_TYPES, WA_NEWSLETTER_MUTE_VALUES } from '@protocol/constants'
 import type { BinaryNode } from '@transport/types'
 
@@ -216,6 +217,52 @@ test('coordinator send(jid, "text") wraps as conversation proto', async () => {
     assert.ok(Array.isArray(stanza.content))
     assert.equal(stanza.content[0].tag, 'plaintext')
     assert.ok(stanza.content[0].content instanceof Uint8Array)
+})
+
+test('coordinator send preserves link preview thumbnail in newsletter plaintext', async () => {
+    const thumbnail = new Uint8Array([1, 2, 3])
+    const newsletterJid = '120363025343298869@newsletter'
+    const text = 'see https://example.com'
+    const env = createTestCoordinator(
+        { resultData: null },
+        {
+            linkPreviewResolver: async () => ({
+                resolved: {
+                    matchedText: 'https://example.com',
+                    title: 'Example',
+                    description: 'Example description',
+                    previewType: proto.Message.ExtendedTextMessage.PreviewType.NONE
+                },
+                thumbnailFields: {
+                    jpegThumbnail: thumbnail,
+                    thumbnailWidth: 320,
+                    thumbnailHeight: 160
+                }
+            })
+        }
+    )
+
+    await env.coordinator.send(newsletterJid, {
+        type: 'text',
+        text,
+        linkPreview: {
+            matchedText: 'https://example.com',
+            thumbnail: { bytes: thumbnail }
+        }
+    })
+
+    const stanza = env.sendCalls[0].node
+    assert.ok(Array.isArray(stanza.content))
+    const plaintext = stanza.content[0].content
+    assert.ok(plaintext instanceof Uint8Array)
+    const message = proto.Message.decode(plaintext)
+    assert.equal(message.extendedTextMessage?.text, text)
+    assert.equal(message.extendedTextMessage?.matchedText, 'https://example.com')
+    assert.equal(message.extendedTextMessage?.title, 'Example')
+    assert.equal(message.extendedTextMessage?.description, 'Example description')
+    assert.deepEqual(Array.from(message.extendedTextMessage?.jpegThumbnail ?? []), [1, 2, 3])
+    assert.equal(message.extendedTextMessage?.thumbnailWidth, 320)
+    assert.equal(message.extendedTextMessage?.thumbnailHeight, 160)
 })
 
 test('coordinator send with explicit stanzaId honors caller id', async () => {

@@ -6,6 +6,7 @@ import {
     performPlaintextMediaUpload,
     type WaUploadMediaSource
 } from '@client/media'
+import { buildTextMessageContent, type WaTextMessageBuildOptions } from '@client/messaging/text'
 import type { Logger } from '@infra/log/types'
 import { NEWSLETTER_MEDIA_UPLOAD_PATHS, type NewsletterMediaKind } from '@media/constants'
 import { createStickerPackZipStream } from '@media/sticker/sticker-pack'
@@ -124,8 +125,7 @@ export interface WaNewsletterBuiltContent {
     readonly upload: WaNewsletterUploadResult | null
 }
 
-export interface BuildNewsletterContentOptions {
-    readonly logger: Logger
+export interface BuildNewsletterContentOptions extends WaTextMessageBuildOptions {
     readonly mediaTransfer?: WaMediaTransferClient
     readonly getMediaConn?: () => Promise<WaMediaConn>
 }
@@ -243,7 +243,8 @@ export async function buildNewsletterMessageContent(
     }
 
     if (isSendTextMessage(content)) {
-        const message = applyContextInfo({ extendedTextMessage: { text: content.text } }, ctx)
+        const textMessage = await buildTextMessageContent(options, content)
+        const message = applyContextInfo(textMessage, ctx)
         return {
             kind: 'text',
             plaintext: proto.Message.encode(message).finish(),

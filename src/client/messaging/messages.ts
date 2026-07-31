@@ -16,10 +16,9 @@ import {
     selectMediaUploadHost,
     shouldNormalizeVoiceNote
 } from '@client/media'
-import type { ResolvedLinkPreviewResult } from '@client/messaging/link-preview'
+import { buildTextMessageContent, type WaTextMessageBuildOptions } from '@client/messaging/text'
 import type { WaMediaOptions } from '@client/types'
 import { aesGcmEncrypt, randomBytesAsync, sha256 } from '@crypto'
-import type { Logger } from '@infra/log/types'
 import { MEDIA_CONN_CACHE_GRACE_MS, MEDIA_UPLOAD_PATHS } from '@media/constants'
 import { WaMediaCrypto } from '@media/crypto/WaMediaCrypto'
 import type { WaMediaProcessorCallContext } from '@media/processor'
@@ -27,7 +26,6 @@ import { createStickerPackZipStream } from '@media/sticker/sticker-pack'
 import { parseMediaConnResponse } from '@media/transfer/conn'
 import type { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
 import type { MediaCryptoType, WaMediaConn } from '@media/types'
-import { buildExtendedTextWithPreview } from '@message/addons/link-preview/builder'
 import {
     buildAddonAdditionalData,
     shouldUseAddonAdditionalData
@@ -69,8 +67,7 @@ import type {
     WaSendPollVoteMessage,
     WaSendReactionMessage,
     WaSendRevokeMessage,
-    WaSendStickerPackMessage,
-    WaSendTextMessage
+    WaSendStickerPackMessage
 } from '@message/types'
 import { proto, type Proto } from '@proto'
 import { WA_DEFAULTS } from '@protocol/constants'
@@ -83,8 +80,7 @@ import { toError } from '@util/primitives'
 
 const VOICE_NOTE_MIMETYPE = 'audio/ogg; codecs=opus'
 
-export interface WaMediaMessageOptions {
-    readonly logger: Logger
+export interface WaMediaMessageOptions extends WaTextMessageBuildOptions {
     readonly mediaTransfer: WaMediaTransferClient
     readonly iqTimeoutMs?: number
     readonly queryWithContext: (
@@ -97,9 +93,6 @@ export interface WaMediaMessageOptions {
     readonly setMediaConnCache: (mediaConn: WaMediaConn | null) => void
     readonly serverClock: ServerClock
     readonly media?: WaMediaOptions
-    readonly linkPreviewResolver?: (
-        content: WaSendTextMessage
-    ) => Promise<ResolvedLinkPreviewResult | null>
 }
 
 export interface WaBuildMessageContext {
@@ -379,25 +372,7 @@ export async function buildMediaMessageContent(
         return { message: { conversation: content } }
     }
     if (isSendTextMessage(content)) {
-        if (options.linkPreviewResolver) {
-            try {
-                const preview = await options.linkPreviewResolver(content)
-                if (preview !== null) {
-                    return {
-                        message: buildExtendedTextWithPreview(
-                            content.text,
-                            preview.resolved,
-                            preview.thumbnailFields
-                        )
-                    }
-                }
-            } catch (error) {
-                options.logger.warn('link preview resolver failed, sending plain text', {
-                    message: toError(error).message
-                })
-            }
-        }
-        return { message: { extendedTextMessage: { text: content.text } } }
+        return { message: await buildTextMessageContent(options, content) }
     }
     if (isSendReactionMessage(content)) {
         return { message: buildReactionMessage(content, options.serverClock, ctx) }
