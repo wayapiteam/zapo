@@ -19,6 +19,7 @@ import {
     WA_DEFAULTS,
     WA_MESSAGE_TAGS,
     WA_MESSAGE_TYPES,
+    WA_NACK_REASONS,
     WA_NODE_TAGS
 } from '@protocol/constants'
 import { buildReceiptNode } from '@transport/node/builders/global'
@@ -64,6 +65,138 @@ function summarizeNodeContent(
     }))
 }
 
+interface WaOutboundPublishSummary {
+    readonly outboundMediaIdPresent: boolean
+    readonly outboundChildTags?: readonly string[]
+    readonly outboundPlaintextMediaType?: string
+    readonly outboundPlaintextByteLength?: number
+    readonly outboundParticipantCount?: number
+    readonly outboundParticipantMessageCount?: number
+    readonly outboundParticipantPreKeyCount?: number
+    readonly outboundParticipantWithoutCiphertextCount?: number
+    readonly outboundTopLevelEncType?: string
+    readonly outboundEncryptedMediaType?: string
+    readonly outboundDecryptFail?: string
+    readonly outboundTopLevelCiphertextByteLength?: number
+    readonly outboundDeviceIdentityPresent?: boolean
+    readonly outboundBotParticipantCount?: number
+}
+
+function countParticipantNodes(content: BinaryNode['content']): {
+    readonly total: number
+    readonly message: number
+    readonly preKey: number
+    readonly withoutCiphertext: number
+} {
+    if (!Array.isArray(content)) {
+        return { total: 0, message: 0, preKey: 0, withoutCiphertext: 0 }
+    }
+
+    let total = 0
+    let message = 0
+    let preKey = 0
+    let withoutCiphertext = 0
+    for (let i = 0; i < content.length; i += 1) {
+        const participant = content[i]
+        if (participant.tag !== 'to') continue
+        total += 1
+        if (!Array.isArray(participant.content)) {
+            withoutCiphertext += 1
+            continue
+        }
+        let encType: string | undefined
+        for (let childIndex = 0; childIndex < participant.content.length; childIndex += 1) {
+            const child = participant.content[childIndex]
+            if (child.tag === WA_MESSAGE_TAGS.ENC) {
+                encType = child.attrs.type
+                break
+            }
+        }
+        if (encType === 'msg') message += 1
+        else if (encType === 'pkmsg') preKey += 1
+        else withoutCiphertext += 1
+    }
+    return { total, message, preKey, withoutCiphertext }
+}
+
+function classifyNackCode(code?: string): WaMessagePublishNackDiagnostics['nackCategory'] {
+    if (!code) return 'other'
+    if (code === '401') return 'authorization'
+    if (code === String(WA_NACK_REASONS.STALE_GROUP_ADDRESSING_MODE)) {
+        return 'stale_group_addressing_mode'
+    }
+    if (code === '429') return 'rate_limit'
+    const numericCode = Number(code)
+    if (numericCode >= 400 && numericCode < 500) return 'client_rejection'
+    if (numericCode >= 500 && numericCode < 600) return 'server_error'
+    return 'other'
+}
+
+function summarizeOutboundNode(node: BinaryNode): WaOutboundPublishSummary {
+    const content = node.content
+    if (!Array.isArray(content)) {
+        return { outboundMediaIdPresent: node.attrs.media_id !== undefined }
+    }
+
+    const childTags = new Array<string>(content.length)
+    let plaintextMediaType: string | undefined
+    let plaintextByteLength: number | undefined
+    let participantCount: number | undefined
+    let participantMessageCount: number | undefined
+    let participantPreKeyCount: number | undefined
+    let participantWithoutCiphertextCount: number | undefined
+    let topLevelEncType: string | undefined
+    let encryptedMediaType: string | undefined
+    let decryptFail: string | undefined
+    let topLevelCiphertextByteLength: number | undefined
+    let deviceIdentityPresent = false
+    let botParticipantCount: number | undefined
+    for (let i = 0; i < content.length; i += 1) {
+        const child = content[i]
+        childTags[i] = child.tag
+        if (child.tag === WA_NODE_TAGS.PLAINTEXT) {
+            plaintextMediaType = child.attrs.mediatype
+            if (child.content instanceof Uint8Array) {
+                plaintextByteLength = child.content.byteLength
+            }
+        } else if (child.tag === WA_NODE_TAGS.PARTICIPANTS) {
+            const counts = countParticipantNodes(child.content)
+            participantCount = counts.total
+            participantMessageCount = counts.message
+            participantPreKeyCount = counts.preKey
+            participantWithoutCiphertextCount = counts.withoutCiphertext
+        } else if (child.tag === WA_MESSAGE_TAGS.ENC) {
+            topLevelEncType = child.attrs.type
+            encryptedMediaType = child.attrs.mediatype
+            decryptFail = child.attrs['decrypt-fail']
+            if (child.content instanceof Uint8Array) {
+                topLevelCiphertextByteLength = child.content.byteLength
+            }
+        } else if (child.tag === WA_NODE_TAGS.DEVICE_IDENTITY) {
+            deviceIdentityPresent = true
+        } else if (child.tag === WA_NODE_TAGS.BOT) {
+            botParticipantCount = countParticipantNodes(child.content).total
+        }
+    }
+
+    return {
+        outboundMediaIdPresent: node.attrs.media_id !== undefined,
+        outboundChildTags: childTags,
+        outboundPlaintextMediaType: plaintextMediaType,
+        outboundPlaintextByteLength: plaintextByteLength,
+        outboundParticipantCount: participantCount,
+        outboundParticipantMessageCount: participantMessageCount,
+        outboundParticipantPreKeyCount: participantPreKeyCount,
+        outboundParticipantWithoutCiphertextCount: participantWithoutCiphertextCount,
+        outboundTopLevelEncType: topLevelEncType,
+        outboundEncryptedMediaType: encryptedMediaType,
+        outboundDecryptFail: decryptFail,
+        outboundTopLevelCiphertextByteLength: topLevelCiphertextByteLength,
+        outboundDeviceIdentityPresent: deviceIdentityPresent,
+        outboundBotParticipantCount: botParticipantCount
+    }
+}
+
 /**
  * Low-level message-publishing client. Sends pre-built message/receipt nodes,
  * handles ack timeouts and retry on negative-ack failures, and is the
@@ -102,15 +235,17 @@ export class WaMessageClient {
         const ackTimeoutMs = options.ackTimeoutMs ?? this.defaultAckTimeoutMs
         const maxAttempts = options.maxAttempts ?? this.defaultMaxAttempts
         const retryDelayMs = options.retryDelayMs ?? this.defaultRetryDelayMs
+        const logger = options.logger ?? this.logger
         if (ackTimeoutMs < 1 || maxAttempts < 1 || retryDelayMs < 0) {
             throw new Error('invalid message publish options')
         }
 
         let lastError: Error | null = null
         for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+            const attemptStartedAt = Date.now()
             let nackLogContext: WaMessagePublishNackDiagnostics | null = null
             try {
-                this.logger.debug('message publish attempt', {
+                logger.debug('message publish attempt', {
                     attempt,
                     maxAttempts,
                     to: node.attrs.to,
@@ -128,25 +263,40 @@ export class WaMessageClient {
                 if (isNegativeAckNode(ackNode)) {
                     const message = `negative publish ack: ${describeAckNode(ackNode)}`
                     const retryable = isRetryableNegativeAck(ackNode)
+                    const nackCodeSource = ackNode.attrs.error
+                        ? 'error'
+                        : ackNode.attrs.code
+                          ? 'code'
+                          : undefined
+                    const nackCode = nackCodeSource ? ackNode.attrs[nackCodeSource] : undefined
                     nackLogContext = {
                         attempt,
                         maxAttempts,
                         nackRetryable: retryable,
                         message,
+                        nackCode,
+                        nackCategory: classifyNackCode(nackCode),
+                        nackCodeSource,
+                        attemptDurationMs: Date.now() - attemptStartedAt,
                         ackTag: ackNode.tag,
                         ackAttrs: ackNode.attrs,
                         ackContent: summarizeNodeContent(ackNode.content),
+                        ackFrom: ackNode.attrs.from,
+                        ackTimestamp: ackNode.attrs.t,
+                        waMessageId: node.attrs.id,
                         outboundTo: node.attrs.to,
                         outboundId: node.attrs.id,
                         outboundType: node.attrs.type,
+                        outboundEdit: node.attrs.edit,
                         outboundParticipant: node.attrs.participant,
                         outboundPhash: node.attrs.phash,
-                        outboundAddressingMode: node.attrs.addressing_mode
+                        outboundAddressingMode: node.attrs.addressing_mode,
+                        ...summarizeOutboundNode(node)
                     }
                     throw new MessagePublishNackError(message, retryable)
                 }
                 if (attempt > 1) {
-                    this.logger.info('message publish acknowledged after retry', {
+                    logger.info('message publish acknowledged after retry', {
                         id,
                         tag: ackNode.tag,
                         type: ackNode.attrs.type,
@@ -155,7 +305,7 @@ export class WaMessageClient {
                         attempts: attempt
                     })
                 } else {
-                    this.logger.trace('message publish acknowledged', {
+                    logger.trace('message publish acknowledged', {
                         id,
                         tag: ackNode.tag,
                         type: ackNode.attrs.type,
@@ -183,11 +333,11 @@ export class WaMessageClient {
                     attempt < maxAttempts &&
                     (this.isRetryablePublishError(lastError) || nackRetryable)
                 if (canRetry) {
-                    this.logger.debug('message publish attempt failed, will retry', logContext)
+                    logger.debug('message publish attempt failed, will retry', logContext)
                     await delay(retryDelayMs * attempt)
                     continue
                 }
-                this.logger.warn('message publish attempt failed', logContext)
+                logger.warn('message publish attempt failed', logContext)
                 throw lastError
             }
         }

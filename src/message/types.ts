@@ -1,5 +1,6 @@
 import type { Readable } from 'node:stream'
 
+import type { Logger } from '@infra/log/types'
 import type { WaLinkPreviewOverride } from '@message/addons/link-preview/types'
 import type { WaSendContextInfo } from '@message/context-info'
 import type { Proto } from '@proto'
@@ -10,6 +11,12 @@ export interface WaMessagePublishOptions {
     readonly ackTimeoutMs?: number
     readonly maxAttempts?: number
     readonly retryDelayMs?: number
+    /**
+     * Logger scoped to this publish operation. Use a child logger to attach
+     * application correlation fields such as `messageId` and `correlationId`.
+     * Defaults to the logger injected into the client.
+     */
+    readonly logger?: Logger
 }
 
 export type WaMessagePublishNackContentSummary =
@@ -32,15 +39,43 @@ export type WaMessagePublishNackDiagnostics = Readonly<Record<string, unknown>> 
     readonly maxAttempts: number
     readonly nackRetryable: boolean
     readonly message: string
+    readonly nackCode?: string
+    readonly nackCategory?:
+        | 'authorization'
+        | 'stale_group_addressing_mode'
+        | 'rate_limit'
+        | 'client_rejection'
+        | 'server_error'
+        | 'other'
+    readonly nackCodeSource?: 'error' | 'code'
+    readonly attemptDurationMs?: number
     readonly ackTag: string
     readonly ackAttrs: Readonly<Record<string, string>>
     readonly ackContent?: WaMessagePublishNackContentSummary
+    readonly ackFrom?: string
+    readonly ackTimestamp?: string
+    readonly waMessageId?: string
     readonly outboundTo?: string
     readonly outboundId?: string
     readonly outboundType?: string
+    readonly outboundEdit?: string
     readonly outboundParticipant?: string
     readonly outboundPhash?: string
     readonly outboundAddressingMode?: string
+    readonly outboundMediaIdPresent?: boolean
+    readonly outboundChildTags?: readonly string[]
+    readonly outboundPlaintextMediaType?: string
+    readonly outboundPlaintextByteLength?: number
+    readonly outboundParticipantCount?: number
+    readonly outboundParticipantMessageCount?: number
+    readonly outboundParticipantPreKeyCount?: number
+    readonly outboundParticipantWithoutCiphertextCount?: number
+    readonly outboundTopLevelEncType?: string
+    readonly outboundEncryptedMediaType?: string
+    readonly outboundDecryptFail?: string
+    readonly outboundTopLevelCiphertextByteLength?: number
+    readonly outboundDeviceIdentityPresent?: boolean
+    readonly outboundBotParticipantCount?: number
 }
 
 export interface WaMessageAckMetadata {

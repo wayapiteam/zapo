@@ -1,5 +1,5 @@
 import type { WaSendContextInfo } from '@message/context-info'
-import type { WaMessagePublishResult } from '@message/types'
+import type { WaMessagePublishOptions, WaMessagePublishResult } from '@message/types'
 import type { WaMexOperationResponses } from '@mex'
 import type {
     WA_NEWSLETTER_VIEW_ROLES,
@@ -123,7 +123,7 @@ export interface WaNewsletterAdminInviteResult {
     readonly expirationTime?: number
 }
 
-export interface WaNewsletterSendOptions {
+export interface WaNewsletterSendOptions extends WaMessagePublishOptions {
     readonly stanzaId?: string
     readonly contextInfo?: WaSendContextInfo | null
     /**

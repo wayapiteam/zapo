@@ -813,7 +813,11 @@ export function buildWaClientDependencies(input: {
             newsletterCoordinator.send(newsletterJid, content, {
                 stanzaId: sendOptions.id,
                 contextInfo,
-                additionalAttributes: sendOptions.additionalAttributes
+                additionalAttributes: sendOptions.additionalAttributes,
+                ackTimeoutMs: sendOptions.ackTimeoutMs,
+                maxAttempts: sendOptions.maxAttempts,
+                retryDelayMs: sendOptions.retryDelayMs,
+                logger: sendOptions.logger
             }),
         getIcdcHashLength: () => abPropsCoordinator.getConfigValue('md_icdc_hash_length'),
         mobileMessageIdFormat: isMobilePrimary,

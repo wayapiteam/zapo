@@ -208,7 +208,7 @@ export function createMessagingOps(deps: WaNewsletterMessagingDeps): WaNewslette
                 null,
                 sendOptions?.additionalAttributes
             )
-            const result = await deps.publishMessageNode(node)
+            const result = await deps.publishMessageNode(node, sendOptions)
             return { ...result, upload: toUploadSummary(built) }
         },
         editMessage: async (newsletterJid, parentMessageId, content) => {

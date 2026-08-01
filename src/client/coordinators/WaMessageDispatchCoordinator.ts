@@ -1192,6 +1192,37 @@ export class WaMessageDispatchCoordinator {
             botParticipants: botSidecar ? [botSidecar] : undefined,
             additionalAttributes: sendOptions.additionalAttributes
         })
+        let distributionMessageCount = 0
+        let distributionPreKeyCount = 0
+        for (let index = 0; index < distributionParticipants.length; index += 1) {
+            if (distributionParticipants[index].encType === 'pkmsg') {
+                distributionPreKeyCount += 1
+            } else {
+                distributionMessageCount += 1
+            }
+        }
+        const publishLogger = (sendOptions.logger ?? this.deps.logger).child({
+            publishPath: 'group_sender_key',
+            groupParticipantCount: participantUserJids.length,
+            fanoutDeviceCount: fanoutDeviceJids.length,
+            hostedDeviceCount: fanoutDeviceJids.length - phashTargetCount,
+            phashParticipantCount: phashTargets.length,
+            senderKeyDistributionCount: distributionParticipants.length,
+            senderKeyDistributionMessageCount: distributionMessageCount,
+            senderKeyDistributionPreKeyCount: distributionPreKeyCount,
+            senderKeyIdHex: senderKeyId.toString(16),
+            groupParticipantSource: retryContext.forceRefreshParticipants
+                ? 'refresh'
+                : 'cache_or_fetch',
+            groupPublishRetried: retryContext.retried === true,
+            forcedAddressingMode: retryContext.forceAddressingMode,
+            deviceIdentityAttached: shouldAttachDeviceIdentity || botSidecar?.encType === 'pkmsg',
+            botSidecarAttached: botSidecar !== null
+        })
+        const publishOptions: WaMessagePublishOptions = {
+            ...sendOptions,
+            logger: publishLogger
+        }
 
         const replayPayload: WaRetryReplayPayload = {
             mode: 'plaintext',
@@ -1206,7 +1237,7 @@ export class WaMessageDispatchCoordinator {
                 replayPayload,
                 eligibleRequesterDeviceJids: undefined
             },
-            async () => this.deps.messageClient.publishNode(messageNode, sendOptions)
+            async () => this.deps.messageClient.publishNode(messageNode, publishOptions)
         )
         const distributedAddresses = new Array<SignalAddress>(distributionParticipants.length)
         for (let index = 0; index < distributionParticipants.length; index += 1) {

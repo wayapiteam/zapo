@@ -6,6 +6,7 @@ import {
     parseNewsletterMetadata
 } from '@client/coordinators/WaNewsletterCoordinator'
 import { createNoopLogger } from '@infra/log/types'
+import type { WaMessagePublishOptions } from '@message/types'
 import { proto } from '@proto'
 import { WA_NEWSLETTER_MUTE_TYPES, WA_NEWSLETTER_MUTE_VALUES } from '@protocol/constants'
 import type { BinaryNode } from '@transport/types'
@@ -49,6 +50,7 @@ function createMexMockSocket(response: MexMockResponse): {
 
 interface SendNodeCall {
     readonly node: BinaryNode
+    readonly options?: WaMessagePublishOptions
 }
 
 function createSendNodeCollector(): {
@@ -65,8 +67,8 @@ function createSendNodeCollector(): {
             calls.push({ node })
             return Promise.resolve()
         },
-        publishMessageNode: async (node) => {
-            calls.push({ node })
+        publishMessageNode: async (node, options) => {
+            calls.push({ node, options })
             return {
                 id: node.attrs.id ?? '',
                 attempts: 1,
@@ -283,6 +285,23 @@ test('coordinator send with explicit stanzaId honors caller id', async () => {
     })
     assert.equal(result.id, 'CUSTOM')
     assert.equal(env.sendCalls[0].node.attrs.id, 'CUSTOM')
+})
+
+test('coordinator send forwards message publish options', async () => {
+    const env = createTestCoordinator({ resultData: null })
+    const operationLogger = createNoopLogger('warn')
+
+    await env.coordinator.send('120363025343298869@newsletter', 'hello', {
+        ackTimeoutMs: 42_000,
+        maxAttempts: 1,
+        retryDelayMs: 250,
+        logger: operationLogger
+    })
+
+    assert.equal(env.sendCalls[0].options?.ackTimeoutMs, 42_000)
+    assert.equal(env.sendCalls[0].options?.maxAttempts, 1)
+    assert.equal(env.sendCalls[0].options?.retryDelayMs, 250)
+    assert.equal(env.sendCalls[0].options?.logger, operationLogger)
 })
 
 test('coordinator listSubscribed parses metadata array', async () => {
