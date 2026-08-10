@@ -43,6 +43,11 @@ interface WaIncomingMessageAckHandlerOptions {
         context: WaRetryDecryptFailureContext,
         error: unknown
     ) => Promise<boolean>
+    /**
+     * Asks the primary device for the plaintext of an `<unavailable/>` message.
+     * Returns `true` when the request was queued.
+     */
+    readonly requestPlaceholderResend?: (context: WaRetryDecryptFailureContext) => boolean
     readonly emitIncomingMessage?: (event: WaIncomingMessageEvent) => void
     readonly emitNewsletterMessageUpdate?: (event: WaIncomingNewsletterMessageUpdateEvent) => void
     readonly emitUnavailableMessage?: (event: WaIncomingUnavailableMessageEvent) => void
@@ -435,7 +440,7 @@ async function decryptAndProcessEncNode(
     options: WaIncomingMessageAckHandlerOptions,
     decrypt: (ciphertext: Uint8Array, senderAddress: SignalAddress) => Promise<Uint8Array>
 ): Promise<DecryptEncNodeResult> {
-    const log = options.logger.child({
+    const logContext = (): { id?: string; from?: string; participant?: string } => ({
         id: node.attrs.id,
         from: node.attrs.from,
         participant: node.attrs.participant
@@ -457,11 +462,13 @@ async function decryptAndProcessEncNode(
                     senderAddress,
                     senderKeyDistribution.payload
                 )
-                log.trace('processed incoming sender key distribution', {
+                options.logger.trace('processed incoming sender key distribution', {
+                    ...logContext(),
                     groupId: senderKeyDistribution.groupId
                 })
             } catch (error) {
-                log.warn('failed to process incoming sender key distribution', {
+                options.logger.warn('failed to process incoming sender key distribution', {
+                    ...logContext(),
                     groupId: senderKeyDistribution.groupId,
                     message: toError(error).message
                 })
@@ -491,7 +498,8 @@ async function decryptAndProcessEncNode(
         }
         return { success: true, encType }
     } catch (error) {
-        log.warn('failed to decrypt incoming message', {
+        options.logger.warn('failed to decrypt incoming message', {
+            ...logContext(),
             encType,
             message: toError(error).message
         })
@@ -662,12 +670,13 @@ export async function handleIncomingMessageAck(
 
     const unavailableNode = findNodeChild(node, 'unavailable')
     if (unavailableNode) {
-        const kind: WaUnavailableMessageKind =
-            unavailableNode.attrs.hosted === 'true'
-                ? 'hosted'
-                : unavailableNode.attrs.type === 'view_once'
-                  ? 'view_once'
-                  : 'other'
+        const kind: WaUnavailableMessageKind = findNodeChild(node, 'bot')
+            ? 'bot'
+            : unavailableNode.attrs.hosted === 'true'
+              ? 'hosted'
+              : unavailableNode.attrs.type === 'view_once'
+                ? 'view_once'
+                : 'other'
         const senderJid = node.attrs.participant ?? node.attrs.from
         const sender = senderJid ? parseJidFull(senderJid) : null
         const { key, pushName } = buildIncomingMessageKey(
@@ -675,10 +684,20 @@ export async function handleIncomingMessageAck(
             sender ? { userJid: sender.userJid, device: sender.address.device } : null,
             options
         )
+        const resendRequested =
+            options.requestPlaceholderResend?.({
+                messageNode: node,
+                stanzaId: id,
+                from,
+                participant: node.attrs.participant,
+                recipient: node.attrs.recipient,
+                t: node.attrs.t
+            }) === true
         options.emitUnavailableMessage?.({
             rawNode: buildIncomingEventRawNode(node),
             key,
             kind,
+            resendRequested,
             stanzaType: node.attrs.type,
             offline: node.attrs.offline !== undefined,
             timestampSeconds: parseOptionalInt(node.attrs.t),
@@ -696,7 +715,8 @@ export async function handleIncomingMessageAck(
             to: from,
             type: ackNode.attrs.type,
             participant: ackNode.attrs.participant,
-            unavailableKind: kind
+            unavailableKind: kind,
+            resendRequested
         })
         await options.sendNode(ackNode)
         return true

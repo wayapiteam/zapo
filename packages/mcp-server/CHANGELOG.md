@@ -1,5 +1,22 @@
 # @zapo-js/mcp-server
 
+## 1.1.0
+
+### Minor Changes
+
+- 5b673b1: Add `MCP_GROUP_BUNDLES` to opt into downloading the group-history bundles other
+  members share, and buffer the resulting `group_history_bundle` events so the
+  `events` tool can query them.
+
+### Patch Changes
+
+- 1f0de19: Buffer the core `offline_thread_metadata` event so the `events` tool can query
+  it. The subscription list is explicit, so a new core event is invisible to the
+  MCP until it is registered there.
+- Updated dependencies
+- Updated dependencies
+    - @zapo-js/store-sqlite@1.1.0
+
 ## 1.0.4
 
 ### Patch Changes

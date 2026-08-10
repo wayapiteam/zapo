@@ -35,13 +35,16 @@ function createCoordinator(peerDataOperation: PeerDataOperationRequester): WaMes
     return new WaMessageCoordinator({
         messageDispatch: {} as never,
         mediaTransfer: {} as never,
+        mediaUploadOptions: {} as never,
         logger: createNoopLogger(),
         messageStore: {} as never,
         messageSecretStore: {} as never,
         trustedContactToken: {} as never,
         emitAddon: () => undefined,
         mexSocket: { query: async () => ({ tag: 'iq', attrs: { type: 'result' } }) },
-        peerDataOperation
+        peerDataOperation,
+        isGroupHistorySendEnabled: () => true,
+        getAbPropNumber: () => 100
     })
 }
 
@@ -92,11 +95,11 @@ test('requestHistorySync rejects invalid count and timestamp inputs', async () =
 
     await assert.rejects(
         () => coordinator.requestHistorySync({ chatJid: 'a@g.us', count: 0 }),
-        /invalid count/
+        /count must be a positive safe integer/
     )
     await assert.rejects(
         () => coordinator.requestHistorySync({ chatJid: 'a@g.us', count: 1.5 }),
-        /invalid count/
+        /count must be a positive safe integer/
     )
     await assert.rejects(
         () =>

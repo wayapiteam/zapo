@@ -1,6 +1,6 @@
 {
-    "name": "@wayapiteam/zapo",
-    "version": "1.5.8",
+    "name": "zapo-js",
+    "version": "1.7.0",
     "description": "High-performance WhatsApp Web TypeScript library",
     "license": "MIT",
     "author": "vinikjkkj <contact@vinicius.email> (https://github.com/vinikjkkj)",
@@ -105,6 +105,8 @@
     },
     "files": [
         "dist",
+        "spec/abprops/index.js",
+        "spec/abprops/index.d.ts",
         "spec/proto/index.js",
         "spec/proto/index.d.ts",
         "spec/mex/index.js",

@@ -7,8 +7,10 @@ import type {
     WaAuthDangerousOptions,
     WaAuthSocketOptions
 } from '@auth/types'
+import type { WaPrivacyAccountSyncResult } from '@client/coordinators/WaPrivacyCoordinator'
 import type { WaCallGroupParticipant, WaCallType } from '@client/events/call'
 import type { IncomingPresenceType, PresenceLastSeen } from '@client/events/presence'
+import type { WaBlocklistResult } from '@client/events/privacy'
 import type { CompanionHostPersistence } from '@client/persistence/companion-host'
 import type { WaClientPluginDefinition } from '@client/plugins/types'
 import type { WaMediaProcessor } from '@media/processor'
@@ -167,7 +169,9 @@ export interface WaClientOptions extends WaAuthClientOptions, WaAuthSocketOption
      * on-demand backfill triggered by `message.requestHistorySync`) are
      * downloaded and emitted as `history_sync_chunk` events. Set
      * `enabled: false` to drop them; `requireFullSync: true` asks the
-     * primary device for a full history download instead of just recent.
+     * primary device for a full history download instead of just recent;
+     * `groupBundles: true` opts into the group-history bundle a member may
+     * share after somebody joins a group.
      */
     readonly history?: WaHistorySyncOptions
     /**
@@ -341,6 +345,14 @@ export interface WaHistorySyncOptions {
      */
     readonly enabled?: boolean
     readonly requireFullSync?: boolean
+    /**
+     * Whether to download and process the group-history bundle a member may
+     * share after somebody joins a group, emitting `group_history_bundle`.
+     * **Off by default** - a bundle is media a third party pushes at this
+     * account unprompted, so fetching it is opt-in. Bundles addressed to
+     * other members are dropped either way.
+     */
+    readonly groupBundles?: boolean
 }
 
 export interface WaSignalMessagePublishInput {
@@ -401,9 +413,23 @@ export interface WaSendMessageOptions extends WaMessagePublishOptions {
      */
     readonly expirationSeconds?: number
     /**
-     * Skip the automatic `ephemeralSettingTimestamp`/`expiration` injection
-     * applied to messages sent into groups with disappearing-mode on (the cached
-     * group ephemeral is otherwise fetched and applied for you). Off by default.
+     * Unix seconds when disappearing-mode was enabled, sent as
+     * `contextInfo.ephemeralSettingTimestamp`. 1:1 only – groups never carry it.
+     * Overrides the value the auto-inject resolves from the thread store; omit
+     * it unless you have a reason, since a missing timestamp makes the peer warn
+     * that the message will not disappear.
+     */
+    readonly ephemeralSettingTimestamp?: number
+    /**
+     * Overrides `contextInfo.disappearingMode.trigger`. The 1:1 auto-inject
+     * already sets `CHAT_SETTING`.
+     */
+    readonly disappearingModeTrigger?: Proto.DisappearingMode.Trigger
+    /**
+     * Skip the automatic disappearing-message injection on **group** sends, which
+     * would otherwise stamp `contextInfo.expiration` and `disappearingMode` from
+     * the group metadata cache. Has no effect on 1:1 – see
+     * {@link disableDirectEphemeralAutoInject}. Off by default.
      *
      * Relationship with {@link expirationSeconds}: a non-undefined
      * `expirationSeconds` already short-circuits the auto-inject, so this flag is
@@ -411,6 +437,17 @@ export interface WaSendMessageOptions extends WaMessagePublishOptions {
      * auto-inject AND not set any expiration yourself.
      */
     readonly disableGroupEphemeralAutoInject?: boolean
+    /**
+     * Skip the automatic disappearing-message injection on **1:1** sends, which
+     * would otherwise stamp `contextInfo.expiration`,
+     * `ephemeralSettingTimestamp` and `disappearingMode` from the chat metadata
+     * cache. Also skips the cache lookup itself. Has no effect on groups – see
+     * {@link disableGroupEphemeralAutoInject}. Off by default.
+     *
+     * Same relationship with {@link expirationSeconds} as the group flag: a
+     * non-undefined `expirationSeconds` already short-circuits the auto-inject.
+     */
+    readonly disableDirectEphemeralAutoInject?: boolean
     /** Raw child nodes appended to the `<message>` stanza. Escape hatch for protocol features the typed API doesn't cover. */
     readonly customNodes?: readonly BinaryNode[]
     /** Wrap the outgoing message as view-once. Only valid for image/video/audio content. */
@@ -926,12 +963,12 @@ export interface WaIncomingUnhandledStanzaEvent extends WaIncomingBaseEvent {
 }
 
 /**
- * Why an incoming message arrived as a content-less placeholder. `view_once`:
- * a view-once already consumed elsewhere. `hosted`: a hosted/bot message that
- * could not be fanned out. `other`: an `unavailable` marker the lib does not
- * categorize yet.
+ * Why an incoming message arrived as a content-less placeholder. `view_once`: a
+ * view-once already consumed elsewhere. `hosted`: a hosted account whose message
+ * could not be fanned out. `bot`: a bot message whose fanout never ran. `other`:
+ * a plain fanout placeholder – the only kind the primary device resends.
  */
-export type WaUnavailableMessageKind = 'view_once' | 'hosted' | 'other'
+export type WaUnavailableMessageKind = 'view_once' | 'hosted' | 'bot' | 'other'
 
 export interface WaIncomingUnavailableMessageEvent extends Omit<
     WaIncomingBaseEvent,
@@ -940,9 +977,16 @@ export interface WaIncomingUnavailableMessageEvent extends Omit<
     /** Which flavour of content the server signalled as unavailable. */
     readonly kind: WaUnavailableMessageKind
     /**
+     * `true` when a resend was queued for the primary device; the payload then
+     * arrives as a `message` event with the same key. Best-effort, like wa-web:
+     * the request is not persisted, so a failed peer message is not retried.
+     * `false` for the unrecoverable flavours, messages past the server age
+     * window, and mobile-primary sessions.
+     */
+    readonly resendRequested: boolean
+    /**
      * The message key (chat, stanza id, author, addressing metadata) – same
-     * shape the `message` event carries, so it can be stored or correlated. There
-     * is no decrypted `message`: the payload is unavailable and cannot be fetched.
+     * shape the `message` event carries, so it can be stored or correlated.
      */
     readonly key: WaIncomingMessageKey
     /** Stanza `t` attr (seconds since epoch). */
@@ -1252,6 +1296,33 @@ export interface WaHistorySyncChunkEvent {
     readonly progress?: number
 }
 
+/**
+ * A group-history bundle shared with this account after it joined a group,
+ * already downloaded, filtered and persisted. Emitted once per bundle, only
+ * when `history.groupBundles` is enabled.
+ */
+export interface WaGroupHistoryBundleEvent {
+    readonly groupJid: string
+    /** Member who shared the history. */
+    readonly senderJid?: string
+    /** Stanza id of the message that carried the bundle. */
+    readonly bundleMessageId?: string
+    /** Messages persisted from this bundle, after filtering. */
+    readonly messagesCount: number
+    /** Pinned messages older than the shared window, exempt from the age cutoff. */
+    readonly outOfWindowPinsCount: number
+    /** Entries skipped as stubs, foreign-chat, ephemeral-expired or too old. */
+    readonly droppedCount: number
+    /** Oldest persisted message timestamp, in ms. */
+    readonly oldestTimestampMs?: number
+    /**
+     * Members the sender addressed the bundle to (PN or LID form). Copied out
+     * of the decoded payload, so mutating it cannot corrupt the message proto
+     * the `message` event handed to the same listener.
+     */
+    readonly historyReceivers: readonly string[]
+}
+
 export type WaAppStateMutationSource = 'snapshot' | 'patch' | 'local'
 
 type MutationEventBase = {
@@ -1383,11 +1454,11 @@ export interface WaClientEventMap {
      */
     readonly message_protocol: (event: WaIncomingProtocolMessageEvent) => void
     /**
-     * A message the server delivered as a content-less placeholder: the payload
-     * is unavailable and cannot be recovered (a view-once already consumed, or a
-     * hosted/bot message that could not be fanned out). The lib acks it and emits
-     * this instead of a `message` event for the same stanza. Branch on
-     * `event.kind`.
+     * A message the server delivered as a content-less placeholder. The lib acks
+     * it and emits this instead of a `message` event for the same stanza. A plain
+     * fanout placeholder is asked back from the primary device and arrives later
+     * as a `message` event (see `event.resendRequested`); a consumed view-once or
+     * a hosted/bot message that could not be fanned out is never resent.
      */
     readonly message_unavailable: (event: WaIncomingUnavailableMessageEvent) => void
     /**
@@ -1421,6 +1492,28 @@ export interface WaClientEventMap {
     /** Profile/group/community picture change notification – the new picture must still be fetched explicitly. */
     readonly picture: (event: WaPictureEvent) => void
     /**
+     * The account's privacy, refetched after the primary or another companion
+     * changed it: the full category set plus any disallowed list the server
+     * reported. The two halves are read by separate queries, so a change
+     * landing mid-refresh can leave them describing slightly different server
+     * states - the payload is exactly what
+     * {@link WaPrivacyCoordinator.refreshFromAccountSync} returns.
+     *
+     * Two paths trigger it: the live `account_sync` notification (debounced,
+     * so a burst of changes on the phone collapses into one refresh) and the
+     * `account_sync` dirty bit that catches a session up after being offline.
+     * Neither is trusted for its payload - the values always come from a
+     * fresh read. Categories the library does not model are dropped.
+     */
+    readonly privacy: (event: WaPrivacyAccountSyncResult) => void
+    /**
+     * The account blocklist after a block/unblock made on another device -
+     * same refetch path as `privacy`, from its own account-sync protocol. The
+     * payload is the full list ({@link WaPrivacyCoordinator.getBlocklist}'s
+     * shape), never a delta.
+     */
+    readonly blocklist: (event: WaBlocklistResult) => void
+    /**
      * A parsed app-state mutation arriving from a sync – chat mute/star/read/
      * pin/archive/contact/label/etc. changed on another device. Inbound only;
      * this client's own outbound actions surface on `mutation_send`. Use the
@@ -1444,11 +1537,23 @@ export interface WaClientEventMap {
      */
     readonly history_sync_chunk: (event: WaHistorySyncChunkEvent) => void
     /**
+     * A group-history bundle another member shared with this account after it
+     * joined a group, already downloaded and persisted. Requires
+     * `history.groupBundles: true` - the download is opt-in because a third
+     * party triggers it.
+     */
+    readonly group_history_bundle: (event: WaGroupHistoryBundleEvent) => void
+    /**
      * Offline-message queue progress after a reconnect (`'resuming'` ticks
      * with `remainingStanzas`, then `'complete'`). Useful to defer UI updates
      * until the catch-up finishes.
      */
     readonly offline_resume: (event: WaOfflineResumeEvent) => void
+    /**
+     * Preview manifest of the offline queue, sent just before the flush. Not
+     * guaranteed to arrive - use `offline_resume` for progress, never this.
+     */
+    readonly offline_thread_metadata: (event: WaOfflineThreadMetadataEvent) => void
     /**
      * Fatal stream-level error from the server (e.g. logged out from another
      * device, stream conflict). The connection will close right after.
@@ -1522,6 +1627,39 @@ export interface WaOfflineResumeEvent {
     readonly remainingStanzas: number
     /** `true` when triggered by an explicit catch-up request rather than auto-resume on reconnect. */
     readonly forced: boolean
+}
+
+export interface WaOfflineThreadPreview {
+    /** User (`@lid`/`@s.whatsapp.net`) or group (`@g.us`) jid. */
+    readonly jid: string
+    /** Unix seconds of the most recent queued stanza for this thread. */
+    readonly timestampSeconds: number
+}
+
+export interface WaOfflineThreadReadWatermark {
+    readonly jid: string
+    /** Unix seconds up to which the peer has already read this thread. */
+    readonly readTimestampSeconds: number
+}
+
+/**
+ * Which threads have queued traffic, announced right before the offline flush.
+ * Informational only - every listed thread still delivers its stanzas
+ * normally. All fields but `threads` depend on server gating and are commonly
+ * absent.
+ */
+export interface WaOfflineThreadMetadataEvent {
+    readonly threads: readonly WaOfflineThreadPreview[]
+    readonly readWatermarks?: readonly WaOfflineThreadReadWatermark[]
+    /** Status-update backlog still queued behind this flush. */
+    readonly pendingStatusMessages?: {
+        readonly count: number
+        readonly jids: readonly string[]
+    }
+    /** Notification backlog still queued behind this flush. */
+    readonly pendingNotifications?: {
+        readonly count: number
+    }
 }
 
 export interface WaPrivacyTokenUpdateEvent {

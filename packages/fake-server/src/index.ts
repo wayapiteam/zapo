@@ -1,3 +1,5 @@
+export { createFakeMobilePrimary, seedFakeMobilePrimary } from './api/FakeMobilePrimary'
+export type { FakeMobilePrimary, SeedFakeMobilePrimaryOptions } from './api/FakeMobilePrimary'
 export { FakePairingDriver } from './api/FakePairingDriver'
 export type {
     CompanionPairingMaterial,
@@ -12,11 +14,12 @@ export type {
     ReceivedMessage,
     SendMessageOptions
 } from './api/FakePeer'
-export { FakeWaServer } from './api/FakeWaServer'
+export { FakeServerSession, FakeWaServer } from './api/FakeWaServer'
 export type {
     BinaryNode,
     ExpectIqOptions,
     ExpectStanzaOptions,
+    FakeSessionKeyInfo,
     FakeWaServerNoiseRootCa,
     FakeWaServerOptions,
     FakeWaServerPipelineListener,
@@ -24,17 +27,81 @@ export type {
     WaFakeAuthenticatedInfo,
     WaFakeConnectionPipeline
 } from './api/FakeWaServer'
+/**
+ * Signing half of the Noise root, needed only to pin
+ * {@link FakeWaServerOptions.noiseRootCa}. Readers of `server.noiseRootCa` get
+ * the public-only {@link FakeWaServerNoiseRootCa} instead.
+ */
+export type { FakeNoiseRootCa } from './protocol/auth/cert-chain'
 export { IqExpectation, Scenario } from './api/Scenario'
 export type { AuthenticatedPipelineListener, ScenarioServer } from './api/Scenario'
 export { WaFakeConnection } from './infra/WaFakeConnection'
-export type { WaFakeConnectionHandlers, WaFakeConnectionState } from './infra/WaFakeConnection'
 export type {
+    WaFakeConnectionHandlers,
+    WaFakeConnectionState,
+    WaFakeSocketEvents,
+    WaFakeSocketLike
+} from './infra/WaFakeConnection'
+export { WaFakeTcpServer } from './infra/WaFakeTcpServer'
+export type { WaFakeTcpServerListenInfo, WaFakeTcpServerOptions } from './infra/WaFakeTcpServer'
+export { createTcpSocketAdapter, createWebSocketAdapter } from './infra/socket-adapters'
+export {
+    ClientPayloadValidationError,
+    parseClientPayload
+} from './protocol/auth/client-payload-validate'
+export type {
+    ClientPayloadFlavor,
+    LoginPayload,
+    MobileLoginDetails,
+    ParsedClientPayload,
+    RegistrationPayload
+} from './protocol/auth/client-payload-validate'
+export type {
+    WaFakeIqConnection,
+    WaFakeIqContext,
     WaFakeIqHandler,
     WaFakeIqMatcher,
     WaFakeIqResponder,
     WaFakeIqRouterEvents,
     WaFakeIqType
 } from './protocol/iq/router'
+export {
+    parseKeyIndexListPublish,
+    parsePairDeviceUpload,
+    parseRemoveCompanionDevice
+} from './protocol/iq/companion-host'
+export type {
+    ParsedKeyIndexListPublish,
+    ParsedPairDeviceUpload,
+    ParsedRemoveCompanionDevice
+} from './protocol/iq/companion-host'
+export {
+    buildCompanionHelloResultContent,
+    buildLinkCodeNotification,
+    parseLinkCodeStanza
+} from './protocol/iq/link-code'
+export type {
+    BuildLinkCodeNotificationInput,
+    LinkCodeStage,
+    ParsedLinkCodeStanza
+} from './protocol/iq/link-code'
+export {
+    buildAccountSyncDevicesNotification,
+    buildAccountTakeoverNotice,
+    buildRegistrationCodeNotification
+} from './protocol/push/mobile-notification'
+export type {
+    BuildAccountSyncDevicesInput,
+    BuildAccountTakeoverNoticeInput,
+    BuildRegistrationCodeNotificationInput,
+    FakeAccountDevice
+} from './protocol/push/mobile-notification'
+export { FakeCompanionHostState, readCompanionKeyIndex } from './state/fake-companion-host'
+export type {
+    FakeLinkedCompanion,
+    FakeMobilePrimaryIdentity,
+    FakePublishedKeyIndexList
+} from './state/fake-companion-host'
 export {
     buildAppStateSyncFullResult,
     buildAppStateSyncResult,

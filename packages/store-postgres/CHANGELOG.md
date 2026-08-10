@@ -1,5 +1,30 @@
 # @zapo-js/store-postgres
 
+## 1.1.0
+
+### Minor Changes
+
+- Add the `chatMetadata` cache backend, the domain the core now uses to resolve
+  the per-chat disappearing settings on the send path. The store is registered in
+  the backend factory and goes through the same lifecycle as its sibling cache
+  domains: the MySQL and PostgreSQL cleanup pollers prune it (those backends have
+  no server-side TTL), the Mongo lookup filters on `expires_at` instead of
+  trusting the asynchronous sweep, the PostgreSQL expiry index is created with the
+  table prefix so two stores cannot share one index, `deleteChatMetadata` and
+  `cleanupExpired` return the affected row count their contract promises, and
+  `chat_metadata_cache` is reachable through the SQLite `tableNames` override map.
+
+    The domain only exists from core 1.7.0, so the `zapo-js` peer range moves to
+    `^1.7.0`.
+
+### Patch Changes
+
+- Persist `ephemeralSettingTimestamp` on the thread record, so an outgoing
+  ephemeral message can carry the timestamp the peer expects instead of leaving
+  the recipient warned that the message will not disappear. SQLite gets migration
+  `0017_mailbox_threads_ephemeral_setting_timestamp`; the other backends widen the
+  thread row in place.
+
 ## 1.0.2
 
 ### Patch Changes

@@ -32,6 +32,7 @@ export {
 } from '@protocol/call'
 export type { WaCallPayloadTag } from '@protocol/call'
 export {
+    normalizeEphemeralSettingSeconds,
     WA_ADDRESSING_MODES,
     WA_EDIT_ATTRS,
     WA_ENC_CIPHERTEXT_TYPES,
@@ -86,10 +87,14 @@ export {
     WA_TC_TOKEN_DEFAULTS
 } from '@protocol/privacy-token'
 export {
+    WA_PRIVACY_ACCOUNT_SYNC_DISALLOWED_LISTS,
     WA_PRIVACY_CATEGORIES,
     WA_PRIVACY_CATEGORY_TO_SETTING,
+    WA_PRIVACY_DHASH_NONE,
     WA_PRIVACY_DISALLOWED_LIST_CATEGORIES,
+    WA_PRIVACY_LIST_ACTIONS,
     WA_PRIVACY_SETTING_TO_CATEGORY,
+    WA_PRIVACY_SETTING_VALUES,
     WA_PRIVACY_TAGS,
     WA_PRIVACY_VALUES
 } from '@protocol/privacy'
@@ -117,9 +122,9 @@ export {
     WA_EMAIL_XMLNS
 } from '@protocol/email'
 export type { WaEmailContext, WaEmailErrorCode } from '@protocol/email'
+export { resolveAbPropNameByCode } from '@abprops-spec'
 export {
     AB_PROP_CONFIGS,
-    resolveAbPropNameByCode,
     WA_ABPROPS_PROTOCOL_VERSION,
     WA_ABPROPS_REFRESH_BOUNDS
 } from '@protocol/abprops'

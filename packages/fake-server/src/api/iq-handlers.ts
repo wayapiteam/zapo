@@ -12,6 +12,12 @@ import {
     type FakeBusinessProfile,
     parseGetBusinessProfileIq
 } from '../protocol/iq/business'
+import {
+    type ParsedPairDeviceUpload,
+    parseKeyIndexListPublish,
+    parsePairDeviceUpload,
+    parseRemoveCompanionDevice
+} from '../protocol/iq/companion-host'
 import { parseClearDirtyBitsIq } from '../protocol/iq/dirty-bits'
 import {
     buildGroupMetadataNode,
@@ -43,9 +49,15 @@ import {
     parseSetProfilePictureIq,
     parseSetStatusIq
 } from '../protocol/iq/profile'
-import { buildIqError, buildIqResult, type WaFakeIqRouter } from '../protocol/iq/router'
+import {
+    buildIqError,
+    buildIqResult,
+    type WaFakeIqContext,
+    type WaFakeIqRouter
+} from '../protocol/iq/router'
 import { buildUsyncDevicesResult } from '../protocol/iq/usync'
 import { type ClientPreKeyBundle, parsePreKeyUploadIq } from '../protocol/signal/prekey-upload'
+import type { FakeMobilePrimaryIdentity } from '../state/fake-companion-host'
 import { type BinaryNode } from '../transport/codec'
 
 import type { FakePeer } from './FakePeer'
@@ -83,12 +95,33 @@ export interface IqHandlerDeps {
     notifyPrivacySet(change: CapturedPrivacySet): void
     notifyBlocklistChange(change: CapturedBlocklistChange): void
     capturePreKeyBundle(bundle: ClientPreKeyBundle): void
+    countServerPreKeys(): number
     consumeOutboundAppStatePatches(iq: BinaryNode): Promise<void>
     readonly appStateCollectionProviders: ReadonlyMap<
         string,
         () => Promise<FakeAppStateCollectionPayload | null> | FakeAppStateCollectionPayload | null
     >
     requireMediaHttpsInfo(): { readonly host: string; readonly port: number }
+    /** Mobile primary bound to this session, or `null` for a web session. */
+    readonly mobilePrimary: FakeMobilePrimaryIdentity | null
+    /**
+     * Completes the primary's `pair-device` upload. Resolves `null` when the
+     * session has no primary or the ref belongs to no live connection.
+     */
+    linkCompanionDevice(upload: ParsedPairDeviceUpload): Promise<LinkedCompanionResult | null>
+    /** Unlinks the given companions, or every one of them when passed `null`. */
+    revokeCompanionDevices(deviceJids: readonly string[] | null): readonly string[]
+    recordKeyIndexList(bytes: Uint8Array, timestampSeconds: number): void
+    /** Routes a link-code stage to the other client, or `null` to fall through. */
+    relayLinkCodeStage(
+        iq: BinaryNode,
+        context: WaFakeIqContext | undefined
+    ): Promise<BinaryNode | null>
+}
+
+export interface LinkedCompanionResult {
+    readonly deviceJid: string
+    readonly companionPropsBytes: Uint8Array | null
 }
 
 export function parseUsyncRequestedUserJids(iq: BinaryNode): readonly string[] {
@@ -143,6 +176,33 @@ function buildGroupMetadataReply(iq: BinaryNode, metadata: MutableFakeGroup): Bi
     }
 }
 
+/**
+ * True when the stanza arrived on the phone that owns this session's account.
+ * Being a phone login is not enough: a second number connecting to the same
+ * session must not drive the companion set of the account that owns it.
+ */
+function isSessionOwnerConnection(
+    context: WaFakeIqContext | undefined,
+    deps: IqHandlerDeps
+): boolean {
+    const payload = context?.connection.clientPayload
+    if (payload?.kind !== 'login' || payload.flavor !== 'mobile') {
+        return false
+    }
+    return deps.mobilePrimary?.username === payload.username
+}
+
+/** The device jid a connection speaks for, or `null` before it logs in. */
+function ownDeviceJid(context: WaFakeIqContext | undefined): string | null {
+    const payload = context?.connection.clientPayload
+    if (payload?.kind !== 'login') {
+        return null
+    }
+    return payload.device > 0
+        ? `${payload.username}:${payload.device}@s.whatsapp.net`
+        : `${payload.username}@s.whatsapp.net`
+}
+
 export function registerDefaultIqHandlers(router: WaFakeIqRouter, deps: IqHandlerDeps): void {
     router.register({
         label: 'prekey-upload',
@@ -162,6 +222,31 @@ export function registerDefaultIqHandlers(router: WaFakeIqRouter, deps: IqHandle
         label: 'signal-digest',
         matcher: { xmlns: 'encrypt', type: 'get', childTag: 'digest' },
         respond: (iq) => buildIqError(iq, { code: 404, text: 'item-not-found' })
+    })
+
+    // Baileys-family and whatsmeow clients block on this query before
+    // reporting the connection as open; zapo-js uses <digest> instead.
+    router.register({
+        label: 'prekey-count',
+        matcher: { xmlns: 'encrypt', type: 'get', childTag: 'count' },
+        respond: (iq) => {
+            const result = buildIqResult(iq)
+            return {
+                ...result,
+                content: [
+                    {
+                        tag: 'count',
+                        attrs: { value: String(deps.countServerPreKeys()) }
+                    }
+                ]
+            }
+        }
+    })
+
+    router.register({
+        label: 'passive-mode',
+        matcher: { xmlns: 'passive', type: 'set' },
+        respond: (iq) => buildIqResult(iq)
     })
 
     router.register({
@@ -300,9 +385,83 @@ export function registerDefaultIqHandlers(router: WaFakeIqRouter, deps: IqHandle
     })
 
     router.register({
+        label: 'link-code-companion-reg',
+        matcher: { xmlns: 'md', type: 'set', childTag: 'link_code_companion_reg' },
+        respond: (iq, context) => deps.relayLinkCodeStage(iq, context)
+    })
+
+    router.register({
+        label: 'companion-pair-device',
+        matcher: { xmlns: 'md', type: 'set', childTag: 'pair-device' },
+        respond: async (iq, context) => {
+            const upload = parsePairDeviceUpload(iq)
+            if (!upload) {
+                return buildIqError(iq, { code: 400, text: 'invalid-pair-device' })
+            }
+            // The link is minted under the account that owns the session, so
+            // only that account's phone may ask for one.
+            if (!isSessionOwnerConnection(context, deps)) {
+                return buildIqError(iq, { code: 403, text: 'not-authorized' })
+            }
+            const linked = await deps.linkCompanionDevice(upload)
+            if (!linked) {
+                return buildIqError(iq, { code: 404, text: 'unknown-pairing-ref' })
+            }
+            // Shape mirrors the phone's parser: <device jid> is a direct child
+            // of the result, with the companion's own props beside it.
+            const content: BinaryNode[] = [{ tag: 'device', attrs: { jid: linked.deviceJid } }]
+            if (linked.companionPropsBytes) {
+                content.push({
+                    tag: 'companion-props',
+                    attrs: {},
+                    content: linked.companionPropsBytes
+                })
+            }
+            return buildIqResult(iq, { content })
+        }
+    })
+
+    router.register({
+        label: 'companion-key-index-list',
+        matcher: { xmlns: 'md', type: 'set', childTag: 'key-index-list' },
+        respond: (iq, context) => {
+            const published = parseKeyIndexListPublish(iq)
+            if (!published) {
+                return buildIqError(iq, { code: 400, text: 'invalid-key-index-list' })
+            }
+            if (!isSessionOwnerConnection(context, deps)) {
+                return buildIqError(iq, { code: 403, text: 'not-authorized' })
+            }
+            deps.recordKeyIndexList(published.keyIndexListBytes, published.timestampSeconds)
+            return buildIqResult(iq)
+        }
+    })
+
+    router.register({
         label: 'remove-companion-device',
         matcher: { xmlns: 'md', type: 'set', childTag: 'remove-companion-device' },
-        respond: (iq) => {
+        respond: (iq, context) => {
+            const removal = parseRemoveCompanionDevice(iq)
+            // The same stanza means "log me out" from a companion and "unlink
+            // that device" from a primary. The wire does not say which, but the
+            // connection does: the account's own phone is always revoking
+            // someone else's device, and never ends its own session this way.
+            if (removal && isSessionOwnerConnection(context, deps)) {
+                if (!removal.all) {
+                    deps.revokeCompanionDevices(removal.deviceJid ? [removal.deviceJid] : [])
+                } else if (!removal.excludeHostedCompanion) {
+                    // The hosted set is exactly what this session tracks, so
+                    // sparing it leaves the registry untouched.
+                    deps.revokeCompanionDevices(null)
+                }
+                return buildIqResult(iq)
+            }
+            // Anyone else may only unlink itself: a connection that is not the
+            // account's phone must never drop someone else's device. Its own
+            // session ends either way.
+            if (removal?.deviceJid && removal.deviceJid === ownDeviceJid(context)) {
+                deps.revokeCompanionDevices([removal.deviceJid])
+            }
             deps.notifyLogout()
             return buildIqResult(iq)
         }

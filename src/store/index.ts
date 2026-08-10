@@ -1,10 +1,16 @@
 export type {
+    WaAnyStoreBackend,
+    WaBackendsProviding,
     WaCreateStoreOptions,
     WaCreateStoreOptionsStrict,
+    WaCreateStoreOptionsStrictFor,
     WaStore,
     WaStoreBackend,
+    WaStoreBackendMap,
     WaCacheDomain,
+    WaCacheDomainContracts,
     WaStoreDomain,
+    WaStoreDomainContracts,
     WaStoreMemoryLimitSelection,
     WaStoreSession
 } from '@store/types'
@@ -21,6 +27,10 @@ export type {
     WaGroupMetadataSnapshot,
     WaGroupMetadataStore
 } from '@store/contracts/group-metadata.store'
+export type {
+    WaChatMetadataSnapshot,
+    WaChatMetadataStore
+} from '@store/contracts/chat-metadata.store'
 export type {
     WaAppStateCollectionStateUpdate,
     WaAppStateCollectionStoreState,
@@ -46,6 +56,7 @@ export { WaIdentityMemoryStore } from '@store/memory/identity.store'
 export { SenderKeyMemoryStore } from '@store/memory/sender-key.store'
 export { WaRetryMemoryStore } from '@store/memory/retry.store'
 export { WaGroupMetadataMemoryStore } from '@store/memory/group-metadata.store'
+export { WaChatMetadataMemoryStore } from '@store/memory/chat-metadata.store'
 export { WaDeviceListMemoryStore } from '@store/memory/device-list.store'
 export { WaContactMemoryStore } from '@store/memory/contact.store'
 export { WaMessageSecretMemoryStore } from '@store/memory/message-secret.store'

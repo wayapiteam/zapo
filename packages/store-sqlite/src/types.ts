@@ -27,6 +27,7 @@ export type WaSqliteTableName =
     | 'device_list_cache'
     | 'privacy_tokens'
     | 'message_secrets_cache'
+    | 'chat_metadata_cache'
 
 export type WaSqliteTableNameOverrides = Readonly<Partial<Record<WaSqliteTableName, string>>>
 
@@ -73,6 +74,7 @@ export type WaSqliteMigrationDomain =
     | 'mailbox'
     | 'privacyToken'
     | 'messageSecret'
+    | 'chatMetadata'
 
 export interface WaSqliteBatchSizeSelection {
     readonly deviceList?: number

@@ -6,25 +6,31 @@ import {
     type ParsedClientPayload
 } from '../protocol/auth/client-payload-validate'
 import { buildSuccessNode } from '../protocol/auth/success-node'
-import { type WaFakeIqRouter } from '../protocol/iq/router'
 import { type BinaryNode, decodeBinaryNodeStanza, encodeBinaryNodeStanza } from '../transport/codec'
 import { type SignalKeyPair, X25519 } from '../transport/crypto'
 import { proto } from '../transport/protos'
 
 import type { WaFakeConnection } from './WaFakeConnection'
-import { WaFakeFrameSocket } from './WaFakeFrameSocket'
+import { type WaFakeClientPrologue, WaFakeFrameSocket } from './WaFakeFrameSocket'
 import { WaFakeNoiseHandshake } from './WaFakeNoiseHandshake'
 import { WaFakeTransport } from './WaFakeTransport'
 
 const NOISE_XX_NAME = new TextEncoder().encode('Noise_XX_25519_AESGCM_SHA256\0\0\0\0')
 const NOISE_IK_NAME = new TextEncoder().encode('Noise_IK_25519_AESGCM_SHA256\0\0\0\0')
-const PROLOGUE = new Uint8Array([0x57, 0x41, 0x06, 0x03])
+const PROLOGUE_MAGIC_W = 0x57
+const PROLOGUE_MAGIC_A = 0x41
+const DEFAULT_PROLOGUE = new Uint8Array([PROLOGUE_MAGIC_W, PROLOGUE_MAGIC_A, 0x06, 0x03])
 
 export interface WaFakeConnectionPipelineConfig {
     readonly connection: WaFakeConnection
     readonly rootCa: FakeNoiseRootCa
     readonly serverStaticKeyPair: SignalKeyPair
-    readonly iqRouter: WaFakeIqRouter
+    /**
+     * Routes an inbound IQ against the session this connection is bound to.
+     * The server resolves the session per connection, so the pipeline stays
+     * unaware of session identity.
+     */
+    readonly routeIq: (iq: BinaryNode) => Promise<BinaryNode | null>
     readonly successNodeAttributes?: Parameters<typeof buildSuccessNode>[0]
 }
 
@@ -62,12 +68,14 @@ export class WaFakeConnectionPipeline {
     private events: WaFakeConnectionPipelineEvents = {}
     private state: State = { kind: 'awaiting_prologue' }
     private chain: Promise<void> = Promise.resolve()
+    private authenticatedPayload: ParsedClientPayload | null = null
+    private clientPrologue: Uint8Array = DEFAULT_PROLOGUE
 
     public constructor(config: WaFakeConnectionPipelineConfig) {
         this.config = config
         this.frameSocket = new WaFakeFrameSocket(config.connection)
         this.frameSocket.setHandlers({
-            onPrologue: () => this.onPrologue(),
+            onPrologue: (prologue) => this.onPrologue(prologue),
             onFrame: (frame) => this.scheduleFrame(frame),
             onClose: (info) => {
                 this.state = { kind: 'closed' }
@@ -85,6 +93,11 @@ export class WaFakeConnectionPipeline {
         return this.state.kind === 'authenticated'
     }
 
+    /** Parsed ClientPayload of the authenticated connection; null before auth. */
+    public get clientPayload(): ParsedClientPayload | null {
+        return this.authenticatedPayload
+    }
+
     public async sendStanza(node: BinaryNode): Promise<void> {
         if (this.state.kind !== 'authenticated') {
             throw new Error(`cannot send stanza while pipeline is in state "${this.state.kind}"`)
@@ -95,11 +108,20 @@ export class WaFakeConnectionPipeline {
         this.frameSocket.sendFrame(ciphertext)
     }
 
-    private onPrologue(): void {
+    private onPrologue(prologue: WaFakeClientPrologue): void {
         if (this.state.kind !== 'awaiting_prologue') {
             this.events.onError?.(new Error('received second prologue from client'))
             return
         }
+        // Mix back the header the client actually sent instead of a fixed one:
+        // it is hashed into the handshake, and a client is free to advertise a
+        // protocol/dict version other than the web client's 6/3.
+        this.clientPrologue = new Uint8Array([
+            PROLOGUE_MAGIC_W,
+            PROLOGUE_MAGIC_A,
+            prologue.protocolVersion,
+            prologue.dictVersion
+        ])
         this.state = { kind: 'awaiting_client_hello' }
     }
 
@@ -150,7 +172,7 @@ export class WaFakeConnectionPipeline {
 
     private async handleXxClientHello(clientEphemeralPub: Uint8Array): Promise<void> {
         const handshake = new WaFakeNoiseHandshake()
-        handshake.start(NOISE_XX_NAME, PROLOGUE)
+        handshake.start(NOISE_XX_NAME, this.clientPrologue)
         handshake.authenticate(clientEphemeralPub)
 
         const serverEphemeral = await X25519.generateKeyPair()
@@ -199,7 +221,7 @@ export class WaFakeConnectionPipeline {
         const encryptedClientPayload = clientHello.payload
 
         const handshake = new WaFakeNoiseHandshake()
-        handshake.start(NOISE_IK_NAME, PROLOGUE)
+        handshake.start(NOISE_IK_NAME, this.clientPrologue)
         handshake.authenticate(this.config.serverStaticKeyPair.pubKey)
         handshake.authenticate(clientEphemeralPub)
         handshake.mixIntoKey(
@@ -235,15 +257,7 @@ export class WaFakeConnectionPipeline {
 
         this.frameSocket.sendFrame(serverHello)
 
-        const keys = handshake.finish()
-        const transport = new WaFakeTransport({
-            recvKey: keys.recvKey,
-            sendKey: keys.sendKey
-        })
-        this.state = { kind: 'authenticated', transport }
-
-        await this.sendStanza(buildSuccessNode(this.config.successNodeAttributes))
-        this.events.onAuthenticated?.({ clientPayload, clientStaticKey })
+        await this.completeAuthentication(handshake, clientPayload, clientStaticKey)
     }
 
     private async handleClientFinish(
@@ -263,14 +277,33 @@ export class WaFakeConnectionPipeline {
         const clientPayloadBytes = handshake.decrypt(clientFinish.payload)
         const clientPayload = parseClientPayload(clientPayloadBytes)
 
+        await this.completeAuthentication(handshake, clientPayload, clientStaticKey)
+    }
+
+    private async completeAuthentication(
+        handshake: WaFakeNoiseHandshake,
+        clientPayload: ParsedClientPayload,
+        clientStaticKey: Uint8Array
+    ): Promise<void> {
         const keys = handshake.finish()
         const transport = new WaFakeTransport({
             recvKey: keys.recvKey,
             sendKey: keys.sendKey
         })
         this.state = { kind: 'authenticated', transport }
+        this.authenticatedPayload = clientPayload
 
         await this.sendStanza(buildSuccessNode(this.config.successNodeAttributes))
+        if (clientPayload.kind === 'login') {
+            // Real WA drains offline messages after login and closes the
+            // drain with this bulletin. Baileys-family clients buffer their
+            // events until it arrives, so send it eagerly with count=0.
+            await this.sendStanza({
+                tag: 'ib',
+                attrs: { from: 's.whatsapp.net' },
+                content: [{ tag: 'offline', attrs: { count: '0' } }]
+            })
+        }
         this.events.onAuthenticated?.({ clientPayload, clientStaticKey })
     }
 
@@ -283,7 +316,7 @@ export class WaFakeConnectionPipeline {
         this.events.onStanza?.(node)
 
         if (node.tag === 'iq') {
-            const response = await this.config.iqRouter.route(node)
+            const response = await this.config.routeIq(node)
             if (response !== null) {
                 await this.sendStanza(response)
             } else {

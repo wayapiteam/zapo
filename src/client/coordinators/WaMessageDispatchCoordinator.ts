@@ -30,16 +30,12 @@ import {
     isSendMediaMessage,
     isSendTextMessage,
     needsSecretPersistence,
-    resolveButtonAddonKind,
-    resolveDecryptFailAttr,
-    resolveEditAttr,
-    resolveEncMediaType,
-    resolveMessageTypeAttr,
-    resolveMetaAttrs,
+    resolveOutboundMessageAttrs,
+    unwrapMessage,
     wrapAsViewOnce
 } from '@message/encode/content'
 import { wrapDeviceSentMessage } from '@message/encode/device-sent'
-import { writeRandomPadMax16 } from '@message/encode/padding'
+import { unpadPkcs7, writeRandomPadMax16 } from '@message/encode/padding'
 import { buildBotInvokeProtoCopy, extractInvokedBotJid, genBotMsgSecret } from '@message/kinds/bot'
 import type {
     WaEncryptedMessageInput,
@@ -52,6 +48,7 @@ import type {
 import type { WaMessageClient } from '@message/WaMessageClient'
 import { proto, type Proto } from '@proto'
 import {
+    normalizeEphemeralSettingSeconds,
     WA_ADDRESSING_MODES,
     WA_DEFAULTS,
     WA_NACK_REASONS,
@@ -79,11 +76,16 @@ import type { SenderKeyManager } from '@signal/group/SenderKeyManager'
 import type { SignalResolvedSessionTarget, SignalSessionResolver } from '@signal/session/resolver'
 import type { SignalProtocol } from '@signal/session/SignalProtocol'
 import type { SignalAddress } from '@signal/types'
+import type {
+    WaChatMetadataSnapshot,
+    WaChatMetadataStore
+} from '@store/contracts/chat-metadata.store'
 import type { WaDeviceListStore } from '@store/contracts/device-list.store'
 import type { WaIdentityStore } from '@store/contracts/identity.store'
 import type { WaMessageSecretStore } from '@store/contracts/message-secret.store'
 import type { WaSessionStore } from '@store/contracts/session.store'
 import type { WaSignalStore } from '@store/contracts/signal.store'
+import type { WaThreadStore } from '@store/contracts/thread.store'
 import { encodeBinaryNode } from '@transport/binary'
 import {
     buildButtonAddonNode,
@@ -121,6 +123,8 @@ interface WaMessageDispatchCoordinatorOptions {
     readonly sessionStore: WaSessionStore
     readonly identityStore: WaIdentityStore
     readonly deviceListStore: WaDeviceListStore
+    readonly threadStore: WaThreadStore
+    readonly chatMetadataStore: WaChatMetadataStore
     readonly signalDeviceSync: SignalDeviceSyncApi
     readonly messageSecretStore: WaMessageSecretStore
     /**
@@ -156,6 +160,77 @@ interface GroupSendRetryContext {
     readonly forceAddressingMode?: GroupAddressingMode
 }
 
+/** Membership split behind a group-history share, in the group's addressing mode. */
+export interface WaGroupHistoryAudience {
+    /** Members the bundle is addressed to. */
+    readonly historyReceivers: readonly string[]
+    /** Members in the group who are not receiving it. */
+    readonly nonHistoryReceivers: readonly string[]
+    /** Requested JIDs that are not current members of the group. */
+    readonly unknownJids: readonly string[]
+    /** Whether the caller asked to share with this account itself. */
+    readonly requestedSelf: boolean
+    readonly addressingMode: 'pn' | 'lid'
+}
+
+/**
+ * Members a group-history bundle is addressed to. Empty for every other
+ * message, which is what keeps the restricted fanout scoped to bundles.
+ */
+function resolveGroupHistoryReceivers(message: Proto.IMessage): readonly string[] {
+    const metadata = unwrapMessage(message).messageHistoryBundle?.messageHistoryMetadata
+    return metadata?.historyReceivers ?? []
+}
+
+/**
+ * Narrows a group's participant list to the members a group-history bundle is
+ * addressed to, plus the sender so its own devices keep a copy. Receivers are
+ * intersected with the live participant list, so a stale receiver entry cannot
+ * pull a non-member into the fanout. Any other message keeps the full list.
+ *
+ * Receivers must be written in the group's addressing mode - a PN entry for a
+ * LID-addressed group does not match and is reported through `onDropped`.
+ *
+ * @throws when no receiver matches a current member. Sending to the sender's
+ * own devices alone counts as no match: it would look like a delivered share
+ * while nobody received anything.
+ */
+export function restrictGroupHistoryTargets(
+    message: Proto.IMessage,
+    participantUserJids: readonly string[],
+    senderJid: string,
+    onDropped?: (droppedJids: readonly string[], totalExpected: number) => void
+): readonly string[] {
+    const receivers = resolveGroupHistoryReceivers(message)
+    if (receivers.length === 0) {
+        return participantUserJids
+    }
+    const pending = new Set<string>()
+    for (let index = 0; index < receivers.length; index += 1) {
+        pending.add(toUserJid(receivers[index]))
+    }
+    const senderUserJid = toUserJid(senderJid)
+    const targets: string[] = []
+    let matchedReceivers = 0
+    for (let index = 0; index < participantUserJids.length; index += 1) {
+        const participant = participantUserJids[index]
+        const participantUserJid = toUserJid(participant)
+        if (pending.delete(participantUserJid)) {
+            matchedReceivers += 1
+            targets[targets.length] = participant
+        } else if (participantUserJid === senderUserJid) {
+            targets[targets.length] = participant
+        }
+    }
+    if (pending.size > 0 && onDropped) {
+        onDropped([...pending], receivers.length)
+    }
+    if (matchedReceivers === 0) {
+        throw new Error('group history bundle resolved no receivers in the group')
+    }
+    return targets
+}
+
 interface WaOutboundEnvelope {
     readonly message: Proto.IMessage
     readonly plaintext: Uint8Array
@@ -182,6 +257,89 @@ export class WaMessageDispatchCoordinator {
         this.phashMaxParticipants =
             options.phashMaxParticipants ?? WA_DEFAULT_PHASH_MAX_PARTICIPANTS
         this.serverClock = options.serverClock
+    }
+
+    /**
+     * Per-chat disappearing settings from the cache, falling back to the
+     * durable thread record on a cold miss and warming the cache with it. A
+     * chat with no disappearing mode is cached as expiration `0` rather than
+     * left absent, so the archive is not re-read on every send to it; the
+     * incoming writers overwrite that entry the moment the chat turns it on.
+     * A failing archive degrades the send to "no ephemeral fields" instead of
+     * rejecting it - the store is opt-in persistence, not a send dependency.
+     */
+    private async resolveChatMetadata(chatJid: string): Promise<WaChatMetadataSnapshot | null> {
+        try {
+            const cached = await this.deps.chatMetadataStore.getChatMetadata(chatJid)
+            if (cached) {
+                return cached
+            }
+            const thread = await this.deps.threadStore.getByJid(chatJid)
+            const expiration = thread?.ephemeralExpiration ?? 0
+            const settingTimestamp = expiration > 0 ? thread?.ephemeralSettingTimestamp : undefined
+            const snapshot: WaChatMetadataSnapshot = {
+                chatJid,
+                ephemeralExpiration: expiration,
+                ...(settingTimestamp !== undefined
+                    ? { ephemeralSettingTimestamp: settingTimestamp }
+                    : {}),
+                updatedAtMs: Date.now()
+            }
+            await this.deps.chatMetadataStore.upsertChatMetadata(snapshot)
+            return snapshot
+        } catch (error) {
+            this.deps.logger.debug(
+                'chat metadata lookup failed, sending without ephemeral fields',
+                {
+                    jid: chatJid,
+                    message: toError(error).message
+                }
+            )
+            return null
+        }
+    }
+
+    /**
+     * Disappearing-message fields for a send into a chat with the mode on, or
+     * `{}` when nothing resolves. Both chat kinds report initiator
+     * `CHANGED_IN_CHAT` when nothing more specific is stored; the trigger comes
+     * from the group metadata for a group and defaults to `CHAT_SETTING` for
+     * 1:1, and is omitted when a group reports none.
+     */
+    private async resolveChatEphemeral(recipientJid: string): Promise<Partial<WaSendContextInfo>> {
+        if (isGroupJid(recipientJid)) {
+            const settings =
+                await this.deps.groupMetadataCache.resolveEphemeralSettings(recipientJid)
+            if (!settings) {
+                return {}
+            }
+            return {
+                expirationSeconds: settings.expirationSeconds,
+                disappearingModeInitiator: proto.DisappearingMode.Initiator.CHANGED_IN_CHAT,
+                ...(settings.trigger !== undefined
+                    ? {
+                          disappearingModeTrigger: settings.trigger
+                      }
+                    : {})
+            }
+        }
+
+        const chat = await this.resolveChatMetadata(recipientJid)
+        const expiration = chat?.ephemeralExpiration
+        if (expiration === undefined || expiration <= 0) {
+            return {}
+        }
+        const stored = chat?.ephemeralSettingTimestamp
+        const settingTimestamp =
+            stored !== undefined ? normalizeEphemeralSettingSeconds(stored) : undefined
+        return {
+            expirationSeconds: expiration,
+            disappearingModeInitiator: proto.DisappearingMode.Initiator.CHANGED_IN_CHAT,
+            disappearingModeTrigger: proto.DisappearingMode.Trigger.CHAT_SETTING,
+            ...(settingTimestamp !== undefined
+                ? { ephemeralSettingTimestamp: settingTimestamp }
+                : {})
+        }
     }
 
     public async publishMessageNode(
@@ -347,19 +505,33 @@ export class WaMessageDispatchCoordinator {
                 this.withResolvedMessageId(options)
             ])
         }
+        const isGroupRecipient = isGroupJid(recipientJid)
+        const directRecipientJid = isGroupRecipient
+            ? recipientJid
+            : await this.resolveDirectRecipientLid(toUserJid(recipientJid))
         let optionsCtx = options.contextInfo
         if (options.expirationSeconds !== undefined) {
             optionsCtx = { ...optionsCtx, expirationSeconds: options.expirationSeconds }
         }
-        if (
-            isGroupJid(recipientJid) &&
-            optionsCtx?.expirationSeconds === undefined &&
-            !options.disableGroupEphemeralAutoInject
-        ) {
-            const cachedEphemeral =
-                await this.deps.groupMetadataCache.resolveEphemeral(recipientJid)
-            if (cachedEphemeral !== null && cachedEphemeral > 0) {
-                optionsCtx = { ...optionsCtx, expirationSeconds: cachedEphemeral }
+        if (options.ephemeralSettingTimestamp !== undefined) {
+            optionsCtx = {
+                ...optionsCtx,
+                ephemeralSettingTimestamp: options.ephemeralSettingTimestamp
+            }
+        }
+        if (options.disappearingModeTrigger !== undefined) {
+            optionsCtx = {
+                ...optionsCtx,
+                disappearingModeTrigger: options.disappearingModeTrigger
+            }
+        }
+        const autoInjectDisabled = isGroupRecipient
+            ? options.disableGroupEphemeralAutoInject
+            : options.disableDirectEphemeralAutoInject
+        if (optionsCtx?.expirationSeconds === undefined && !autoInjectDisabled) {
+            optionsCtx = {
+                ...(await this.resolveChatEphemeral(directRecipientJid)),
+                ...optionsCtx
             }
         }
         const ctx = resolveSendContextInfo({
@@ -464,17 +636,16 @@ export class WaMessageDispatchCoordinator {
         )
 
         const plaintext = await writeRandomPadMax16(proto.Message.encode(messageWithIcdc).finish())
-        const buttonAddonKind = resolveButtonAddonKind(messageWithIcdc)
+        const outboundAttrs = resolveOutboundMessageAttrs(messageWithIcdc)
+        const buttonAddonKind = outboundAttrs.buttonAddonKind
         const buttonAddonNode = buttonAddonKind ? buildButtonAddonNode(buttonAddonKind) : undefined
         // when a <biz> companion is attached the stanza must advertise type=text and
         // omit enc.mediatype; sending type=media + mediatype=list/button alongside the
         // companion is rejected by the server as SMAX_INVALID (479).
-        const type = buttonAddonKind ? 'text' : resolveMessageTypeAttr(messageWithIcdc)
-        const edit = resolveEditAttr(messageWithIcdc) ?? undefined
-        const mediatype = buttonAddonKind
-            ? undefined
-            : (resolveEncMediaType(messageWithIcdc) ?? undefined)
-        const metaAttrs = resolveMetaAttrs(messageWithIcdc)
+        const type = buttonAddonKind ? 'text' : outboundAttrs.typeAttr
+        const edit = outboundAttrs.edit ?? undefined
+        const mediatype = buttonAddonKind ? undefined : (outboundAttrs.mediatype ?? undefined)
+        const metaAttrs = outboundAttrs.metaAttrs
         const metaNode = metaAttrs ? buildMetaNode(metaAttrs as Record<string, string>) : undefined
         const customNodes: BinaryNode[] = []
         if (metaNode) customNodes.push(metaNode)
@@ -485,7 +656,7 @@ export class WaMessageDispatchCoordinator {
             }
         }
 
-        const decryptFail = resolveDecryptFailAttr(messageWithIcdc)
+        const decryptFail = outboundAttrs.decryptFail
         const envelope: WaOutboundEnvelope = {
             message: messageWithIcdc,
             plaintext,
@@ -497,9 +668,6 @@ export class WaMessageDispatchCoordinator {
             sendOptions
         }
 
-        const directRecipientJid = isGroup
-            ? recipientJid
-            : await this.resolveDirectRecipientLid(toUserJid(recipientJid))
         const peerRecipientPn = isGroup
             ? undefined
             : await this.resolvePeerRecipientPn(toUserJid(recipientJid), directRecipientJid)
@@ -517,30 +685,16 @@ export class WaMessageDispatchCoordinator {
 
     /**
      * For a 1:1 recipient passed in PN form, returns the LID-addressed user JID
-     * (cache-first; falls back to a one-shot `queryLidsByPhoneJids`). Switching
-     * to LID before fanout ensures the envelope, eligible-requester list, and
+     * (via {@link SignalDeviceSyncApi.resolveUserJidPair}). Switching to LID
+     * before fanout ensures the envelope, eligible-requester list, and
      * retry-receipt addressing all agree, which keeps the retry tracker from
      * rejecting receipts that arrive in LID form. Returns the original PN if
      * no LID is known/resolvable. Inputs already in LID form pass through.
      */
     private async resolveDirectRecipientLid(pnUserJid: string): Promise<string> {
         if (isLidJid(pnUserJid)) return pnUserJid
-        const cached = await this.deps.deviceListStore.findByAnyUserJid(pnUserJid)
-        if (cached) {
-            if (isLidJid(cached.userJid)) return cached.userJid
-            if (cached.altUserJid && isLidJid(cached.altUserJid)) return cached.altUserJid
-        }
-        try {
-            const results = await this.deps.signalDeviceSync.queryLidsByPhoneJids([pnUserJid])
-            const match = results.find((entry) => entry.phoneJid === pnUserJid)
-            if (match?.lidJid) return match.lidJid
-        } catch (error) {
-            this.deps.logger.debug('lid resolution failed for direct recipient', {
-                pnUserJid,
-                message: toError(error).message
-            })
-        }
-        return pnUserJid
+        const pair = await this.deps.signalDeviceSync.resolveUserJidPair(pnUserJid)
+        return pair.lidJid ?? pnUserJid
     }
 
     /**
@@ -558,17 +712,8 @@ export class WaMessageDispatchCoordinator {
     ): Promise<string | undefined> {
         if (!isLidJid(directRecipientJid)) return undefined
         if (isUserJid(recipientUserJid)) return recipientUserJid
-        try {
-            const snapshot = await this.deps.deviceListStore.findByAnyUserJid(directRecipientJid)
-            if (snapshot?.userJid && isUserJid(snapshot.userJid)) return snapshot.userJid
-            if (snapshot?.altUserJid && isUserJid(snapshot.altUserJid)) return snapshot.altUserJid
-        } catch (error) {
-            this.deps.logger.trace('peer_recipient_pn store lookup failed', {
-                lid: directRecipientJid,
-                message: toError(error).message
-            })
-        }
-        return undefined
+        const pair = await this.deps.signalDeviceSync.resolveUserJidPair(directRecipientJid)
+        return pair.pnJid ?? undefined
     }
 
     public async syncSignalSession(jid: string, reasonIdentity = false): Promise<void> {
@@ -651,7 +796,7 @@ export class WaMessageDispatchCoordinator {
             replayStatusSetting: statusSetting,
             // Bare `<to jid=user>` ack hints route the skmsg through primary
             // devices that already hold the sender key.
-            customize: async ({
+            customize: ({
                 fanoutDeviceJids,
                 distributionParticipants,
                 messageWithSecret,
@@ -675,7 +820,7 @@ export class WaMessageDispatchCoordinator {
                     seenAck.add(userJid)
                     ackHints.push({ jid: userJid })
                 }
-                const reportingArtifacts = await this.tryBuildReportingTokenArtifacts({
+                const reportingArtifacts = this.tryBuildReportingTokenArtifacts({
                     message: messageWithSecret,
                     stanzaId: sendOptions.id,
                     senderUserJid: toUserJid(senderJid),
@@ -746,11 +891,17 @@ export class WaMessageDispatchCoordinator {
             }[]
             readonly messageWithSecret: Proto.IMessage
             readonly sendOptions: WaSendMessageOptions
-        }) => Promise<{
-            readonly extraParticipants?: readonly { readonly jid: string }[]
-            readonly customNodes?: readonly BinaryNode[]
-            readonly phash?: string
-        }>
+        }) =>
+            | Promise<{
+                  readonly extraParticipants?: readonly { readonly jid: string }[]
+                  readonly customNodes?: readonly BinaryNode[]
+                  readonly phash?: string
+              }>
+            | {
+                  readonly extraParticipants?: readonly { readonly jid: string }[]
+                  readonly customNodes?: readonly BinaryNode[]
+                  readonly phash?: string
+              }
     }): Promise<WaMessagePublishResult> {
         const sendOptions = await this.withResolvedMessageId(input.options)
         const sender = parseSignalAddressFromJid(input.senderJid)
@@ -803,14 +954,15 @@ export class WaMessageDispatchCoordinator {
                 participants.push(entry)
             }
         }
+        const outboundAttrs = resolveOutboundMessageAttrs(messageWithSecret)
         const messageNode = buildGroupSenderKeyMessageNode({
             to: input.groupJid,
-            type: resolveMessageTypeAttr(messageWithSecret),
+            type: outboundAttrs.typeAttr,
             id: sendOptions.id,
             phash: extras.phash,
-            edit: resolveEditAttr(messageWithSecret) ?? undefined,
-            mediatype: resolveEncMediaType(messageWithSecret) ?? undefined,
-            decryptFail: resolveDecryptFailAttr(messageWithSecret),
+            edit: outboundAttrs.edit ?? undefined,
+            mediatype: outboundAttrs.mediatype ?? undefined,
+            decryptFail: outboundAttrs.decryptFail,
             groupCiphertext: groupCiphertext.ciphertext,
             participants,
             deviceIdentity: shouldAttachDeviceIdentity
@@ -874,9 +1026,63 @@ export class WaMessageDispatchCoordinator {
         await this.deps.groupMetadataCache.mutateFromGroupEvent(event)
     }
 
-    // noop for now
+    /**
+     * Splits a group's members into the ones a history bundle is being shared
+     * with and the rest, normalizing everything to the group's addressing mode
+     * so the receiver list written into the proto matches what the fanout can
+     * actually resolve. This account is excluded from both lists.
+     *
+     * Requested JIDs that are not current members come back in `unknownJids`
+     * instead of being silently dropped - sharing history with a non-member is
+     * a caller mistake worth surfacing.
+     */
+    public async resolveGroupHistoryAudience(
+        groupJid: string,
+        requestedJids: readonly string[]
+    ): Promise<WaGroupHistoryAudience> {
+        const participants = await this.deps.groupMetadataCache.resolveParticipantUsers(groupJid)
+        const meJid = this.requireCurrentMeJid('shareGroupHistory')
+        const addressingMode = this.resolveGroupAddressingMode(participants, groupJid)
+        const meUserJid = toUserJid(this.resolveSenderForAddressingMode(addressingMode, meJid))
+
+        const pending = new Set<string>()
+        for (let index = 0; index < requestedJids.length; index += 1) {
+            pending.add(toUserJid(normalizeRecipientJid(requestedJids[index])))
+        }
+        const historyReceivers: string[] = []
+        const nonHistoryReceivers: string[] = []
+        for (let index = 0; index < participants.length; index += 1) {
+            const participantUserJid = toUserJid(participants[index])
+            if (participantUserJid === meUserJid) {
+                continue
+            }
+            if (pending.delete(participantUserJid)) {
+                historyReceivers[historyReceivers.length] = participantUserJid
+            } else {
+                nonHistoryReceivers[nonHistoryReceivers.length] = participantUserJid
+            }
+        }
+        const requestedSelf = pending.delete(meUserJid)
+        const unknownJids: string[] = []
+        for (const jid of pending) {
+            unknownJids[unknownJids.length] = jid
+        }
+        return {
+            historyReceivers,
+            nonHistoryReceivers,
+            unknownJids,
+            requestedSelf,
+            addressingMode
+        }
+    }
+
+    /**
+     * A group-history bundle goes to the members named in `historyReceivers`
+     * rather than to the whole group, so it takes the per-device direct fanout
+     * instead of the group sender key.
+     */
     private shouldUseGroupDirectPath(message: Proto.IMessage): boolean {
-        return false
+        return resolveGroupHistoryReceivers(message).length > 0
     }
 
     private async publishGroupDirectMessage(
@@ -892,9 +1098,22 @@ export class WaMessageDispatchCoordinator {
         const addressingMode =
             retryContext.forceAddressingMode ??
             this.resolveGroupAddressingMode(participantUserJids, groupJid)
-        const senderForPhash = this.resolveSenderForAddressingMode(addressingMode, meJid)
+        const senderJid = this.resolveSenderForAddressingMode(addressingMode, meJid)
+        const targetUserJids = restrictGroupHistoryTargets(
+            message,
+            participantUserJids,
+            senderJid,
+            (droppedJids, totalExpected) => {
+                this.deps.logger.warn('group history receivers missing from the participant list', {
+                    groupJid,
+                    droppedCount: droppedJids.length,
+                    totalExpected,
+                    sample: droppedJids.slice(0, 3)
+                })
+            }
+        )
         const fanoutDeviceJids =
-            await this.deps.fanoutResolver.resolveGroupParticipantDeviceJids(participantUserJids)
+            await this.deps.fanoutResolver.resolveGroupParticipantDeviceJids(targetUserJids)
         if (fanoutDeviceJids.length === 0) {
             throw new Error('group direct send resolved no target devices')
         }
@@ -960,21 +1179,11 @@ export class WaMessageDispatchCoordinator {
                 break
             }
         }
-        const phashTargets = new Array<string>(resolvedFanoutTargets.length + 1)
-        let phashTargetCount = 0
-        for (let index = 0; index < resolvedFanoutTargets.length; index += 1) {
-            const candidate = resolvedFanoutTargets[index].jid
-            if (isHostedDeviceJid(candidate)) continue
-            phashTargets[phashTargetCount] = candidate
-            phashTargetCount += 1
-        }
-        phashTargets[phashTargetCount] = senderForPhash
-        phashTargets.length = phashTargetCount + 1
-        const localPhash = computePhashV2(phashTargets, this.phashMaxParticipants)
-        const reportingArtifacts = await this.tryBuildReportingTokenArtifacts({
+        const reportingArtifacts = this.tryBuildReportingTokenArtifacts({
             message,
+            messageBytes: unpadPkcs7(plaintext),
             stanzaId: sendOptions.id,
-            senderUserJid: toUserJid(senderForPhash),
+            senderUserJid: toUserJid(senderJid),
             remoteJid: groupJid,
             context: 'group_direct'
         })
@@ -985,7 +1194,6 @@ export class WaMessageDispatchCoordinator {
             type,
             id: sendOptions.id,
             edit,
-            phash: localPhash,
             addressingMode,
             participants,
             deviceIdentity: shouldAttachDeviceIdentity
@@ -1014,7 +1222,7 @@ export class WaMessageDispatchCoordinator {
         const ackError = result.ack.error
         const serverPhash = result.ack.phash
         const serverAddressingMode = result.ack.addressingMode
-        const hasPhashMismatch = !!serverPhash && serverPhash !== localPhash
+        const hasPhashMismatch = !!serverPhash
         const hasAddressingMismatch =
             !!serverAddressingMode && serverAddressingMode !== addressingMode
         const hasAddressingError = ackError === WA_NACK_REASONS.STALE_GROUP_ADDRESSING_MODE
@@ -1025,7 +1233,6 @@ export class WaMessageDispatchCoordinator {
             this.deps.logger.warn('group direct publish acknowledged with mismatch metadata', {
                 id: result.id,
                 groupJid,
-                localPhash,
                 serverPhash,
                 localAddressingMode: addressingMode,
                 serverAddressingMode,
@@ -1162,9 +1369,10 @@ export class WaMessageDispatchCoordinator {
         }
         phashTargets[phashTargetCount] = senderJid
         phashTargets.length = phashTargetCount + 1
-        const localPhash = computePhashV2(phashTargets, this.phashMaxParticipants)
-        const reportingArtifacts = await this.tryBuildReportingTokenArtifacts({
+        const localPhash = computePhashV2(phashTargets)
+        const reportingArtifacts = this.tryBuildReportingTokenArtifacts({
             message,
+            messageBytes: unpadPkcs7(plaintext),
             stanzaId: sendOptions.id,
             senderUserJid: toUserJid(senderJid),
             remoteJid: groupJid,
@@ -1343,11 +1551,6 @@ export class WaMessageDispatchCoordinator {
             readonly ciphertext: Uint8Array
         }[]
     }> {
-        const distributionPayload = await writeRandomPadMax16(
-            proto.Message.encode({
-                senderKeyDistributionMessage
-            }).finish()
-        )
         const fanoutDeviceJids =
             await this.deps.fanoutResolver.resolveGroupParticipantDeviceJids(participantUserJids)
         if (fanoutDeviceJids.length === 0) {
@@ -1356,19 +1559,9 @@ export class WaMessageDispatchCoordinator {
                 distributionParticipants: []
             }
         }
-        const fanoutTargetsByAddressKey = new Map<
-            string,
-            {
-                readonly jid: string
-                readonly address: SignalAddress
-            }
-        >()
         const fanoutAddresses: SignalAddress[] = new Array(fanoutDeviceJids.length)
         for (let index = 0; index < fanoutDeviceJids.length; index += 1) {
-            const jid = fanoutDeviceJids[index]
-            const address = parseSignalAddressFromJid(jid)
-            fanoutAddresses[index] = address
-            fanoutTargetsByAddressKey.set(signalAddressKey(address), { jid, address })
+            fanoutAddresses[index] = parseSignalAddressFromJid(fanoutDeviceJids[index])
         }
         const pendingAddresses =
             await this.deps.senderKeyManager.filterParticipantsNeedingDistribution(
@@ -1381,6 +1574,20 @@ export class WaMessageDispatchCoordinator {
                 fanoutDeviceJids,
                 distributionParticipants: []
             }
+        }
+        const fanoutTargetsByAddressKey = new Map<
+            string,
+            {
+                readonly jid: string
+                readonly address: SignalAddress
+            }
+        >()
+        for (let index = 0; index < fanoutAddresses.length; index += 1) {
+            const address = fanoutAddresses[index]
+            fanoutTargetsByAddressKey.set(signalAddressKey(address), {
+                jid: fanoutDeviceJids[index],
+                address
+            })
         }
         const pendingAddressKeys = new Set<string>()
         const pendingTargets: {
@@ -1454,6 +1661,11 @@ export class WaMessageDispatchCoordinator {
                 distributionParticipants: []
             }
         }
+        const distributionPayload = await writeRandomPadMax16(
+            proto.Message.encode({
+                senderKeyDistributionMessage
+            }).finish()
+        )
 
         const distributionEncryptRequests: {
             readonly address: SignalAddress
@@ -1672,8 +1884,9 @@ export class WaMessageDispatchCoordinator {
         const deviceIdentity = shouldAttachDeviceIdentity
             ? this.getEncodedSignedDeviceIdentity()
             : undefined
-        const reportingArtifacts = await this.tryBuildReportingTokenArtifacts({
+        const reportingArtifacts = this.tryBuildReportingTokenArtifacts({
             message,
+            messageBytes: unpadPkcs7(plaintext),
             stanzaId: sendOptions.id,
             senderUserJid: meUserJid,
             remoteJid: recipientUserJid,
@@ -1788,20 +2001,22 @@ export class WaMessageDispatchCoordinator {
         }
     }
 
-    private async tryBuildReportingTokenArtifacts(input: {
+    private tryBuildReportingTokenArtifacts(input: {
         readonly message: Proto.IMessage
+        readonly messageBytes?: Uint8Array
         readonly stanzaId?: string
         readonly senderUserJid: string
         readonly remoteJid: string
         readonly context: string
-    }): Promise<BuildReportingTokenArtifactsResult | null> {
+    }): BuildReportingTokenArtifactsResult | null {
         if (!input.stanzaId) {
             return null
         }
 
         try {
-            return await buildReportingTokenArtifacts({
+            return buildReportingTokenArtifacts({
                 message: input.message,
+                messageBytes: input.messageBytes,
                 stanzaId: input.stanzaId,
                 senderUserJid: input.senderUserJid,
                 remoteJid: input.remoteJid

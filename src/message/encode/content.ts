@@ -22,10 +22,24 @@ import {
 } from '@protocol/constants'
 
 /**
+ * Content keys that carry a payload but do not end in `Message`, so the
+ * substring match below would miss them.
+ */
+const UNSUFFIXED_CONTENT_KEYS = new Set([
+    'conversation',
+    'messageHistoryBundle',
+    'messageHistoryNotice'
+])
+
+/**
  * Returns the content-type key of a message - `'conversation'`,
- * `'imageMessage'`, `'extendedTextMessage'`, etc. - or `undefined` for an empty
- * message. `senderKeyDistributionMessage` is skipped so group messages report
- * their real payload type rather than the piggy-backed sender-key.
+ * `'imageMessage'`, `'extendedTextMessage'`, `'messageHistoryBundle'`, etc. -
+ * or `undefined` for an empty message. `senderKeyDistributionMessage` is
+ * skipped so group messages report their real payload type rather than the
+ * piggy-backed sender-key.
+ *
+ * A key that is present but holds `null`/`undefined` carries no payload and is
+ * skipped, so an explicitly-cleared field cannot mask the real content.
  */
 export function getContentType(
     content: Proto.IMessage | undefined
@@ -33,7 +47,10 @@ export function getContentType(
     if (!content) return undefined
     const key = Object.keys(content).find(
         (k) =>
-            (k === 'conversation' || k.includes('Message')) && k !== 'senderKeyDistributionMessage'
+            content[k as keyof Proto.IMessage] !== null &&
+            content[k as keyof Proto.IMessage] !== undefined &&
+            (UNSUFFIXED_CONTENT_KEYS.has(k) || k.includes('Message')) &&
+            k !== 'senderKeyDistributionMessage'
     )
     return key as keyof Proto.IMessage | undefined
 }
@@ -202,8 +219,10 @@ export function unwrapMessage(message: Proto.IMessage): Proto.IMessage {
 }
 
 export function resolveMessageTypeAttr(message: Proto.IMessage): string {
-    const msg = unwrapMessage(message)
+    return resolveMessageTypeAttrFrom(unwrapMessage(message))
+}
 
+function resolveMessageTypeAttrFrom(msg: Proto.IMessage): string {
     if (msg.reactionMessage || msg.encReactionMessage) {
         return WA_STANZA_MSG_TYPES.REACTION
     }
@@ -222,6 +241,7 @@ export function resolveMessageTypeAttr(message: Proto.IMessage): string {
         msg.pollCreationMessageV2 ||
         msg.pollCreationMessageV3 ||
         msg.pollCreationMessageV5 ||
+        msg.pollCreationMessageV6 ||
         msg.pollUpdateMessage ||
         msg.secretEncryptedMessage?.secretEncType ===
             proto.Message.SecretEncryptedMessage.SecretEncType.POLL_EDIT ||
@@ -264,7 +284,10 @@ export function resolveMessageTypeAttr(message: Proto.IMessage): string {
 const REVOKED_REACTION_TEXT = ''
 
 export function resolveDecryptFailAttr(message: Proto.IMessage): 'hide' | undefined {
-    const msg = unwrapMessage(message)
+    return resolveDecryptFailAttrFrom(unwrapMessage(message))
+}
+
+function resolveDecryptFailAttrFrom(msg: Proto.IMessage): 'hide' | undefined {
     const secretEncType = msg.secretEncryptedMessage?.secretEncType
     if (
         msg.reactionMessage ||
@@ -315,8 +338,10 @@ export function needsSecretPersistence(message: Proto.IMessage): boolean {
 }
 
 export function resolveEditAttr(message: Proto.IMessage): string | null {
-    const msg = unwrapMessage(message)
+    return resolveEditAttrFrom(unwrapMessage(message))
+}
 
+function resolveEditAttrFrom(msg: Proto.IMessage): string | null {
     if (msg.protocolMessage) {
         const protocolType = msg.protocolMessage.type
         if (protocolType === proto.Message.ProtocolMessage.Type.REVOKE) {
@@ -369,8 +394,10 @@ export function resolveEditAttr(message: Proto.IMessage): string | null {
 }
 
 export function resolveEncMediaType(message: Proto.IMessage): string | null {
-    const msg = unwrapMessage(message)
+    return resolveEncMediaTypeFrom(unwrapMessage(message))
+}
 
+function resolveEncMediaTypeFrom(msg: Proto.IMessage): string | null {
     if (msg.imageMessage) return WA_ENC_MEDIA_TYPES.IMAGE
     if (msg.stickerMessage) return WA_ENC_MEDIA_TYPES.STICKER
     if (msg.stickerPackMessage) return WA_ENC_MEDIA_TYPES.STICKER_PACK
@@ -404,12 +431,27 @@ export function resolveEncMediaType(message: Proto.IMessage): string | null {
     return null
 }
 
-export type WaButtonAddonKind = 'list' | 'interactive'
+/** Companion business node kind for list and native-flow messages. */
+export type WaButtonAddonKind = 'list' | 'interactive' | 'payment_info' | 'order_details'
 
 export function resolveButtonAddonKind(message: Proto.IMessage): WaButtonAddonKind | null {
-    const msg = unwrapMessage(message)
+    return resolveButtonAddonKindFrom(unwrapMessage(message))
+}
+
+function resolveNativeFlowAddonKind(
+    nativeFlow: Proto.Message.InteractiveMessage.INativeFlowMessage
+): WaButtonAddonKind {
+    const firstButtonName = nativeFlow.buttons?.[0]?.name
+    if (firstButtonName === 'payment_info') return 'payment_info'
+    if (firstButtonName === 'review_and_pay') return 'order_details'
+    return 'interactive'
+}
+
+function resolveButtonAddonKindFrom(msg: Proto.IMessage): WaButtonAddonKind | null {
     if (msg.listMessage) return 'list'
-    if (msg.buttonsMessage || msg.interactiveMessage?.nativeFlowMessage) return 'interactive'
+    if (msg.buttonsMessage) return 'interactive'
+    const nativeFlow = msg.interactiveMessage?.nativeFlowMessage
+    if (nativeFlow) return resolveNativeFlowAddonKind(nativeFlow)
     return null
 }
 
@@ -419,13 +461,52 @@ export interface MessageMetaAttrs {
     readonly view_once?: string
 }
 
-export function resolveMetaAttrs(message: Proto.IMessage): MessageMetaAttrs | null {
+export interface WaOutboundMessageAttrs {
+    readonly buttonAddonKind: WaButtonAddonKind | null
+    readonly typeAttr: string
+    readonly edit: string | null
+    readonly mediatype: string | null
+    readonly metaAttrs: MessageMetaAttrs | null
+    readonly decryptFail: 'hide' | undefined
+}
+
+/**
+ * Resolves every outbound stanza attribute derived from the message body in
+ * one pass, unwrapping the envelope (`ephemeralMessage`, `viewOnceMessage`,
+ * `deviceSentMessage`, ...) a single time instead of once per resolver.
+ * Equivalent to calling the individual `resolve*` helpers on `message`.
+ */
+export function resolveOutboundMessageAttrs(message: Proto.IMessage): WaOutboundMessageAttrs {
     const msg = unwrapMessage(message)
+    return {
+        buttonAddonKind: resolveButtonAddonKindFrom(msg),
+        typeAttr: resolveMessageTypeAttrFrom(msg),
+        edit: resolveEditAttrFrom(msg),
+        mediatype: resolveEncMediaTypeFrom(msg),
+        metaAttrs: resolveMetaAttrsFrom(message, msg),
+        decryptFail: resolveDecryptFailAttrFrom(msg)
+    }
+}
+
+export function resolveMetaAttrs(message: Proto.IMessage): MessageMetaAttrs | null {
+    return resolveMetaAttrsFrom(message, unwrapMessage(message))
+}
+
+function resolveMetaAttrsFrom(
+    message: Proto.IMessage,
+    msg: Proto.IMessage
+): MessageMetaAttrs | null {
     let polltype: string | undefined
     let eventType: string | undefined
     let viewOnce: string | undefined
 
-    if (msg.pollCreationMessage || msg.pollCreationMessageV2 || msg.pollCreationMessageV3) {
+    if (
+        msg.pollCreationMessage ||
+        msg.pollCreationMessageV2 ||
+        msg.pollCreationMessageV3 ||
+        msg.pollCreationMessageV5 ||
+        msg.pollCreationMessageV6
+    ) {
         polltype = WA_POLL_META_TYPES.CREATION
     } else if (msg.pollUpdateMessage) {
         polltype = WA_POLL_META_TYPES.VOTE
