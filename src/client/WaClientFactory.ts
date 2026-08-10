@@ -72,7 +72,6 @@ import {
     getMediaConn as getClientMediaConn,
     type WaMediaMessageOptions
 } from '@client/messaging/messages'
-import { uploadNewsletterLinkPreviewThumbnail } from '@client/newsletter/content'
 import type {
     WaClientEventMap,
     WaClientOptions,
@@ -85,10 +84,6 @@ import type { Logger } from '@infra/log/types'
 import { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
 import type { WaMediaConn } from '@media/types'
 import { createDefaultLinkPreviewFetcher } from '@message/addons/link-preview/fetcher'
-import {
-    WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS,
-    WA_DEFAULT_PHASH_MAX_PARTICIPANTS
-} from '@message/crypto/phash'
 import { processNewsletterLiveUpdates } from '@message/kinds/newsletter'
 import { handleIncomingMessageAck } from '@message/primitives/incoming'
 import {
@@ -96,6 +91,10 @@ import {
     type PeerDataOperationRequester
 } from '@message/primitives/peer-data-operation'
 import { WaMessageClient } from '@message/WaMessageClient'
+import {
+    WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS,
+    WA_DEFAULT_PHASH_MAX_PARTICIPANTS
+} from '@message/crypto/phash'
 import {
     resolveWaDeviceIdentity,
     WA_DEFAULTS,
@@ -666,23 +665,7 @@ export function buildWaClientDependencies(input: {
         generateStanzaId: () => messageDispatch.generateOutgoingMessageId(),
         mediaTransfer,
         getMediaConn: () => getClientMediaConn(mediaMessageBuildOptions),
-        linkPreviewResolver: (content) =>
-            resolveLinkPreview(content.text, content.linkPreview, {
-                logger,
-                mediaTransfer,
-                getMediaConn: () => getClientMediaConn(mediaMessageBuildOptions),
-                fetcher: linkPreviewFetcher,
-                options: linkPreviewOptions,
-                serverClock,
-                thumbnailUploader: async (thumbnail) =>
-                    uploadNewsletterLinkPreviewThumbnail(
-                        { mediaTransfer, logger },
-                        {
-                            thumbnail,
-                            mediaConn: await getClientMediaConn(mediaMessageBuildOptions)
-                        }
-                    )
-            }),
+        linkPreviewResolver: mediaMessageBuildOptions.linkPreviewResolver,
         getAbPropString: (name) => abPropsCoordinator.getConfigValue<string>(name),
         logger
     })
