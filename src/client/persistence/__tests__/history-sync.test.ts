@@ -1,20 +1,40 @@
 import assert from 'node:assert/strict'
+import { Readable } from 'node:stream'
 import test from 'node:test'
 import { promisify } from 'node:util'
 import { gzip } from 'node:zlib'
 
+import { openHistoryBlobStream } from '@client/persistence/history-blob'
 import {
-    processHistorySyncNotification,
-    scanConversationJidPair,
-    scanHistorySyncBlob
+    CONVERSATION_FIELDS,
+    HISTORY_SYNC_FIELDS,
+    processHistorySyncNotification
 } from '@client/persistence/history-sync'
 import { WriteBehindPersistence } from '@client/persistence/WriteBehindPersistence'
 import { createNoopLogger } from '@infra/log/types'
 import { proto, type Proto } from '@proto'
+import type { WaStoredContactRecord } from '@store/contracts/contact.store'
+import type { WaStoredMessageRecord } from '@store/contracts/message.store'
 import type { WaStoredThreadRecord } from '@store/contracts/thread.store'
 import { toBytesView } from '@util/bytes'
+import { readProtoVarint } from '@util/protoscan'
 
 const gzipAsync = promisify(gzip)
+
+/**
+ * Reads a field number back out of the generated encoder: encode a message
+ * carrying only that field, then decode the leading tag. Keeps the hardcoded
+ * numbers pinned to the code that actually serializes the wire, with no
+ * reflection metadata to depend on.
+ */
+function encodedFieldNumber(
+    type: { encode: (value: never) => { finish: () => Uint8Array } },
+    value: unknown
+): number {
+    const bytes = type.encode(value as never).finish()
+    assert.ok(bytes.length > 0, 'the probe field must actually be encoded')
+    return Math.floor(readProtoVarint(bytes, 0, bytes.length).value / 8)
+}
 
 function createThreadCapture(): {
     readonly writes: WaStoredThreadRecord[]
@@ -43,6 +63,66 @@ function createThreadCapture(): {
         createNoopLogger()
     )
     return { writes, writeBehind }
+}
+
+interface TokenConversation {
+    readonly jid: string
+    readonly tcToken?: Uint8Array | null
+    readonly tcTokenTimestamp?: number | null
+}
+
+interface Capture {
+    readonly order: string[]
+    readonly messages: WaStoredMessageRecord[]
+    readonly threads: WaStoredThreadRecord[]
+    readonly contacts: WaStoredContactRecord[]
+    readonly events: unknown[]
+    readonly acked: number[]
+    readonly salts: Uint8Array[]
+    readonly tokens: TokenConversation[]
+}
+
+function createCapture(): { readonly capture: Capture; readonly deps: unknown } {
+    const capture: Capture = {
+        order: [],
+        messages: [],
+        threads: [],
+        contacts: [],
+        events: [],
+        acked: [],
+        salts: [],
+        tokens: []
+    }
+    const deps = {
+        logger: createNoopLogger(),
+        mediaTransfer: {} as never,
+        writeBehind: {
+            persistMessageAsync: async (record: WaStoredMessageRecord) => {
+                capture.order.push(`msg:${record.id}`)
+                capture.messages.push(record)
+            },
+            persistThreadAsync: async (record: WaStoredThreadRecord) => {
+                capture.order.push(`thread:${record.jid}`)
+                capture.threads.push(record)
+            },
+            persistContactAsync: async (record: WaStoredContactRecord) => {
+                capture.contacts.push(record)
+            }
+        } as never,
+        emitEvent: (_type: string, payload: unknown) => {
+            capture.events.push(payload)
+        },
+        onNctSalt: async (salt: Uint8Array) => {
+            capture.salts.push(salt)
+        },
+        onPrivacyTokens: async (conversations: readonly TokenConversation[]) => {
+            capture.tokens.push(...conversations)
+        },
+        onProcessed: async (syncType: number) => {
+            capture.acked.push(syncType)
+        }
+    }
+    return { capture, deps }
 }
 
 async function buildInlineNotification(
@@ -129,7 +209,7 @@ test('history sync leaves ephemeralSettingTimestamp absent for a non-ephemeral c
     assert.equal(thread.ephemeralSettingTimestamp, undefined)
 })
 
-test('scanHistorySyncBlob is equivalent to the monolithic HistorySync decode', () => {
+test('streaming history sync is equivalent to the monolithic HistorySync decode', async () => {
     const historySync: Proto.IHistorySync = {
         syncType: proto.HistorySync.HistorySyncType.RECENT,
         chunkOrder: 4,
@@ -140,7 +220,10 @@ test('scanHistorySyncBlob is equivalent to the monolithic HistorySync decode', (
             { id: '5511111111111@s.whatsapp.net', pushname: 'Alice' },
             { id: '5522222222222@s.whatsapp.net', pushname: 'Bob' }
         ],
-        phoneNumberToLidMappings: [{ pnJid: '5511111111111@s.whatsapp.net', lidJid: '111@lid' }],
+        phoneNumberToLidMappings: [
+            { pnJid: '5511111111111@s.whatsapp.net', lidJid: '111@lid' },
+            { pnJid: '5544444444444@s.whatsapp.net', lidJid: '444@lid' }
+        ],
         inlineContacts: [
             { pnJid: '5522222222222@s.whatsapp.net', lidJid: '222@lid', fullName: 'Bob Silva' }
         ],
@@ -154,12 +237,20 @@ test('scanHistorySyncBlob is equivalent to the monolithic HistorySync decode', (
                 pnJid: '5511111111111@s.whatsapp.net',
                 lidJid: '111@lid',
                 tcToken: new Uint8Array([5, 5, 5]),
+                name: 'Alice',
+                unreadCount: 3,
                 messages: [
                     {
                         message: {
                             key: { remoteJid: '5511111111111@s.whatsapp.net', id: 'M1' },
                             message: { conversation: 'oi' },
                             messageTimestamp: 1_722_000_000
+                        }
+                    },
+                    {
+                        message: {
+                            key: { remoteJid: '5511111111111@s.whatsapp.net', id: 'M2' },
+                            messageStubType: proto.WebMessageInfo.StubType.GROUP_PARTICIPANT_ADD
                         }
                     }
                 ]
@@ -168,7 +259,6 @@ test('scanHistorySyncBlob is equivalent to the monolithic HistorySync decode', (
                 id: '5533333333333@s.whatsapp.net',
                 pnJid: '5533333333333@s.whatsapp.net',
                 accountLid: '333@lid',
-                muteEndTime: -1,
                 messages: []
             },
             { id: '123@g.us', messages: [] }
@@ -183,35 +273,149 @@ test('scanHistorySyncBlob is equivalent to the monolithic HistorySync decode', (
     blob.set(unknownLen, unknownVarint.length + clean.length)
 
     const reference = proto.HistorySync.decode(blob)
-    const scan = scanHistorySyncBlob(blob)
+    const { capture, deps } = createCapture()
+    await processHistorySyncNotification(deps as never, {
+        syncType: proto.Message.HistorySyncType.RECENT,
+        initialHistBootstrapInlinePayload: toBytesView(await gzipAsync(blob))
+    })
 
-    assert.equal(scan.conversationRanges.length, reference.conversations.length)
-    for (let i = 0; i < scan.conversationRanges.length; i += 1) {
-        const range = scan.conversationRanges[i]
-        const incremental = proto.Conversation.decode(blob.subarray(range.start, range.end))
-        assert.deepEqual(
-            Array.from(proto.Conversation.encode(incremental).finish()),
-            Array.from(proto.Conversation.encode(reference.conversations[i]).finish()),
-            `conversation ${i}`
-        )
-        const pair = scanConversationJidPair(blob, range)
-        assert.equal(pair.pnJid, reference.conversations[i].pnJid ?? null)
-        assert.equal(
-            pair.lidJid,
-            reference.conversations[i].lidJid ?? reference.conversations[i].accountLid ?? null
-        )
+    const emitted = capture.events[0] as Record<string, number>
+    assert.equal(emitted.conversationsCount, reference.conversations.length)
+    assert.equal(emitted.pushnamesCount, reference.pushnames.length)
+    assert.equal(emitted.inlineContactsCount, reference.inlineContacts.length)
+    assert.equal(emitted.chunkOrder, reference.chunkOrder)
+    assert.equal(emitted.progress, reference.progress)
+
+    assert.deepEqual(
+        capture.threads.map((record) => record.jid),
+        reference.conversations.map((conversation) => conversation.id)
+    )
+    const alice = capture.threads[0]
+    assert.equal(alice.name, 'Alice')
+    assert.equal(alice.unreadCount, 3)
+
+    assert.deepEqual(
+        capture.messages.map((record) => record.id),
+        ['M1']
+    )
+    assert.equal(capture.messages[0].threadJid, '5511111111111@s.whatsapp.net')
+    assert.equal(capture.messages[0].timestampMs, 1_722_000_000_000)
+    const messageBytes = capture.messages[0].messageBytes
+    assert.ok(messageBytes, 'message payload must be persisted')
+    assert.deepEqual(
+        Array.from(messageBytes),
+        Array.from(proto.Message.encode({ conversation: 'oi' }).finish())
+    )
+
+    const bob = capture.contacts.find((record) => record.pushName === 'Bob')
+    assert.ok(bob, 'Bob pushname must be persisted')
+    assert.equal(bob.jid, '222@lid', 'pushname must land on the canonical LID row')
+    const aliceContact = capture.contacts.find((record) => record.pushName === 'Alice')
+    assert.ok(aliceContact)
+    assert.equal(aliceContact.jid, '111@lid')
+
+    assert.deepEqual(
+        capture.salts.map((salt) => Array.from(salt)),
+        [Array.from(reference.nctSalt as Uint8Array)],
+        'the chunk nctSalt must be handed over'
+    )
+    assert.deepEqual(
+        capture.tokens.map((token) => [token.jid, Array.from(token.tcToken ?? [])]),
+        [
+            [
+                '5511111111111@s.whatsapp.net',
+                Array.from(reference.conversations[0].tcToken as Uint8Array)
+            ]
+        ],
+        'privacy tokens must be collected from the conversations that carry them'
+    )
+
+    const standalone = capture.contacts.find((record) => record.jid === '444@lid')
+    assert.ok(standalone, 'a mapping with no conversation or inline contact must still land')
+    assert.equal(standalone.phoneNumber, '5544444444444@s.whatsapp.net')
+
+    const firstMessage = capture.order.indexOf('msg:M1')
+    const ownerThread = capture.order.indexOf('thread:5511111111111@s.whatsapp.net')
+    assert.ok(firstMessage >= 0 && ownerThread >= 0)
+    assert.ok(
+        firstMessage < ownerThread,
+        'messages must be written as they stream, before their conversation closes'
+    )
+
+    assert.deepEqual(capture.acked, [proto.Message.HistorySyncType.RECENT])
+})
+
+test('streaming history sync tolerates a Conversation whose id follows its messages', async () => {
+    const messageField = proto.Conversation.encode({
+        messages: [
+            {
+                message: {
+                    key: { remoteJid: '5511444444444@s.whatsapp.net', id: 'REVERSED' },
+                    message: { conversation: 'fora de ordem' },
+                    messageTimestamp: 1_722_000_001
+                }
+            }
+        ]
+    }).finish()
+    const idField = proto.Conversation.encode({ id: '5511444444444@s.whatsapp.net' }).finish()
+    const conversation = new Uint8Array(messageField.length + idField.length)
+    conversation.set(messageField, 0)
+    conversation.set(idField, messageField.length)
+
+    assert.ok(conversation.length < 128, 'fixture must fit single-byte length framing')
+    const blob = new Uint8Array(2 + conversation.length)
+    blob.set([0x12, conversation.length], 0)
+    blob.set(conversation, 2)
+
+    const { capture, deps } = createCapture()
+    await processHistorySyncNotification(deps as never, {
+        syncType: proto.Message.HistorySyncType.RECENT,
+        initialHistBootstrapInlinePayload: toBytesView(await gzipAsync(blob))
+    })
+
+    assert.deepEqual(
+        capture.messages.map((record) => [record.id, record.threadJid]),
+        [['REVERSED', '5511444444444@s.whatsapp.net']]
+    )
+    const emitted = capture.events[0] as Record<string, number>
+    assert.equal(
+        emitted.messagesCount,
+        capture.messages.length,
+        'a parked message must be counted exactly once, when it is written'
+    )
+})
+
+test('streaming history sync rejects a chunk whose MAC fails, without acking it', async () => {
+    const payload = proto.HistorySync.encode({
+        syncType: proto.HistorySync.HistorySyncType.RECENT,
+        conversations: [{ id: '5511555555555@s.whatsapp.net', messages: [] }]
+    }).finish()
+    const gzipped = toBytesView(await gzipAsync(payload))
+
+    const { capture, deps } = createCapture()
+    const withTransfer = {
+        ...(deps as Record<string, unknown>),
+        mediaTransfer: {
+            downloadAndDecryptStream: async () => ({
+                plaintext: Readable.from([Buffer.from(gzipped)]),
+                metadata: Promise.reject(new Error('media MAC mismatch'))
+            })
+        }
     }
 
-    assert.equal(scan.pushnames.length, reference.pushnames.length)
-    for (let i = 0; i < scan.pushnames.length; i += 1) {
-        assert.equal(scan.pushnames[i].id, reference.pushnames[i].id)
-        assert.equal(scan.pushnames[i].pushname, reference.pushnames[i].pushname)
-    }
-    assert.equal(scan.inlineContacts.length, reference.inlineContacts.length)
-    assert.equal(scan.phoneNumberToLidMappings.length, reference.phoneNumberToLidMappings.length)
-    assert.equal(scan.chunkOrder, reference.chunkOrder ?? null)
-    assert.equal(scan.progress, reference.progress ?? null)
-    assert.deepEqual(Array.from(scan.nctSalt ?? []), Array.from(reference.nctSalt ?? []))
+    await assert.rejects(
+        () =>
+            processHistorySyncNotification(withTransfer as never, {
+                syncType: proto.Message.HistorySyncType.RECENT,
+                directPath: '/history',
+                mediaKey: new Uint8Array(32),
+                fileSha256: new Uint8Array(32),
+                fileEncSha256: new Uint8Array(32)
+            }),
+        /media MAC mismatch/
+    )
+    assert.deepEqual(capture.acked, [], 'a chunk that failed verification must stay unacked')
+    assert.deepEqual(capture.events, [], 'no chunk event may be emitted for unverified data')
 })
 
 test('history sync abort on a corrupt conversation settles pending writes', async () => {
@@ -277,5 +481,149 @@ test('history sync abort on a corrupt conversation settles pending writes', asyn
         threadJids,
         ['5511111111111@s.whatsapp.net'],
         'the conversation before the corrupt record must have been written'
+    )
+})
+
+test('history sync field numbers match the generated encoder', () => {
+    assert.deepEqual(
+        {
+            CONVERSATIONS: encodedFieldNumber(proto.HistorySync, { conversations: [{ id: 'x' }] }),
+            CHUNK_ORDER: encodedFieldNumber(proto.HistorySync, { chunkOrder: 1 }),
+            PROGRESS: encodedFieldNumber(proto.HistorySync, { progress: 1 }),
+            PUSHNAMES: encodedFieldNumber(proto.HistorySync, { pushnames: [{ id: 'x' }] }),
+            PHONE_NUMBER_TO_LID_MAPPINGS: encodedFieldNumber(proto.HistorySync, {
+                phoneNumberToLidMappings: [{ pnJid: 'x' }]
+            }),
+            NCT_SALT: encodedFieldNumber(proto.HistorySync, { nctSalt: new Uint8Array([1]) }),
+            INLINE_CONTACTS: encodedFieldNumber(proto.HistorySync, {
+                inlineContacts: [{ pnJid: 'x' }]
+            })
+        },
+        { ...HISTORY_SYNC_FIELDS }
+    )
+
+    assert.deepEqual(
+        {
+            ID: encodedFieldNumber(proto.Conversation, { id: 'x' }),
+            MESSAGES: encodedFieldNumber(proto.Conversation, { messages: [{}] })
+        },
+        { ...CONVERSATION_FIELDS }
+    )
+})
+
+test('destroying the inflated stream tears down the decryption source', async () => {
+    const plaintext = new Readable({ read: () => undefined })
+    const blob = await openHistoryBlobStream(
+        {
+            downloadAndDecryptStream: async () => ({
+                plaintext,
+                metadata: Promise.resolve(null)
+            })
+        } as never,
+        {
+            directPath: '/history',
+            mediaKey: new Uint8Array(32),
+            fileSha256: new Uint8Array(32),
+            fileEncSha256: new Uint8Array(32)
+        },
+        'history',
+        'history sync'
+    )
+
+    assert.equal(plaintext.destroyed, false)
+    blob.inflated.destroy(new Error('consumer gave up'))
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(plaintext.destroyed, true, 'the source must not keep draining after an abort')
+})
+
+test('history sync bounds the messages parked before their thread jid', async () => {
+    const encodeVarint = (value: number): number[] => {
+        const out: number[] = []
+        let rest = value
+        while (rest > 0x7f) {
+            out.push((rest & 0x7f) | 0x80)
+            rest = Math.floor(rest / 128)
+        }
+        out.push(rest)
+        return out
+    }
+
+    const messages: Proto.IHistorySyncMsg[] = []
+    for (let index = 0; index < 1_200; index += 1) {
+        messages.push({
+            message: {
+                key: { remoteJid: '5511444444444@s.whatsapp.net', id: `P${index}` },
+                message: { conversation: 'parked' },
+                messageTimestamp: 1_722_000_000 + index
+            }
+        })
+    }
+    const messagesPart = proto.Conversation.encode({ messages }).finish()
+    const idPart = proto.Conversation.encode({ id: '5511444444444@s.whatsapp.net' }).finish()
+    const conversation = new Uint8Array(messagesPart.length + idPart.length)
+    conversation.set(messagesPart, 0)
+    conversation.set(idPart, messagesPart.length)
+    const blob = new Uint8Array([0x12, ...encodeVarint(conversation.length), ...conversation])
+
+    const payload = toBytesView(await gzipAsync(blob))
+    const { capture, deps } = createCapture()
+    await assert.rejects(
+        () =>
+            processHistorySyncNotification(deps as never, {
+                syncType: proto.Message.HistorySyncType.RECENT,
+                initialHistBootstrapInlinePayload: payload
+            }),
+        /parked 1024 messages with no thread jid/
+    )
+
+    assert.deepEqual(capture.acked, [], 'an aborted chunk must stay unacked so it is resent')
+    assert.deepEqual(capture.events, [], 'no chunk event may report a partial apply')
+})
+
+test('history sync counts only the messages it persisted', async () => {
+    const { capture, deps } = createCapture()
+    await processHistorySyncNotification(deps as never, {
+        syncType: proto.Message.HistorySyncType.RECENT,
+        initialHistBootstrapInlinePayload: toBytesView(
+            await gzipAsync(
+                proto.HistorySync.encode({
+                    conversations: [
+                        {
+                            id: '5511222222222@s.whatsapp.net',
+                            messages: [
+                                {
+                                    message: {
+                                        key: {
+                                            remoteJid: '5511222222222@s.whatsapp.net',
+                                            id: 'KEPT'
+                                        },
+                                        message: { conversation: 'kept' },
+                                        messageTimestamp: 1_722_000_000
+                                    }
+                                },
+                                {
+                                    message: {
+                                        key: {
+                                            remoteJid: '5511222222222@s.whatsapp.net',
+                                            id: 'STUB'
+                                        },
+                                        messageStubType:
+                                            proto.WebMessageInfo.StubType.GROUP_PARTICIPANT_ADD
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }).finish()
+            )
+        )
+    })
+
+    const emitted = capture.events[0] as Record<string, number>
+    assert.equal(capture.messages.length, 1)
+    assert.equal(
+        emitted.messagesCount,
+        capture.messages.length,
+        'the reported count must match what was written'
     )
 })

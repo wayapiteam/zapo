@@ -8,12 +8,20 @@ import {
 } from '@message/crypto/use-case-secret'
 import { unwrapMessage } from '@message/encode/content'
 import { proto, type Proto } from '@proto'
+import {
+    isGroupOrBroadcastJid,
+    isLidJid,
+    isNewsletterJid,
+    isUserJid,
+    toUserJid
+} from '@protocol/jid'
 import type {
     WaMessageSecretEntry,
     WaMessageSecretStore
 } from '@store/contracts/message-secret.store'
 import type { WaMessageStore } from '@store/contracts/message.store'
 import { bytesToHex, EMPTY_BYTES, TEXT_ENCODER, toBytesView } from '@util/bytes'
+import { toError } from '@util/primitives'
 
 const WA_ADDON_ENCRYPTION_NONCE_BYTES = 12
 
@@ -39,6 +47,147 @@ export function buildAddonAdditionalData(stanzaId: string, addOnSenderJid: strin
         throw new Error('addon sender jid must be a non-empty string')
     }
     return TEXT_ENCODER.encode(`${stanzaId}\u0000${addOnSenderJid}`)
+}
+
+/**
+ * Deduplicates JID candidates as bare `user@server` (device stripped). Empty /
+ * whitespace-only values are dropped. Order is preserved (first wins).
+ */
+export function collectUniqueUserJids(
+    ...candidates: ReadonlyArray<string | null | undefined>
+): readonly string[] {
+    const out: string[] = []
+    const seen = new Set<string>()
+    for (const candidate of candidates) {
+        if (typeof candidate !== 'string' || !candidate.trim()) continue
+        let userJid: string
+        try {
+            userJid = toUserJid(candidate)
+        } catch {
+            continue
+        }
+        if (seen.has(userJid)) continue
+        seen.add(userJid)
+        out.push(userJid)
+    }
+    return out
+}
+
+/**
+ * Resolves the parent-message author JID the peer used when encrypting an
+ * addon (poll vote / event response / ...), or `null` when the key carries no
+ * usable one. In a group the author is the key's `participant`; in 1:1 it is
+ * `remoteJid`, which is how the sender addressed us (often our LID).
+ *
+ * A `fromMe` key is ours, so its author is this account and the stored parent
+ * entry already holds that JID. `remoteJid` on such a key is the *chat*, i.e.
+ * the other side, so reading it would seed the candidate list with the one
+ * party that certainly did not write the parent.
+ *
+ * WhatsApp Web reads the author off its own stored parent message instead,
+ * then normalizes the addressing mode. Taking it from the key the peer sent
+ * is a shortcut to the same JID, in the exact form they encrypted with, so it
+ * pairs with the stored author rather than replacing it.
+ */
+export function resolveAddonParentSenderFromKey(
+    targetMessageKey: Proto.IMessageKey,
+    chatIsGroup: boolean
+): string | null {
+    if (targetMessageKey.fromMe) return null
+    const raw = chatIsGroup ? targetMessageKey.participant : targetMessageKey.remoteJid
+    return collectUniqueUserJids(raw)[0] ?? null
+}
+
+export interface WaAddonSenderPair {
+    readonly parentMsgOriginalSender: string
+    readonly modificationSender: string
+}
+
+/**
+ * Chat JIDs reach the candidate lists through stanza attributes (`from` and
+ * the `*Alt` fields point at the group in a group chat) and can never be the
+ * author of anything, so they are dropped. Everything else stays: the
+ * as-received rung has to work for senders outside `@lid` / `@s.whatsapp.net`,
+ * such as a hosted device.
+ */
+function isPossibleAddonSenderJid(jid: string): boolean {
+    return !isGroupOrBroadcastJid(jid) && !isNewsletterJid(jid)
+}
+
+/** Builds the bounded LID, PN, and as-received sender rungs used by addon decryption. */
+export function buildAddonSenderPairs(input: {
+    readonly parentCandidates: readonly string[]
+    readonly modificationCandidates: readonly string[]
+}): readonly WaAddonSenderPair[] {
+    const parents = input.parentCandidates.filter(isPossibleAddonSenderJid)
+    const modifiers = input.modificationCandidates.filter(isPossibleAddonSenderJid)
+    const pairs: WaAddonSenderPair[] = []
+    const seen = new Set<string>()
+    const addPair = (
+        parentMsgOriginalSender: string | undefined,
+        modificationSender: string | undefined
+    ) => {
+        if (!parentMsgOriginalSender || !modificationSender) return
+        const key = `${parentMsgOriginalSender}\u0000${modificationSender}`
+        if (seen.has(key)) return
+        seen.add(key)
+        pairs.push({ parentMsgOriginalSender, modificationSender })
+    }
+
+    addPair(
+        parents.find((jid) => isLidJid(jid)),
+        modifiers.find((jid) => isLidJid(jid))
+    )
+    addPair(
+        parents.find((jid) => isUserJid(jid)),
+        modifiers.find((jid) => isUserJid(jid))
+    )
+    addPair(parents[0], modifiers[0])
+    return pairs
+}
+
+/**
+ * Decrypts an addon payload, walking the sender rungs until one authenticates.
+ * Needed during the PN→LID migration: the voter encrypts with the poll
+ * creator's LID from `pollCreationMessageKey`, while we may have persisted the
+ * secret under our PN `meJid`.
+ *
+ * Every attempt is local crypto over the same ciphertext, so a failed rung
+ * says nothing beyond "wrong sender pair" and never aborts the walk. Only an
+ * exhausted list throws, carrying the last error.
+ */
+export async function decryptAddonPayloadWithSenderFallback(input: {
+    readonly messageSecret: WaAddonBytes
+    readonly stanzaId: string
+    readonly senderPairs: readonly WaAddonSenderPair[]
+    readonly modificationType: ModificationType
+    readonly ciphertext: WaAddonBytes
+    readonly iv: WaAddonBytes
+}): Promise<Uint8Array> {
+    if (input.senderPairs.length === 0) {
+        throw new Error('addon sender pairs must not be empty')
+    }
+
+    let lastError: unknown
+    for (const { parentMsgOriginalSender, modificationSender } of input.senderPairs) {
+        try {
+            return await decryptAddonPayload({
+                messageSecret: input.messageSecret,
+                stanzaId: input.stanzaId,
+                parentMsgOriginalSender,
+                modificationSender,
+                modificationType: input.modificationType,
+                ciphertext: input.ciphertext,
+                iv: input.iv,
+                additionalData: shouldUseAddonAdditionalData(input.modificationType)
+                    ? buildAddonAdditionalData(input.stanzaId, modificationSender)
+                    : undefined
+            })
+        } catch (error) {
+            lastError = error
+        }
+    }
+    throw lastError instanceof Error ? lastError : new Error(toError(lastError).message)
 }
 
 /** Encrypts an addon payload (poll vote, reaction, edit, ...) with the per-use-case secret. */

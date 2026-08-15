@@ -3,10 +3,14 @@ import test from 'node:test'
 
 import {
     buildAddonAdditionalData,
+    buildAddonSenderPairs,
+    collectUniqueUserJids,
     decodeAddonPlaintext,
     decryptAddonPayload,
+    decryptAddonPayloadWithSenderFallback,
     encryptAddonPayload,
-    identifyEncryptedAddon
+    identifyEncryptedAddon,
+    resolveAddonParentSenderFromKey
 } from '@message/crypto/addon-crypto'
 import {
     createUseCaseSecret,
@@ -236,4 +240,282 @@ test('secretEncryptedMessage with non-12-byte iv is not identified', () => {
         }
     }
     assert.equal(identifyEncryptedAddon(wrapper), null)
+})
+
+test('resolveAddonParentSenderFromKey reads the author the sender addressed', () => {
+    assert.equal(
+        resolveAddonParentSenderFromKey(
+            { remoteJid: '142971525722223@lid', fromMe: false, id: 'POLL1' },
+            false
+        ),
+        '142971525722223@lid'
+    )
+    assert.equal(
+        resolveAddonParentSenderFromKey(
+            {
+                remoteJid: '120363@g.us',
+                fromMe: false,
+                id: 'POLL1',
+                participant: '551100000000:3@s.whatsapp.net'
+            },
+            true
+        ),
+        '551100000000@s.whatsapp.net'
+    )
+    assert.equal(
+        resolveAddonParentSenderFromKey(
+            { remoteJid: 'chat@lid', fromMe: true, id: 'POLL1' },
+            false
+        ),
+        null
+    )
+    assert.equal(
+        resolveAddonParentSenderFromKey(
+            { remoteJid: 'not-a-jid', fromMe: false, id: 'POLL1' },
+            false
+        ),
+        null
+    )
+    assert.equal(
+        resolveAddonParentSenderFromKey(
+            {
+                remoteJid: '120363@g.us',
+                fromMe: false,
+                id: 'POLL1',
+                participant: '@s.whatsapp.net'
+            },
+            true
+        ),
+        null
+    )
+})
+
+test('collectUniqueUserJids strips devices and drops duplicates', () => {
+    const collected = collectUniqueUserJids(
+        '56410217926709:49@lid',
+        '56410217926709@lid',
+        '5519981790250@s.whatsapp.net',
+        '',
+        null,
+        '5519981790250:1@s.whatsapp.net'
+    )
+    assert.deepEqual(collected, ['56410217926709@lid', '5519981790250@s.whatsapp.net'])
+    if (false) {
+        // @ts-expect-error Candidate lists are immutable to callers.
+        collected.push('5511777777777@s.whatsapp.net')
+    }
+})
+
+test('buildAddonSenderPairs orders LID, PN, and original pairs without mixed or group JIDs', () => {
+    assert.deepEqual(
+        buildAddonSenderPairs({
+            parentCandidates: ['5511999999999@s.whatsapp.net', '142971525722223@lid'],
+            modificationCandidates: [
+                '5511888888888@s.whatsapp.net',
+                '120363000000000000@g.us',
+                '56410217926709@lid'
+            ]
+        }),
+        [
+            {
+                parentMsgOriginalSender: '142971525722223@lid',
+                modificationSender: '56410217926709@lid'
+            },
+            {
+                parentMsgOriginalSender: '5511999999999@s.whatsapp.net',
+                modificationSender: '5511888888888@s.whatsapp.net'
+            }
+        ]
+    )
+})
+
+test('a vote synced from our own device pairs this account with itself', () => {
+    const us = '142971525722223@lid'
+    const peer = '56410217926709@lid'
+    const peerPn = '5511888888888@s.whatsapp.net'
+    const targetMessageKey = { remoteJid: peer, fromMe: true, id: 'POLL1' }
+
+    assert.equal(resolveAddonParentSenderFromKey(targetMessageKey, false), null)
+
+    const parentCandidates = collectUniqueUserJids(
+        resolveAddonParentSenderFromKey(targetMessageKey, false),
+        us
+    )
+    const modificationCandidates = collectUniqueUserJids(us, peer, peerPn)
+    assert.deepEqual(buildAddonSenderPairs({ parentCandidates, modificationCandidates }), [
+        { parentMsgOriginalSender: us, modificationSender: us }
+    ])
+})
+
+test('buildAddonSenderPairs keeps a sender outside lid/pn on the as-received rung', () => {
+    const hostedSender = '6116570308623@hosted.lid'
+    assert.deepEqual(
+        buildAddonSenderPairs({
+            parentCandidates: ['142971525722223@lid'],
+            modificationCandidates: ['120363000000000000@g.us', hostedSender]
+        }),
+        [
+            {
+                parentMsgOriginalSender: '142971525722223@lid',
+                modificationSender: hostedSender
+            }
+        ]
+    )
+})
+
+test('decryptAddonPayloadWithSenderFallback walks past a rung that fails before the cipher', async () => {
+    const messageSecret = new Uint8Array(32).fill(13)
+    const stanzaId = '3EB022B08C137DCAE1E403'
+    const parentLid = '142971525722223@lid'
+    const voterLid = '56410217926709@lid'
+    const plaintext = proto.Message.PollVoteMessage.encode({
+        selectedOptions: [new Uint8Array(32).fill(7)]
+    }).finish()
+    const iv = new Uint8Array(12).fill(8)
+
+    const ciphertext = await encryptAddonPayload({
+        messageSecret,
+        stanzaId,
+        parentMsgOriginalSender: parentLid,
+        modificationSender: voterLid,
+        modificationType: WA_USE_CASE_SECRET_MODIFICATION_TYPES.POLL_VOTE,
+        payload: plaintext,
+        iv
+    })
+
+    const recovered = await decryptAddonPayloadWithSenderFallback({
+        messageSecret,
+        stanzaId,
+        senderPairs: [
+            {
+                parentMsgOriginalSender: parentLid,
+                modificationSender: '   '
+            },
+            {
+                parentMsgOriginalSender: parentLid,
+                modificationSender: voterLid
+            }
+        ],
+        modificationType: WA_USE_CASE_SECRET_MODIFICATION_TYPES.POLL_VOTE,
+        ciphertext,
+        iv
+    })
+    assert.deepEqual(Uint8Array.from(recovered), Uint8Array.from(plaintext))
+})
+
+test('decryptAddonPayloadWithSenderFallback recovers when stored parent is PN but vote used LID', async () => {
+    const messageSecret = new Uint8Array(32).fill(11)
+    const stanzaId = '3EB022B08C137DCAE1E401'
+    const parentLid = '142971525722223@lid'
+    const parentPn = '5511999999999@s.whatsapp.net'
+    const voterLid = '56410217926709@lid'
+    const plaintext = proto.Message.PollVoteMessage.encode({
+        selectedOptions: [new Uint8Array(32).fill(3)]
+    }).finish()
+    const iv = new Uint8Array(12).fill(5)
+
+    const ciphertext = await encryptAddonPayload({
+        messageSecret,
+        stanzaId,
+        parentMsgOriginalSender: parentLid,
+        modificationSender: voterLid,
+        modificationType: WA_USE_CASE_SECRET_MODIFICATION_TYPES.POLL_VOTE,
+        payload: plaintext,
+        iv
+    })
+
+    await assert.rejects(
+        () =>
+            decryptAddonPayload({
+                messageSecret,
+                stanzaId,
+                parentMsgOriginalSender: parentPn,
+                modificationSender: voterLid,
+                modificationType: WA_USE_CASE_SECRET_MODIFICATION_TYPES.POLL_VOTE,
+                ciphertext,
+                iv
+            }),
+        /authenticate|operation failed|decrypt/i
+    )
+
+    const recovered = await decryptAddonPayloadWithSenderFallback({
+        messageSecret,
+        stanzaId,
+        senderPairs: [
+            {
+                parentMsgOriginalSender: parentPn,
+                modificationSender: voterLid
+            },
+            {
+                parentMsgOriginalSender: parentLid,
+                modificationSender: voterLid
+            }
+        ],
+        modificationType: WA_USE_CASE_SECRET_MODIFICATION_TYPES.POLL_VOTE,
+        ciphertext,
+        iv
+    })
+    assert.deepEqual(Uint8Array.from(recovered), Uint8Array.from(plaintext))
+})
+
+test('decryptAddonPayloadWithSenderFallback retries paired modification senders without a cross product', async () => {
+    const messageSecret = new Uint8Array(32).fill(12)
+    const stanzaId = '3EB022B08C137DCAE1E402'
+    const parentLid = '142971525722223@lid'
+    const parentPn = '5511999999999@s.whatsapp.net'
+    const voterLid = '56410217926709@lid'
+    const voterPn = '5511888888888@s.whatsapp.net'
+    const plaintext = proto.Message.PollVoteMessage.encode({
+        selectedOptions: [new Uint8Array(32).fill(4)]
+    }).finish()
+    const iv = new Uint8Array(12).fill(6)
+
+    const ciphertext = await encryptAddonPayload({
+        messageSecret,
+        stanzaId,
+        parentMsgOriginalSender: parentLid,
+        modificationSender: voterLid,
+        modificationType: WA_USE_CASE_SECRET_MODIFICATION_TYPES.POLL_VOTE,
+        payload: plaintext,
+        iv
+    })
+
+    await assert.rejects(() =>
+        decryptAddonPayloadWithSenderFallback({
+            messageSecret,
+            stanzaId,
+            senderPairs: [
+                {
+                    parentMsgOriginalSender: parentPn,
+                    modificationSender: voterPn
+                },
+                {
+                    parentMsgOriginalSender: parentLid,
+                    modificationSender: voterPn
+                }
+            ],
+            modificationType: WA_USE_CASE_SECRET_MODIFICATION_TYPES.POLL_VOTE,
+            ciphertext,
+            iv
+        })
+    )
+
+    const recovered = await decryptAddonPayloadWithSenderFallback({
+        messageSecret,
+        stanzaId,
+        senderPairs: [
+            {
+                parentMsgOriginalSender: parentPn,
+                modificationSender: voterPn
+            },
+            {
+                parentMsgOriginalSender: parentLid,
+                modificationSender: voterLid
+            }
+        ],
+        modificationType: WA_USE_CASE_SECRET_MODIFICATION_TYPES.POLL_VOTE,
+        ciphertext,
+        iv
+    })
+    assert.deepEqual(Uint8Array.from(recovered), Uint8Array.from(plaintext))
 })

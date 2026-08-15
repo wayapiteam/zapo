@@ -1,4 +1,5 @@
 import type {
+    WaIncomingDecryptedPayloadEvent,
     WaIncomingMessageEvent,
     WaIncomingMessageKey,
     WaIncomingNewsletterMessageUpdateEvent,
@@ -52,6 +53,7 @@ interface WaIncomingMessageAckHandlerOptions {
     readonly emitNewsletterMessageUpdate?: (event: WaIncomingNewsletterMessageUpdateEvent) => void
     readonly emitUnavailableMessage?: (event: WaIncomingUnavailableMessageEvent) => void
     readonly emitUnhandledStanza?: (event: WaIncomingUnhandledStanzaEvent) => void
+    readonly emitDecryptedPayload?: (build: () => WaIncomingDecryptedPayloadEvent) => void
 }
 
 interface MessageIdentityAttrs {
@@ -88,7 +90,10 @@ type MessageKeyIdentity = Omit<MessageIdentityAttrs, 'pushName'>
 /**
  * Self-authored 1:1 chat is the recipient, so its alternate addressing is the
  * `recipient*` attrs (the `sender*` attrs describe me). Promotes `recipientAlt`
- * to `remoteJidAlt` and drops the stale sender/recipient fields.
+ * to `remoteJidAlt` and drops the stale sender/recipient fields. Applied
+ * whenever the stanza is self-authored 1:1, even when the chat itself did not
+ * resolve: the sender attrs always describe the own account there, so letting
+ * them through would address the message to the connection's own number.
  */
 function promoteRecipientAddressing(identity: MessageKeyIdentity): MessageKeyIdentity {
     return {
@@ -116,13 +121,13 @@ function buildIncomingMessageKey(
     const fromMe = sender
         ? isOwnAccountJid(sender.userJid, options.getMeJid?.(), options.getMeLid?.())
         : false
-    const selfSentChat =
-        fromMe && !isGroup && !isBroadcast
-            ? (node.attrs.recipient ?? destinationJid ?? undefined)
-            : undefined
+    const isSelfSentDirect = fromMe && !isGroup && !isBroadcast
+    const selfSentChat = isSelfSentDirect
+        ? (node.attrs.recipient ?? destinationJid ?? undefined)
+        : undefined
     const chatJid = selfSentChat ? toUserJid(selfSentChat) : fromUserJid
     const { pushName, ...identity } = extractMessageIdentityAttrs(node.attrs)
-    const keyIdentity = selfSentChat ? promoteRecipientAddressing(identity) : identity
+    const keyIdentity = isSelfSentDirect ? promoteRecipientAddressing(identity) : identity
     return {
         pushName,
         key: {
@@ -432,10 +437,52 @@ function processMsmsgEncNode(
     }
 }
 
+/**
+ * Hand a decrypted payload to the observer, before the library decodes it.
+ *
+ * Separate from the decrypt path in three ways that all matter. It hands over a
+ * builder rather than an event, so the copy below is only paid where something
+ * is subscribed. It swallows the observer's failures, because a listener that
+ * throws would otherwise land in the decrypt `catch` and send a message that
+ * decrypted perfectly into retry handling. And it copies the plaintext, because
+ * the caller hands the same buffer to `decode` on the next line: an observer
+ * that trimmed it in place would change the message the library delivers.
+ */
+function emitDecryptedPayload(
+    node: BinaryNode,
+    options: WaIncomingMessageAckHandlerOptions,
+    encIndex: number,
+    encType: string,
+    plaintext: Uint8Array
+): void {
+    if (options.emitDecryptedPayload === undefined) {
+        return
+    }
+    try {
+        options.emitDecryptedPayload(() => ({
+            rawNode: buildIncomingEventRawNode(node),
+            stanzaId: node.attrs.id,
+            chatJid: node.attrs.from,
+            stanzaType: node.attrs.type,
+            offline: node.attrs.offline !== undefined,
+            encIndex,
+            encType,
+            plaintext: plaintext.slice()
+        }))
+    } catch (error) {
+        options.logger.warn('decrypted payload observer threw', {
+            id: node.attrs.id,
+            encType,
+            message: toError(error).message
+        })
+    }
+}
+
 async function decryptAndProcessEncNode(
     node: BinaryNode,
     encNode: BinaryNode,
     encType: string,
+    encIndex: number,
     senderJid: string,
     options: WaIncomingMessageAckHandlerOptions,
     decrypt: (ciphertext: Uint8Array, senderAddress: SignalAddress) => Promise<Uint8Array>
@@ -452,6 +499,7 @@ async function decryptAndProcessEncNode(
             senderAddress
         )
         const unpaddedPlaintext = unpadPkcs7(decryptedPayload)
+        emitDecryptedPayload(node, options, encIndex, encType, unpaddedPlaintext)
         const decodedMessage = proto.Message.decode(unpaddedPlaintext)
         const message = unwrapDeviceSentMessage(decodedMessage) ?? decodedMessage
         const senderKeyDistribution = pickSenderKeyDistributionPayload(message)
@@ -564,6 +612,7 @@ export async function handleIncomingMessageAck(
                         node,
                         child,
                         'skmsg',
+                        encCount - 1,
                         senderJid,
                         options,
                         (ciphertext, senderAddress) =>
@@ -585,6 +634,7 @@ export async function handleIncomingMessageAck(
                         node,
                         child,
                         encType,
+                        encCount - 1,
                         senderJid,
                         options,
                         (ciphertext, senderAddress) => {

@@ -28,16 +28,23 @@ import { MEDIA_UPLOAD_PATHS } from '@media/constants'
 import type { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
 import type { MediaKind } from '@media/types'
 import {
-    buildAddonAdditionalData,
+    buildAddonSenderPairs,
+    collectUniqueUserJids,
     decodeAddonPlaintext,
-    decryptAddonPayload,
+    decryptAddonPayloadWithSenderFallback,
     identifyEncryptedAddon,
+    resolveAddonParentSenderFromKey,
     resolveParentMessageSecret,
-    resolvePollOptionNames,
-    shouldUseAddonAdditionalData
+    resolvePollOptionNames
 } from '@message/crypto/addon-crypto'
 import { unwrapMessage } from '@message/encode/content'
+import { resolveMediaPayload } from '@message/encode/media-payload'
 import { encodeGroupHistoryBundle } from '@message/kinds/group-history'
+import type {
+    WaMediaRetryRequest,
+    WaMediaRetryRequester,
+    WaMediaRetryResult
+} from '@message/primitives/media-retry'
 import type { PeerDataOperationRequester } from '@message/primitives/peer-data-operation'
 import type {
     WaMessagePublishResult,
@@ -59,6 +66,8 @@ import { longToNumber, toError } from '@util/primitives'
 export interface WaMessageCoordinatorDeps {
     readonly messageDispatch: WaMessageDispatchCoordinator
     readonly mediaTransfer: WaMediaTransferClient
+    /** Backs {@link WaMessageCoordinator.requestMediaReupload}. */
+    readonly mediaRetry: WaMediaRetryRequester
     /** Media upload wiring shared with the send path; backs {@link WaMessageCoordinator.upload}. */
     readonly mediaUploadOptions: WaMediaMessageOptions
     readonly logger: Logger
@@ -279,6 +288,7 @@ async function normalizeUploadSource(source: WaUploadMediaSource): Promise<Uint8
 export class WaMessageCoordinator {
     private readonly messageDispatch: WaMessageDispatchCoordinator
     private readonly mediaTransfer: WaMediaTransferClient
+    private readonly mediaRetry: WaMediaRetryRequester
     private readonly mediaUploadOptions: WaMediaMessageOptions
     private readonly logger: Logger
     private readonly messageStore: WaMessageStore
@@ -293,6 +303,7 @@ export class WaMessageCoordinator {
     public constructor(deps: WaMessageCoordinatorDeps) {
         this.messageDispatch = deps.messageDispatch
         this.mediaTransfer = deps.mediaTransfer
+        this.mediaRetry = deps.mediaRetry
         this.mediaUploadOptions = deps.mediaUploadOptions
         this.logger = deps.logger
         this.messageStore = deps.messageStore
@@ -799,6 +810,81 @@ export class WaMessageCoordinator {
     }
 
     /**
+     * Asks the sender's primary device to re-upload a message's media, for when
+     * the CDN answers `404`/`410` because the blob expired - typically old
+     * media surfaced by a history sync. Sends a `server-error` receipt carrying
+     * the sealed request and resolves once the server answers with a
+     * `mediaretry` notification, usually within a couple of seconds.
+     *
+     * On `result: 'success'` only the `directPath` changes - the media key,
+     * hashes, and length of the original message stay valid, so patch the path
+     * into the message and download again. A second call for a message already
+     * in flight joins the first request instead of sending another receipt.
+     *
+     * The other three `result` values are answers too, not thrown errors:
+     * `not_found` means the sender no longer holds the file and nothing can
+     * recover it, `decryption_error` that it could not open its own copy, and
+     * `general_error` anything else including a result code this version does
+     * not recognize.
+     *
+     * Requires the message's media key, so it only works for media you received
+     * or sent, never for a bare message id. Newsletter messages are rejected -
+     * channel media has no per-message key to seal the request with. Pass an
+     * explicit `WaMediaRetryRequest` instead of an event when you hold the
+     * message id, chat jid, and media key but not the decoded message.
+     *
+     * @throws when the message carries no downloadable media, is a newsletter
+     * message, the session is not paired, the stanza cannot be sent, or no
+     * notification arrives before `options.timeoutMs`. It does **not** throw on
+     * a `not_found` / `general_error` answer - check `result`.
+     * @example
+     * ```ts
+     * const image = event.message?.imageMessage
+     * try {
+     *     return await client.message.downloadBytes(event)
+     * } catch {
+     *     const retry = await client.message.requestMediaReupload(event)
+     *     if (retry.result !== 'success') throw new Error(`reupload ${retry.result}`)
+     *     return await client.message.downloadBytes({
+     *         imageMessage: { ...image, directPath: retry.directPath }
+     *     })
+     * }
+     * ```
+     */
+    public requestMediaReupload(
+        event: WaIncomingMessageEvent,
+        options?: { readonly timeoutMs?: number }
+    ): Promise<WaMediaRetryResult>
+    public requestMediaReupload(request: WaMediaRetryRequest): Promise<WaMediaRetryResult>
+    public requestMediaReupload(
+        source: WaIncomingMessageEvent | WaMediaRetryRequest,
+        options?: { readonly timeoutMs?: number }
+    ): Promise<WaMediaRetryResult> {
+        if (!('key' in source)) {
+            return this.mediaRetry.request(source)
+        }
+        const key = source.key
+        if (!key.id || !key.remoteJid) {
+            throw new Error('requestMediaReupload event is missing key.remoteJid or key.id')
+        }
+        if (key.isNewsletter) {
+            throw new Error('requestMediaReupload is not supported on newsletter messages')
+        }
+        const payload = resolveMediaPayload(source.message)
+        if (!payload) {
+            throw new Error('message has no downloadable media')
+        }
+        return this.mediaRetry.request({
+            messageId: key.id,
+            chatJid: key.remoteJid,
+            mediaKey: payload.mediaKey,
+            fromMe: key.fromMe,
+            participant: key.participant,
+            timeoutMs: options?.timeoutMs
+        })
+    }
+
+    /**
      * Attempts to decrypt an addon payload (poll vote, reaction, edit, ...)
      * attached to `event` and, on success, emits a typed
      * `WaIncomingAddonEvent`. Silently returns when the parent message
@@ -848,20 +934,40 @@ export class WaMessageCoordinator {
             return
         }
 
-        const parentMsgOriginalSender = parentEntry.senderJid
-        const modificationSender = event.key.participant ?? event.key.remoteJid
+        const modificationSenderRaw = event.key.participant ?? event.key.remoteJid
+        if (!modificationSenderRaw) return
 
-        const plaintext = await decryptAddonPayload({
+        const modificationSenderCandidates = collectUniqueUserJids(
+            event.key.fromMe ? event.rawNode.attrs.from : undefined,
+            modificationSenderRaw,
+            event.key.participantAlt,
+            event.key.remoteJidAlt,
+            event.rawNode.attrs.participant_pn,
+            event.rawNode.attrs.sender_pn,
+            event.rawNode.attrs.participant,
+            event.key.isGroup ? undefined : event.rawNode.attrs.from
+        )
+
+        const keyParentSender = resolveAddonParentSenderFromKey(
+            addon.targetMessageKey,
+            event.key.isGroup
+        )
+        const parentMsgOriginalSenderCandidates = collectUniqueUserJids(
+            keyParentSender,
+            parentEntry.senderJid
+        )
+        const senderPairs = buildAddonSenderPairs({
+            parentCandidates: parentMsgOriginalSenderCandidates,
+            modificationCandidates: modificationSenderCandidates
+        })
+
+        const plaintext = await decryptAddonPayloadWithSenderFallback({
             messageSecret: parentEntry.secret,
             stanzaId: targetMessageId,
-            parentMsgOriginalSender,
-            modificationSender,
+            senderPairs,
             modificationType: addon.modificationType,
             ciphertext: addon.encPayload,
-            iv: addon.encIv,
-            additionalData: shouldUseAddonAdditionalData(addon.modificationType)
-                ? buildAddonAdditionalData(targetMessageId, modificationSender)
-                : undefined
+            iv: addon.encIv
         })
 
         let decrypted = decodeAddonPlaintext(addon.kind, plaintext)
