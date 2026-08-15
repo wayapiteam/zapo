@@ -1,5 +1,5 @@
 {
-    "name": "zapo-js",
+    "name": "@wayapiteam/zapo",
     "version": "1.7.1",
     "description": "High-performance WhatsApp Web TypeScript library",
     "license": "MIT",
