@@ -7,7 +7,6 @@ import {
 } from '@client/coordinators/WaNewsletterCoordinator'
 import { createNoopLogger } from '@infra/log/types'
 import type { WaMessagePublishOptions } from '@message/types'
-import { proto } from '@proto'
 import { WA_NEWSLETTER_MUTE_TYPES, WA_NEWSLETTER_MUTE_VALUES } from '@protocol/constants'
 import type { BinaryNode } from '@transport/types'
 
@@ -156,6 +155,46 @@ test('parseNewsletterMetadata maps wa-web envelope into metadata', () => {
     assert.equal(meta.preview?.id, 'pv-id')
 })
 
+test('coordinator fetch sends every condition variable the query declares', async () => {
+    const env = createTestCoordinator({
+        resultData: { xwa2_newsletter: { id: '111111111111111111@newsletter' } }
+    })
+
+    await env.coordinator.fetch('111111111111111111@newsletter')
+    const queryNode = env.mexCalls[0].node.content?.[0] as BinaryNode | undefined
+    assert.ok(queryNode)
+    assert.equal(queryNode.attrs.query_id, '27456920720571478')
+    const body = JSON.parse(queryNode.content as string)
+    assert.deepEqual(Object.keys(body.variables).sort(), [
+        'fetch_creation_time',
+        'fetch_full_image',
+        'fetch_pinned_messages',
+        'fetch_status_metadata',
+        'fetch_viewer_metadata',
+        'fetch_wamo_sub',
+        'input'
+    ])
+    assert.equal(body.variables.fetch_pinned_messages, true)
+})
+
+test('coordinator fetchDehydrated sends every condition variable the query declares', async () => {
+    const env = createTestCoordinator({
+        resultData: { xwa2_newsletter: { id: '111111111111111111@newsletter' } }
+    })
+
+    await env.coordinator.fetchDehydrated('111111111111111111@newsletter')
+    const queryNode = env.mexCalls[0].node.content?.[0] as BinaryNode | undefined
+    assert.ok(queryNode)
+    assert.equal(queryNode.attrs.query_id, '26944199458535748')
+    const body = JSON.parse(queryNode.content as string)
+    assert.deepEqual(Object.keys(body.variables).sort(), [
+        'fetch_pinned_messages',
+        'fetch_wamo_sub',
+        'input'
+    ])
+    assert.equal(body.variables.fetch_pinned_messages, true)
+})
+
 test('coordinator follow/unfollow sends mex with newsletter_id', async () => {
     const env = createTestCoordinator({
         resultData: { xwa2_newsletter_join_v2: { id: '1', state: { type: 'ACTIVE' } } }
@@ -219,63 +258,6 @@ test('coordinator send(jid, "text") wraps as conversation proto', async () => {
     assert.ok(Array.isArray(stanza.content))
     assert.equal(stanza.content[0].tag, 'plaintext')
     assert.ok(stanza.content[0].content instanceof Uint8Array)
-})
-
-test('coordinator send preserves link preview thumbnail in newsletter plaintext', async () => {
-    const thumbnail = Buffer.from(
-        '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAEf/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABAf/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPxB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPxB//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxB//9k=',
-        'base64'
-    )
-    const newsletterJid = '120363025343298869@newsletter'
-    const text = 'see https://example.com'
-    const env = createTestCoordinator(
-        { resultData: null },
-        {
-            linkPreviewResolver: async () => ({
-                resolved: {
-                    matchedText: 'https://example.com',
-                    title: 'Example',
-                    description: 'Example description',
-                    previewType: proto.Message.ExtendedTextMessage.PreviewType.NONE
-                },
-                thumbnailFields: {
-                    jpegThumbnail: thumbnail,
-                    thumbnailDirectPath: '/newsletter/link-thumbnail',
-                    thumbnailSha256: new Uint8Array(32),
-                    thumbnailWidth: 320,
-                    thumbnailHeight: 160
-                }
-            })
-        }
-    )
-
-    await env.coordinator.send(newsletterJid, {
-        type: 'text',
-        text,
-        linkPreview: {
-            matchedText: 'https://example.com',
-            thumbnail: { bytes: thumbnail }
-        }
-    })
-
-    const stanza = env.sendCalls[0].node
-    assert.ok(Array.isArray(stanza.content))
-    const plaintext = stanza.content[0].content
-    assert.ok(plaintext instanceof Uint8Array)
-    const message = proto.Message.decode(plaintext)
-    assert.equal(message.extendedTextMessage?.text, text)
-    assert.equal(message.extendedTextMessage?.matchedText, 'https://example.com')
-    assert.equal(message.extendedTextMessage?.title, 'Example')
-    assert.equal(message.extendedTextMessage?.description, 'Example description')
-    assert.deepEqual(message.extendedTextMessage?.jpegThumbnail, thumbnail)
-    assert.equal(message.extendedTextMessage?.jpegThumbnail?.[0], 0xff)
-    assert.equal(message.extendedTextMessage?.jpegThumbnail?.[1], 0xd8)
-    assert.equal(message.extendedTextMessage?.thumbnailDirectPath, '/newsletter/link-thumbnail')
-    assert.equal(message.extendedTextMessage?.thumbnailSha256?.byteLength, 32)
-    assert.equal(message.extendedTextMessage?.thumbnailEncSha256, null)
-    assert.equal(message.extendedTextMessage?.mediaKey, null)
-    assert.equal(message.extendedTextMessage?.thumbnailWidth, 320)
-    assert.equal(message.extendedTextMessage?.thumbnailHeight, 160)
 })
 
 test('coordinator send with explicit stanzaId honors caller id', async () => {

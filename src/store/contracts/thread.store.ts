@@ -7,6 +7,12 @@ export interface WaStoredThreadRecord {
     readonly muteEndMs?: number
     readonly markedAsUnread?: boolean
     readonly ephemeralExpiration?: number
+    /**
+     * Unix seconds when disappearing mode was enabled, normalized on ingest to
+     * the unit `ContextInfo` uses on the wire. Set only for ephemeral 1:1 chats;
+     * groups do not carry it on outgoing messages.
+     */
+    readonly ephemeralSettingTimestamp?: number
 }
 
 export interface WaThreadStore {

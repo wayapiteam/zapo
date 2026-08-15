@@ -91,8 +91,8 @@ export function createDiscoveryOps(deps: WaNewsletterMexDeps): WaNewsletterDisco
             fetch_full_image: opts?.fetchFullImage ?? keyType !== 'INVITE',
             fetch_creation_time: opts?.fetchCreationTime ?? true,
             fetch_wamo_sub: opts?.fetchWamoSub ?? false,
-            fetch_pinned_messages: false,
-            fetch_status_metadata: false
+            fetch_status_metadata: false,
+            fetch_pinned_messages: true
         })
         if (!data?.xwa2_newsletter) {
             throw new Error('newsletter fetch returned no envelope')
@@ -185,7 +185,7 @@ export function createDiscoveryOps(deps: WaNewsletterMexDeps): WaNewsletterDisco
                     view_role: opts?.viewRole ?? WA_NEWSLETTER_VIEW_ROLES.SUBSCRIBER
                 },
                 fetch_wamo_sub: opts?.fetchWamoSub ?? false,
-                fetch_pinned_messages: false
+                fetch_pinned_messages: true
             })
             return parseDehydratedMetadata(data)
         }

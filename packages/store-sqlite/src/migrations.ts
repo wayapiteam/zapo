@@ -15,6 +15,7 @@ export type WaSqliteMigrationDomain =
     | 'mailbox'
     | 'privacyToken'
     | 'messageSecret'
+    | 'chatMetadata'
 
 interface WaSqliteMigration {
     readonly id: string
@@ -422,6 +423,44 @@ const SQLITE_MIGRATIONS: readonly WaSqliteMigration[] = [
                 ALTER TABLE retry_outbound_messages DROP COLUMN message_type;
                 ALTER TABLE retry_outbound_messages DROP COLUMN created_at_ms;
                 ALTER TABLE retry_inbound_counters DROP COLUMN updated_at_ms;
+            `)
+        }
+    },
+    {
+        id: '0017_mailbox_threads_ephemeral_setting_timestamp',
+        domain: 'mailbox',
+        up: (db) => {
+            db.exec(`
+                ALTER TABLE mailbox_threads ADD COLUMN ephemeral_setting_timestamp INTEGER;
+            `)
+        }
+    },
+    {
+        id: '0018_group_participants_cache_ephemeral_trigger',
+        domain: 'participants',
+        up: (db) => {
+            db.exec(`
+                ALTER TABLE group_participants_cache ADD COLUMN ephemeral_trigger INTEGER;
+            `)
+        }
+    },
+    {
+        id: '0019_chat_metadata_cache_schema',
+        domain: 'chatMetadata',
+        up: (db) => {
+            db.exec(`
+                CREATE TABLE IF NOT EXISTS chat_metadata_cache (
+                    session_id TEXT NOT NULL,
+                    chat_jid TEXT NOT NULL,
+                    ephemeral_expiration INTEGER,
+                    ephemeral_setting_timestamp INTEGER,
+                    updated_at_ms INTEGER NOT NULL,
+                    expires_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (session_id, chat_jid)
+                );
+
+                CREATE INDEX IF NOT EXISTS chat_metadata_cache_by_expiry
+                    ON chat_metadata_cache (session_id, expires_at_ms);
             `)
         }
     }

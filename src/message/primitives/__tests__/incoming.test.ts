@@ -1,10 +1,15 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import type { WaIncomingMessageEvent, WaIncomingUnavailableMessageEvent } from '@client/types'
+import type {
+    WaIncomingDecryptedPayloadEvent,
+    WaIncomingMessageEvent,
+    WaIncomingUnavailableMessageEvent
+} from '@client/types'
 import { createNoopLogger } from '@infra/log/types'
 import { buildRecoveredIncomingEvent, handleIncomingMessageAck } from '@message/primitives/incoming'
 import { proto } from '@proto'
+import type { WaRetryDecryptFailureContext } from '@retry/types'
 import type { BinaryNode } from '@transport/types'
 
 function createEncryptedMessageNode(): BinaryNode {
@@ -206,6 +211,58 @@ test('1:1 message from my lid identity is detected as fromMe', async () => {
     assert.equal(key.remoteJid, '144400000000000@lid')
 })
 
+test('1:1 message from my hosted device is detected as fromMe', async () => {
+    const emitted: WaIncomingMessageEvent[] = []
+    await handleIncomingMessageAck(
+        {
+            tag: 'message',
+            attrs: {
+                id: 'msg-self-hosted',
+                from: '133300000000000:99@hosted.lid',
+                recipient: '144400000000000@lid',
+                sender_pn: '5511999999999@s.whatsapp.net',
+                t: '123'
+            },
+            content: [{ tag: 'enc', attrs: { type: 'msg' }, content: new Uint8Array([1]) }]
+        },
+        createDecryptingOptions(emitted, {
+            getMeJid: () => '5511999999999@s.whatsapp.net',
+            getMeLid: () => '133300000000000@lid'
+        })
+    )
+
+    assert.equal(emitted.length, 1)
+    const { key } = emitted[0]
+    assert.equal(key.fromMe, true)
+    assert.equal(key.remoteJid, '144400000000000@lid')
+    assert.equal(key.remoteJidAlt, undefined)
+})
+
+test('self-sent 1:1 message with an unresolved chat keeps the own number out of remoteJidAlt', async () => {
+    const emitted: WaIncomingMessageEvent[] = []
+    await handleIncomingMessageAck(
+        {
+            tag: 'message',
+            attrs: {
+                id: 'msg-self-no-chat',
+                from: '133300000000000:99@hosted.lid',
+                sender_pn: '5511999999999@s.whatsapp.net',
+                t: '123'
+            },
+            content: [{ tag: 'enc', attrs: { type: 'msg' }, content: new Uint8Array([1]) }]
+        },
+        createDecryptingOptions(emitted, {
+            getMeJid: () => '5511999999999@s.whatsapp.net',
+            getMeLid: () => '133300000000000@lid'
+        })
+    )
+
+    assert.equal(emitted.length, 1)
+    const { key } = emitted[0]
+    assert.equal(key.fromMe, true)
+    assert.equal(key.remoteJidAlt, undefined)
+})
+
 test('1:1 incoming message from a peer stays fromMe false with the peer as remoteJid', async () => {
     const emitted: WaIncomingMessageEvent[] = []
     await handleIncomingMessageAck(
@@ -353,6 +410,7 @@ test('view-once-unavailable message acks instead of delivery-receipting and emit
     assert.equal(unavailable.length, 1)
     const event = unavailable[0]
     assert.equal(event.kind, 'view_once')
+    assert.equal(event.resendRequested, false)
     assert.equal(event.key.remoteJid, '53979165777985@lid')
     assert.equal(event.key.id, 'msg-vou')
     assert.equal(event.key.fromMe, false)
@@ -364,6 +422,79 @@ test('view-once-unavailable message acks instead of delivery-receipting and emit
     assert.equal(sentNodes[0].attrs.id, 'msg-vou')
     assert.equal(sentNodes[0].attrs.to, '53979165777985@lid')
     assert.equal(sentNodes[0].attrs.type, 'media')
+})
+
+test('unavailable message asks for a placeholder resend and reports it on the event', async () => {
+    const sentNodes: BinaryNode[] = []
+    const unavailable: WaIncomingUnavailableMessageEvent[] = []
+    const resendContexts: WaRetryDecryptFailureContext[] = []
+
+    const handled = await handleIncomingMessageAck(
+        {
+            tag: 'message',
+            attrs: {
+                id: 'msg-fanout',
+                from: '120363000000000000@g.us',
+                participant: '5511777777777:3@s.whatsapp.net',
+                type: 'text',
+                t: '1781885732'
+            },
+            content: [{ tag: 'unavailable', attrs: {} }]
+        },
+        {
+            logger: createNoopLogger(),
+            sendNode: async (node) => {
+                sentNodes.push(node)
+            },
+            getMeJid: () => '5511999999999@s.whatsapp.net',
+            requestPlaceholderResend: (context) => {
+                resendContexts.push(context)
+                return true
+            },
+            emitUnavailableMessage: (event) => {
+                unavailable.push(event)
+            }
+        }
+    )
+
+    assert.equal(handled, true)
+    assert.equal(resendContexts.length, 1)
+    assert.equal(resendContexts[0].stanzaId, 'msg-fanout')
+    assert.equal(resendContexts[0].from, '120363000000000000@g.us')
+    assert.equal(resendContexts[0].participant, '5511777777777:3@s.whatsapp.net')
+    assert.equal(resendContexts[0].t, '1781885732')
+    assert.equal(unavailable.length, 1)
+    assert.equal(unavailable[0].kind, 'other')
+    assert.equal(unavailable[0].resendRequested, true)
+    assert.equal(sentNodes.length, 1)
+    assert.equal(sentNodes[0].tag, 'ack')
+})
+
+test('bot fanout placeholder is classified as its own kind', async () => {
+    const unavailable: WaIncomingUnavailableMessageEvent[] = []
+
+    await handleIncomingMessageAck(
+        {
+            tag: 'message',
+            attrs: { id: 'msg-bot', from: '5511777777777@s.whatsapp.net', type: 'text' },
+            content: [
+                { tag: 'unavailable', attrs: {} },
+                { tag: 'bot', attrs: { biz_bot: '1' } }
+            ]
+        },
+        {
+            logger: createNoopLogger(),
+            sendNode: async () => undefined,
+            requestPlaceholderResend: () => false,
+            emitUnavailableMessage: (event) => {
+                unavailable.push(event)
+            }
+        }
+    )
+
+    assert.equal(unavailable.length, 1)
+    assert.equal(unavailable[0].kind, 'bot')
+    assert.equal(unavailable[0].resendRequested, false)
 })
 
 test('incoming message ack falls back to retry receipt when decrypt fails', async () => {
@@ -387,4 +518,156 @@ test('incoming message ack falls back to retry receipt when decrypt fails', asyn
     assert.equal(sentNodes[0].attrs.id, 'msg-1')
     assert.equal(sentNodes[0].attrs.to, '551100000000@s.whatsapp.net')
     assert.equal(sentNodes[0].attrs.type, 'retry')
+})
+
+test('a decrypted payload is handed over before the library decodes it', async () => {
+    const payloads: WaIncomingDecryptedPayloadEvent[] = []
+    const emitted: WaIncomingMessageEvent[] = []
+    const plaintext = paddedPlaintext({ conversation: 'hi' })
+
+    const handled = await handleIncomingMessageAck(createEncryptedMessageNode(), {
+        ...createDecryptingOptions(emitted),
+        emitDecryptedPayload: (build) => {
+            payloads.push(build())
+        }
+    })
+
+    assert.equal(handled, true)
+    assert.equal(payloads.length, 1)
+    // The unpadded bytes, which is what `proto.Message.decode` receives — not
+    // the padded ciphertext output and not a re-encoding of the decoded message.
+    assert.deepEqual(payloads[0].plaintext, plaintext.subarray(0, plaintext.length - 1))
+    assert.equal(payloads[0].encType, 'msg')
+    assert.equal(payloads[0].encIndex, 0)
+    assert.equal(payloads[0].stanzaId, 'msg-1')
+    assert.equal(payloads[0].chatJid, '551100000000@s.whatsapp.net')
+    assert.equal(emitted.length, 1, 'and the message still arrives as usual')
+})
+
+test('a payload that decrypts but does not decode is still handed over', async () => {
+    // The reason the event exists. Decoding throws, the stanza is reported as
+    // unhandled, and the decryption has already advanced the ratchet — so
+    // without this the bytes are gone for good.
+    const payloads: WaIncomingDecryptedPayloadEvent[] = []
+    const emitted: WaIncomingMessageEvent[] = []
+    // Field 1 of Message is `conversation`: tag 0x0A, then a length. Declaring
+    // 127 bytes and supplying none makes `decode` throw — the bytes are perfectly
+    // good, this build just cannot read them. The trailing byte is the PKCS7 pad.
+    const undecodable = new Uint8Array([0x0a, 0x7f, 0x01])
+
+    await handleIncomingMessageAck(createEncryptedMessageNode(), {
+        ...createDecryptingOptions(emitted),
+        signalProtocol: {
+            decryptMessage: async () => undecodable
+        } as never,
+        emitDecryptedPayload: (build) => {
+            payloads.push(build())
+        }
+    })
+
+    assert.equal(payloads.length, 1, 'handed over despite the decode failing')
+    assert.deepEqual(payloads[0].plaintext, undecodable.subarray(0, 2))
+    assert.equal(emitted.length, 0, 'and nothing was emitted as a message')
+})
+
+test('each enc of a multi-device message reports its own index', async () => {
+    // The ciphertexts are unrelated, so attributing a payload to the wrong
+    // `<enc>` attributes it to the wrong sender.
+    const payloads: WaIncomingDecryptedPayloadEvent[] = []
+    const emitted: WaIncomingMessageEvent[] = []
+    const node: BinaryNode = {
+        tag: 'message',
+        attrs: { id: 'msg-multi', from: '551100000000@s.whatsapp.net', t: '123' },
+        content: [
+            { tag: 'enc', attrs: { type: 'pkmsg' }, content: new Uint8Array([1]) },
+            { tag: 'enc', attrs: { type: 'msg' }, content: new Uint8Array([2]) }
+        ]
+    }
+
+    await handleIncomingMessageAck(node, {
+        ...createDecryptingOptions(emitted),
+        emitDecryptedPayload: (build) => {
+            payloads.push(build())
+        }
+    })
+
+    assert.deepEqual(
+        payloads.map((p) => [p.encIndex, p.encType]),
+        [
+            [0, 'pkmsg'],
+            [1, 'msg']
+        ]
+    )
+})
+
+test('an observer that throws does not turn a good message into a decrypt failure', async () => {
+    // The hook is observability. A listener that blows up must not send a
+    // message that decrypted perfectly into retry handling.
+    const emitted: WaIncomingMessageEvent[] = []
+    const unhandled: unknown[] = []
+
+    const handled = await handleIncomingMessageAck(createEncryptedMessageNode(), {
+        ...createDecryptingOptions(emitted),
+        emitDecryptedPayload: () => {
+            throw new Error('observer blew up')
+        },
+        emitUnhandledStanza: (event) => {
+            unhandled.push(event)
+        }
+    })
+
+    assert.equal(handled, true)
+    assert.equal(emitted.length, 1, 'the message still arrives')
+    assert.equal(unhandled.length, 0, 'and nothing was reported as undecryptable')
+})
+
+test('an observer cannot alter the message the library delivers', async () => {
+    // The buffer the observer sees is handed to decode on the next line, so a
+    // listener that trims or normalizes in place would change the payload.
+    const emitted: WaIncomingMessageEvent[] = []
+
+    await handleIncomingMessageAck(createEncryptedMessageNode(), {
+        ...createDecryptingOptions(emitted, { message: { conversation: 'hi' } }),
+        emitDecryptedPayload: (build) => {
+            build().plaintext.fill(0)
+        }
+    })
+
+    assert.equal(emitted.length, 1)
+    assert.equal(emitted[0]?.message?.conversation, 'hi')
+})
+
+test('the payload is only built when the hook asks for it', async () => {
+    // The hook is wired unconditionally by the factory, so the optional-call
+    // guard never fires in production. Handing over a builder is what keeps
+    // the plaintext copy and the redacted node off the path when the event has
+    // no listener, which is every session that never subscribes.
+    const emitted: WaIncomingMessageEvent[] = []
+    let handedBuilder = 0
+
+    await handleIncomingMessageAck(createEncryptedMessageNode(), {
+        ...createDecryptingOptions(emitted),
+        // What the factory does when nothing is subscribed: take the builder
+        // and never call it.
+        emitDecryptedPayload: () => {
+            handedBuilder += 1
+        }
+    })
+
+    assert.equal(handedBuilder, 1, 'the hook still runs')
+    assert.equal(emitted.length, 1, 'and the message still arrives')
+
+    // And calling it produces a fresh copy each time, so the copy lives in the
+    // builder rather than on the path to it.
+    const built: WaIncomingDecryptedPayloadEvent[] = []
+    await handleIncomingMessageAck(createEncryptedMessageNode(), {
+        ...createDecryptingOptions(emitted),
+        emitDecryptedPayload: (build) => {
+            built.push(build(), build())
+        }
+    })
+
+    assert.equal(built.length, 2)
+    assert.notEqual(built[0]?.plaintext, built[1]?.plaintext, 'each call copies')
+    assert.deepEqual(built[0]?.plaintext, built[1]?.plaintext, 'to the same bytes')
 })

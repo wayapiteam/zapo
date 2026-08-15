@@ -43,7 +43,7 @@ import {
 } from '@client/coordinators/WaPresenceCoordinator'
 import {
     createPrivacyCoordinator,
-    type WaPrivacyCoordinator
+    type WaPrivacyCoordinatorRuntime
 } from '@client/coordinators/WaPrivacyCoordinator'
 import {
     createProfileCoordinator,
@@ -66,16 +66,16 @@ import { parsePrivacyTokenNotification } from '@client/events/privacy-token'
 import { createDeviceFanoutResolver } from '@client/messaging/fanout'
 import { createGroupMetadataCache } from '@client/messaging/group-metadata'
 import { createAppStateSyncKeyProtocol } from '@client/messaging/key-protocol'
-import { resolveLinkPreview } from '@client/messaging/link-preview'
+import { resolveLinkPreview, type WaLinkPreviewSurface } from '@client/messaging/link-preview'
 import {
     buildMediaMessageContent,
     getMediaConn as getClientMediaConn,
     type WaMediaMessageOptions
 } from '@client/messaging/messages'
-import { uploadNewsletterLinkPreviewThumbnail } from '@client/newsletter/content'
 import type {
     WaClientEventMap,
     WaClientOptions,
+    WaIncomingDecryptedPayloadEvent,
     WaIncomingMessageEvent,
     WaIncomingProtocolMessageEvent,
     WaIncomingUnhandledStanzaEvent,
@@ -85,17 +85,22 @@ import type { Logger } from '@infra/log/types'
 import { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
 import type { WaMediaConn } from '@media/types'
 import { createDefaultLinkPreviewFetcher } from '@message/addons/link-preview/fetcher'
-import {
-    WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS,
-    WA_DEFAULT_PHASH_MAX_PARTICIPANTS
-} from '@message/crypto/phash'
 import { processNewsletterLiveUpdates } from '@message/kinds/newsletter'
 import { handleIncomingMessageAck } from '@message/primitives/incoming'
+import {
+    createMediaRetryRequester,
+    type WaMediaRetryRequester
+} from '@message/primitives/media-retry'
 import {
     createPeerDataOperationRequester,
     type PeerDataOperationRequester
 } from '@message/primitives/peer-data-operation'
+import type { WaSendTextMessage } from '@message/types'
 import { WaMessageClient } from '@message/WaMessageClient'
+import {
+    WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS,
+    WA_DEFAULT_PHASH_MAX_PARTICIPANTS
+} from '@message/crypto/phash'
 import {
     resolveWaDeviceIdentity,
     WA_DEFAULTS,
@@ -128,7 +133,7 @@ import type { WaStoredContactRecord } from '@store/contracts/contact.store'
 import { WaKeepAlive } from '@transport/keepalive/WaKeepAlive'
 import { buildAckNode } from '@transport/node/builders/global'
 import { buildPresenceNode } from '@transport/node/builders/presence'
-import { getFirstNodeChild } from '@transport/node/helpers'
+import { findNodeChild, getFirstNodeChild } from '@transport/node/helpers'
 import { createUsyncSidGenerator } from '@transport/node/usync'
 import { WaNodeOrchestrator } from '@transport/node/WaNodeOrchestrator'
 import { WaNodeTransport } from '@transport/node/WaNodeTransport'
@@ -165,6 +170,8 @@ interface WaClientBuildRuntime {
         event: K,
         ...args: Parameters<WaClientEventMap[K]>
     ) => void
+    /** Whether anything is subscribed, for events whose payload costs something to build. */
+    readonly hasEventListener: (event: keyof WaClientEventMap) => boolean
     readonly handleIncomingMessageEvent: (event: WaIncomingMessageEvent) => Promise<void>
     readonly handleError: (error: Error) => void
     readonly handleIncomingFrame: (frame: Uint8Array) => Promise<void>
@@ -218,7 +225,7 @@ export interface WaClientDependencies {
     readonly statusCoordinator: WaStatusCoordinator
     readonly broadcastListCoordinator: WaBroadcastListCoordinator
     readonly newsletterCoordinator: WaNewsletterCoordinator
-    readonly privacyCoordinator: WaPrivacyCoordinator
+    readonly privacyCoordinator: WaPrivacyCoordinatorRuntime
     readonly profileCoordinator: WaProfileCoordinator
     readonly businessCoordinator: WaBusinessCoordinator
     readonly botCoordinator: WaBotCoordinator
@@ -287,6 +294,7 @@ export function resolveWaClientBase(options: WaClientOptions, logger: Logger): W
         sessionId,
         deviceBrowser: device.browser,
         deviceOsDisplayName: device.osDisplayName,
+        deviceOsVersion: device.osVersion ?? undefined,
         devicePlatform: device.platform,
         urls: options.urls ?? options.chatSocketUrls ?? WA_DEFAULTS.CHAT_SOCKET_URLS,
         iqTimeoutMs: options.iqTimeoutMs ?? WA_DEFAULTS.IQ_TIMEOUT_MS,
@@ -324,6 +332,7 @@ function createIncomingNodeRuntime(input: {
     readonly streamControl: WaStreamControlHandler
     readonly mediaMessageBuildOptions: WaMediaMessageOptions
     readonly retryCoordinator: WaRetryCoordinator
+    readonly mediaRetryRequester: WaMediaRetryRequester
     readonly messageDispatch: WaMessageDispatchCoordinator
     readonly sendNode: (node: BinaryNode) => Promise<void>
     readonly syncAppState: () => Promise<void>
@@ -348,6 +357,7 @@ function createIncomingNodeRuntime(input: {
         streamControl,
         mediaMessageBuildOptions,
         retryCoordinator,
+        mediaRetryRequester,
         messageDispatch,
         sendNode,
         syncAppState,
@@ -360,7 +370,8 @@ function createIncomingNodeRuntime(input: {
 
     return {
         handleStreamControlResult: streamControl.handleStreamControlResult,
-        persistSuccessAttributes: (attributes) => authClient.persistSuccessAttributes(attributes),
+        persistSuccessAttributes: (attributes) =>
+            authClient.persistSuccessAttributes(attributes, { countsAsLogin: true }),
         emitSuccessNode: (node) => emitEvent('debug_connection_success', { node }),
         updateClockSkewFromSuccess: (serverUnixSeconds) =>
             connectionManager.updateClockSkewFromSuccess(serverUnixSeconds),
@@ -380,6 +391,7 @@ function createIncomingNodeRuntime(input: {
             handleIncomingMessageAck(node, incomingMessageAckOptions),
         sendNode,
         handleIncomingRetryReceipt: (node) => retryCoordinator.handleIncomingRetryReceipt(node),
+        handleMediaRetryNotification: (node) => mediaRetryRequester.handleNotification(node),
         trackOutboundReceipt: (node) => retryCoordinator.trackOutboundReceipt(node),
         emitIncomingReceipt: (event) => emitEvent('receipt', event),
         emitIncomingPresence: (event) => emitEvent('presence', event),
@@ -389,6 +401,7 @@ function createIncomingNodeRuntime(input: {
         emitIncomingFailure: (event) => emitEvent('stream_failure', event),
         emitIncomingErrorStanza: (event) => emitEvent('stanza_error', event),
         emitIncomingNotification: (event) => emitEvent('debug_notification', event),
+        emitOfflineThreadMetadata: (event) => emitEvent('offline_thread_metadata', event),
         emitMexNotification: (event) => emitEvent('mex_notification', event),
         emitRegistrationCode: (event) => emitEvent('mobile_registration_code', event),
         emitAccountTakeoverNotice: (event) => emitEvent('mobile_account_takeover_notice', event),
@@ -520,6 +533,17 @@ export function buildWaClientDependencies(input: {
             allowPrivateHosts: linkPreviewOptions.allowPrivateHosts,
             proxy: linkPreviewOptions.proxy ?? options.proxy?.linkPreview
         })
+    const createLinkPreviewResolver =
+        (surface?: WaLinkPreviewSurface) => (content: WaSendTextMessage) =>
+            resolveLinkPreview(content.text, content.linkPreview, {
+                logger,
+                mediaTransfer,
+                getMediaConn: () => getClientMediaConn(mediaMessageBuildOptions),
+                fetcher: linkPreviewFetcher,
+                options: linkPreviewOptions,
+                serverClock,
+                surface
+            })
     const mediaMessageBuildOptions: WaMediaMessageOptions = {
         logger,
         mediaTransfer,
@@ -537,15 +561,7 @@ export function buildWaClientDependencies(input: {
         },
         serverClock,
         media: options.media,
-        linkPreviewResolver: (content) =>
-            resolveLinkPreview(content.text, content.linkPreview, {
-                logger,
-                mediaTransfer,
-                getMediaConn: () => getClientMediaConn(mediaMessageBuildOptions),
-                fetcher: linkPreviewFetcher,
-                options: linkPreviewOptions,
-                serverClock
-            })
+        linkPreviewResolver: createLinkPreviewResolver()
     }
 
     const messageClient = new WaMessageClient({
@@ -615,6 +631,7 @@ export function buildWaClientDependencies(input: {
         {
             deviceBrowser: options.deviceBrowser,
             deviceOsDisplayName: options.deviceOsDisplayName,
+            deviceOsVersion: options.deviceOsVersion,
             devicePlatform: options.devicePlatform,
             requireFullSync: options.requireFullSync,
             version: options.version,
@@ -666,29 +683,17 @@ export function buildWaClientDependencies(input: {
         generateStanzaId: () => messageDispatch.generateOutgoingMessageId(),
         mediaTransfer,
         getMediaConn: () => getClientMediaConn(mediaMessageBuildOptions),
-        linkPreviewResolver: (content) =>
-            resolveLinkPreview(content.text, content.linkPreview, {
-                logger,
-                mediaTransfer,
-                getMediaConn: () => getClientMediaConn(mediaMessageBuildOptions),
-                fetcher: linkPreviewFetcher,
-                options: linkPreviewOptions,
-                serverClock,
-                thumbnailUploader: async (thumbnail) =>
-                    uploadNewsletterLinkPreviewThumbnail(
-                        { mediaTransfer, logger },
-                        {
-                            thumbnail,
-                            mediaConn: await getClientMediaConn(mediaMessageBuildOptions)
-                        }
-                    )
-            }),
+        linkPreviewResolver: createLinkPreviewResolver('newsletter'),
         getAbPropString: (name) => abPropsCoordinator.getConfigValue<string>(name),
         logger
     })
 
     const privacyCoordinator = createPrivacyCoordinator({
-        queryWithContext: runtime.queryWithContext
+        logger,
+        queryWithContext: runtime.queryWithContext,
+        resolveUserJidPair: (userJid) => signalDeviceSync.resolveUserJidPair(userJid),
+        getSelfLid: () => getCurrentCredentials()?.meLid ?? null,
+        emitPrivacy: (event) => runtime.emitEvent('privacy', event)
     })
 
     const businessCoordinator = createBusinessCoordinator({
@@ -730,7 +735,8 @@ export function buildWaClientDependencies(input: {
             }
             return {
                 participants: participantJids,
-                ephemeral: metadata.ephemeral
+                ephemeral: metadata.ephemeral,
+                ephemeralTrigger: metadata.ephemeralTrigger
             }
         },
         logger
@@ -795,6 +801,8 @@ export function buildWaClientDependencies(input: {
         sessionStore: sessionStore.session,
         identityStore: sessionStore.identity,
         deviceListStore: sessionStore.deviceList,
+        threadStore: sessionStore.threads,
+        chatMetadataStore: sessionStore.chatMetadata,
         signalDeviceSync,
         messageSecretStore: sessionStore.messageSecret,
         persistAllMessageSecrets: options.addons?.persistAllSecrets === true,
@@ -839,16 +847,27 @@ export function buildWaClientDependencies(input: {
         subscribeToProtocolMessage: runtime.subscribeProtocolMessage
     })
 
+    const mediaRetryRequester = createMediaRetryRequester({
+        logger,
+        sendNode: (node) => nodeOrchestrator.sendNode(node, false),
+        getCurrentCredentials
+    })
+
     const messageCoordinator = new WaMessageCoordinator({
         messageDispatch,
         mediaTransfer,
+        mediaRetry: mediaRetryRequester,
+        mediaUploadOptions: mediaMessageBuildOptions,
         logger,
         messageStore: sessionStore.messages,
         messageSecretStore: sessionStore.messageSecret,
         trustedContactToken,
         emitAddon: (event) => runtime.emitEvent('message_addon', event),
         mexSocket: { query: runtime.query },
-        peerDataOperation
+        peerDataOperation,
+        isGroupHistorySendEnabled: () =>
+            abPropsCoordinator.getConfigValue<boolean>('group_history_send'),
+        getAbPropNumber: (name) => abPropsCoordinator.getConfigValue<number>(name)
     })
 
     const retryCoordinator = new WaRetryCoordinator({
@@ -875,7 +894,8 @@ export function buildWaClientDependencies(input: {
                 .handleIncomingMessageEvent(event)
                 .catch((err) => runtime.handleError(toError(err)))
         },
-        isMobilePrimary
+        isMobilePrimary,
+        getAbPropNumber: (name) => abPropsCoordinator.getConfigValue<number>(name)
     })
 
     const botCoordinator = createBotCoordinator({
@@ -1007,6 +1027,7 @@ export function buildWaClientDependencies(input: {
     ): Promise<void> => {
         abPropsCoordinator.reset()
         offlineResume.reset()
+        privacyCoordinator.stopAccountSyncRefresh()
         await connectionManager?.disconnect()
         runtime.emitEvent('connection', {
             status: 'close',
@@ -1058,6 +1079,8 @@ export function buildWaClientDependencies(input: {
         senderKeyManager,
         onDecryptFailure: (context: WaRetryDecryptFailureContext, error: unknown) =>
             retryCoordinator.onDecryptFailure(context, error),
+        requestPlaceholderResend: (context: WaRetryDecryptFailureContext) =>
+            retryCoordinator.onUnavailableMessage(context),
         emitIncomingMessage: (event: WaIncomingMessageEvent) => {
             void runtime
                 .handleIncomingMessageEvent(event)
@@ -1067,7 +1090,15 @@ export function buildWaClientDependencies(input: {
             runtime.emitEvent('newsletter_message_update', event),
         emitUnavailableMessage: (event) => runtime.emitEvent('message_unavailable', event),
         emitUnhandledStanza: (event: WaIncomingUnhandledStanzaEvent) =>
-            runtime.emitEvent('debug_unhandled_stanza', event)
+            runtime.emitEvent('debug_unhandled_stanza', event),
+        emitDecryptedPayload: (build: () => WaIncomingDecryptedPayloadEvent) => {
+            // Built only if someone is subscribed: the payload carries a copy of
+            // the plaintext and a redacted node, and this runs per `<enc>`.
+            if (!runtime.hasEventListener('debug_decrypted_payload')) {
+                return
+            }
+            runtime.emitEvent('debug_decrypted_payload', build())
+        }
     }
 
     const handleClientDirtyBits = (dirtyBits: Parameters<typeof handleDirtyBits>[1]) =>
@@ -1078,6 +1109,10 @@ export function buildWaClientDependencies(input: {
                 getCurrentCredentials,
                 syncAppState: runtime.syncAppState,
                 generateUsyncSid,
+                syncAccountPrivacy: async () => {
+                    await privacyCoordinator.refreshFromAccountSync()
+                },
+                emitBlocklist: (blocklist) => runtime.emitEvent('blocklist', blocklist),
                 newsletterListSubscribed: () => newsletterCoordinator.listSubscribed()
             },
             dirtyBits
@@ -1103,6 +1138,7 @@ export function buildWaClientDependencies(input: {
             streamControl,
             mediaMessageBuildOptions,
             retryCoordinator,
+            mediaRetryRequester,
             messageDispatch,
             sendNode: runtime.sendNode,
             syncAppState: runtime.syncAppState,
@@ -1284,6 +1320,26 @@ export function buildWaClientDependencies(input: {
                 return true
             }
 
+            return false
+        }
+    })
+
+    incomingNode.registerIncomingHandler({
+        tag: WA_NODE_TAGS.NOTIFICATION,
+        subtype: WA_NOTIFICATION_TYPES.ACCOUNT_SYNC,
+        prepend: true,
+        /**
+         * The stanza carries the changed `<category>` inline, but it is a
+         * trigger only: the payload is a partial view, so the whole set is
+         * refetched instead. Observer only - returning false keeps the
+         * generic notification handler responsible for the ack and the
+         * `debug_notification` emit, leaving wire behavior unchanged.
+         */
+        // eslint-disable-next-line @typescript-eslint/require-await
+        handler: async (node) => {
+            if (findNodeChild(node, WA_NODE_TAGS.PRIVACY)) {
+                privacyCoordinator.scheduleAccountSyncRefresh()
+            }
             return false
         }
     })

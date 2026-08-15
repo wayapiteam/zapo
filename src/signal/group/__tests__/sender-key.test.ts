@@ -8,7 +8,7 @@ import { SIGNAL_GROUP_VERSION } from '@signal/constants'
 import { deriveSenderKeyMsgKey, selectMessageKey } from '@signal/group/SenderKeyChain'
 import { parseDistributionPayload, parseSenderKeyMessage } from '@signal/group/SenderKeyCodec'
 import { SenderKeyManager } from '@signal/group/SenderKeyManager'
-import type { SenderKeyRecord, SignalAddress } from '@signal/types'
+import type { SenderKeyDistributionRecord, SenderKeyRecord, SignalAddress } from '@signal/types'
 import { SenderKeyMemoryStore } from '@store/memory/sender-key.store'
 import { concatBytes } from '@util/bytes'
 
@@ -41,6 +41,17 @@ function makeSenderKeyRecord(seed = 0): SenderKeyRecord {
     }
 }
 
+class CountingSenderKeyMemoryStore extends SenderKeyMemoryStore {
+    public distributionWrites = 0
+
+    public override async upsertSenderKeyDistribution(
+        record: SenderKeyDistributionRecord
+    ): Promise<void> {
+        this.distributionWrites += 1
+        await super.upsertSenderKeyDistribution(record)
+    }
+}
+
 test('sender key chain derives message keys and handles stale/future counters', async () => {
     const senderKey = makeSenderKeyRecord(11)
 
@@ -49,12 +60,12 @@ test('sender key chain derives message keys and handles stale/future counters', 
     assert.equal(derived.messageKey.iteration, 0)
     assert.equal(derived.messageKey.seed.length, 50)
 
-    const selectedFuture = await selectMessageKey(senderKey, 3)
+    const selectedFuture = selectMessageKey(senderKey, 3)
     assert.equal(selectedFuture.messageKey.iteration, 3)
     assert.equal(selectedFuture.updatedRecord.iteration, 4)
     assert.ok((selectedFuture.updatedRecord.unusedMessageKeys?.length ?? 0) > 0)
 
-    const selectedStale = await selectMessageKey(selectedFuture.updatedRecord, 1)
+    const selectedStale = selectMessageKey(selectedFuture.updatedRecord, 1)
     assert.equal(selectedStale.messageKey.iteration, 1)
     assert.equal(
         (selectedStale.updatedRecord.unusedMessageKeys?.length ?? 0) <
@@ -62,11 +73,11 @@ test('sender key chain derives message keys and handles stale/future counters', 
         true
     )
 
-    await assert.rejects(
+    assert.throws(
         () => selectMessageKey(selectedStale.updatedRecord, 1),
         /sender key message iteration is stale/
     )
-    await assert.rejects(
+    assert.throws(
         () => selectMessageKey(senderKey, 50_000),
         /sender key message is too far in future/
     )
@@ -177,6 +188,18 @@ test('sender key manager handles distribution, encryption/decryption and validat
             }),
         /invalid sender key signature/
     )
+})
+
+test('sender key manager does not record a distribution for the sender itself', async () => {
+    const store = new CountingSenderKeyMemoryStore()
+    const manager = new SenderKeyManager(store)
+    const groupId = '120363000000000001@g.us'
+    const sender = makeAddress('5511888888888', 1)
+    const plaintext = makeBytes(24, 12)
+
+    const prepared = await manager.prepareGroupEncryption(groupId, sender, plaintext)
+    assert.ok(prepared.distributionMessage.axolotlSenderKeyDistributionMessage)
+    assert.strictEqual(store.distributionWrites, 0)
 })
 
 test('sender key manager bypasses signature check when skipSignatureVerification is set', async () => {

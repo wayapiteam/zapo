@@ -6,12 +6,20 @@ export type {
     WaClientOptions,
     WaClientProxyOptions,
     WaDownloadMediaOptions,
+    WaGroupHistoryBundleEvent,
     WaHistorySyncChunkEvent,
     WaHistorySyncOptions,
     WaWriteBehindOptions
 } from '@client/types'
 export type { WaClientPluginContext, WaClientPluginDefinition } from '@client/plugins'
-export type { WaMessageCoordinator } from '@client/coordinators/WaMessageCoordinator'
+export type {
+    WaMediaUploadResult,
+    WaMessageCoordinator,
+    WaShareGroupHistoryInput,
+    WaShareGroupHistoryResult,
+    WaUploadMediaOptions,
+    WaUploadMediaType
+} from '@client/coordinators/WaMessageCoordinator'
 export type {
     WaAccountTakeoverNoticeEvent,
     WaAppStateMutationEvent,
@@ -37,6 +45,7 @@ export type {
     WaIncomingChatstateEvent,
     WaIncomingErrorStanzaEvent,
     WaIncomingFailureEvent,
+    WaIncomingDecryptedPayloadEvent,
     WaIncomingMessageEvent,
     WaIncomingMessageKey,
     WaIncomingNewsletterEvent,
@@ -64,6 +73,9 @@ export type {
     WaMexUsernameSetEvent,
     WaMexUsernameUpdateHintEvent,
     WaOfflineResumeEvent,
+    WaOfflineThreadMetadataEvent,
+    WaOfflineThreadPreview,
+    WaOfflineThreadReadWatermark,
     WaOutgoingMessageEvent,
     WaPictureEvent,
     WaPictureEventAction,
@@ -105,6 +117,21 @@ export type {
 } from '@client/coordinators/WaBusinessCoordinator'
 export { downloadMediaMessage } from '@client/media'
 export type { WaDownloadMediaMessageOptions, WaUploadMediaSource } from '@client/media'
+export { WaMediaCrypto } from '@media/crypto/WaMediaCrypto'
+export { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
+export type {
+    MediaCryptoType,
+    MediaKind,
+    WaMediaConn,
+    WaMediaDecryptReadableOptions,
+    WaMediaDecryptionResult,
+    WaMediaDerivedKeys,
+    WaMediaEncryptionResult,
+    WaMediaFileEncryptionResult,
+    WaMediaReadableDecryptionResult,
+    WaMediaReadableEncryptionResult,
+    WaMediaTransferClientOptions
+} from '@media/types'
 export type { WaEditBusinessProfileInput } from '@transport/node/builders/business'
 export type {
     WaEmailCoordinator,
@@ -171,11 +198,16 @@ export type {
     WaPageInfo
 } from '@client/coordinators/WaNewsletterCoordinator'
 export type {
-    WaBlocklistResult,
+    WaPrivacyAccountSyncResult,
     WaPrivacyCoordinator,
+    WaPrivacyDisallowedListInput,
+    WaPrivacyDisallowedListUpdate
+} from '@client/coordinators/WaPrivacyCoordinator'
+export type {
+    WaBlocklistResult,
     WaPrivacyDisallowedListResult,
     WaPrivacySettings
-} from '@client/coordinators/WaPrivacyCoordinator'
+} from '@client/events/privacy'
 export type {
     WaDisappearingModeResult,
     WaOwnUsernameResult,
@@ -237,9 +269,16 @@ export {
     unwrapMessage
 } from '@message/encode/content'
 export { getContextInfo } from '@message/context-info'
+export { decodeGroupHistoryBundle, encodeGroupHistoryBundle } from '@message/kinds/group-history'
 export { resolveMediaPayload } from '@message/encode/media-payload'
 export { unpadPkcs7, writeRandomPadMax16 } from '@message/encode/padding'
+export type { WaGroupHistoryBundleEncoding } from '@message/kinds/group-history'
 export type { WaResolvedMediaPayload } from '@message/encode/media-payload'
+export type {
+    WaMediaRetryRequest,
+    WaMediaRetryResult,
+    WaMediaRetryResultType
+} from '@message/primitives/media-retry'
 export type { WaSendContextInfo } from '@message/context-info'
 export type {
     WaLinkPreviewFetcher,
@@ -269,16 +308,39 @@ export type { PinoLoggerOptions } from '@infra/log/PinoLogger'
 export { createNoopLogger } from '@infra/log/types'
 export type { Logger, LogLevel } from '@infra/log/types'
 export { WA_VERSION } from '@version-spec'
+export {
+    resolveAbPropNameByCode,
+    WA_ABPROPS,
+    WA_ABPROPS_BY_CODE,
+    WA_ABPROPS_SPECIAL_EARLY,
+    WA_ABPROPS_USED_BEFORE_INIT,
+    WA_GROUP_ABPROPS,
+    WA_GROUP_ABPROPS_BY_CODE
+} from '@abprops-spec'
+export type {
+    WaAbProp,
+    WaAbPropName,
+    WaAbPropType,
+    WaAbPropValue,
+    WaAbPropValueByName,
+    WaGroupAbPropName,
+    WaGroupAbPropValueByName
+} from '@abprops-spec'
 export { createStore, WaAuthMemoryStore } from '@store'
 export type {
+    WaAnyStoreBackend,
     WaAppStateCollectionStoreState,
     WaAppStateStore,
     WaAuthStore,
+    WaCacheDomain,
     WaContactStore,
     WaCreateStoreOptions,
     WaCreateStoreOptionsStrict,
+    WaCreateStoreOptionsStrictFor,
     WaDeviceListSnapshot,
     WaDeviceListStore,
+    WaChatMetadataSnapshot,
+    WaChatMetadataStore,
     WaGroupMetadataSnapshot,
     WaGroupMetadataStore,
     WaMessageStore,
@@ -293,6 +355,8 @@ export type {
     WaStoredThreadRecord,
     WaStore,
     WaStoreBackend,
+    WaStoreBackendMap,
+    WaStoreDomain,
     WaStoreSession,
     WaThreadStore
 } from '@store'
@@ -351,10 +415,12 @@ export {
     WA_SIGNALING,
     WA_STREAM_SIGNALING,
     WA_SUPPORTED_DIRTY_TYPES,
+    WA_PRIVACY_ACCOUNT_SYNC_DISALLOWED_LISTS,
     WA_PRIVACY_CATEGORIES,
     WA_PRIVACY_CATEGORY_TO_SETTING,
     WA_PRIVACY_DISALLOWED_LIST_CATEGORIES,
     WA_PRIVACY_SETTING_TO_CATEGORY,
+    WA_PRIVACY_SETTING_VALUES,
     WA_PRIVACY_TAGS,
     WA_PRIVACY_VALUES,
     WA_XMLNS

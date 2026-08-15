@@ -20,6 +20,10 @@ function hashToRecord(data: Record<string, string>): WaStoredThreadRecord {
         ephemeralExpiration:
             toStringOrNull(data.ephemeral_expiration) !== null
                 ? Number(data.ephemeral_expiration)
+                : undefined,
+        ephemeralSettingTimestamp:
+            toStringOrNull(data.ephemeral_setting_timestamp) !== null
+                ? Number(data.ephemeral_setting_timestamp)
                 : undefined
     }
 }
@@ -49,6 +53,9 @@ function recordToHash(record: WaStoredThreadRecord): Record<string, string> {
     }
     if (record.ephemeralExpiration !== undefined) {
         fields.ephemeral_expiration = String(record.ephemeralExpiration)
+    }
+    if (record.ephemeralSettingTimestamp !== undefined) {
+        fields.ephemeral_setting_timestamp = String(record.ephemeralSettingTimestamp)
     }
 
     return fields

@@ -4,6 +4,7 @@ import { withSenderKeyCache } from '@store/cache/sender-key.cache'
 import { withSessionCache } from '@store/cache/session.cache'
 import type { WaAppStateStore } from '@store/contracts/appstate.store'
 import type { WaAuthStore } from '@store/contracts/auth.store'
+import type { WaChatMetadataStore } from '@store/contracts/chat-metadata.store'
 import type { WaContactStore } from '@store/contracts/contact.store'
 import type { WaDeviceListStore } from '@store/contracts/device-list.store'
 import type { WaGroupMetadataStore } from '@store/contracts/group-metadata.store'
@@ -34,6 +35,7 @@ import { withSignalLock } from '@store/locks/signal.lock'
 import { withThreadLock } from '@store/locks/thread.lock'
 import { WaAppStateMemoryStore } from '@store/memory/appstate.store'
 import { WaAuthMemoryStore } from '@store/memory/auth.store'
+import { WaChatMetadataMemoryStore } from '@store/memory/chat-metadata.store'
 import { WaContactMemoryStore } from '@store/memory/contact.store'
 import { WaDeviceListMemoryStore } from '@store/memory/device-list.store'
 import { WaGroupMetadataMemoryStore } from '@store/memory/group-metadata.store'
@@ -48,6 +50,7 @@ import { WaSessionMemoryStore } from '@store/memory/session.store'
 import { WaSignalMemoryStore } from '@store/memory/signal.store'
 import { WaThreadMemoryStore } from '@store/memory/thread.store'
 import {
+    NOOP_CHAT_METADATA_STORE,
     NOOP_CONTACT_STORE,
     NOOP_DEVICE_LIST_STORE,
     NOOP_GROUP_METADATA_STORE,
@@ -58,13 +61,14 @@ import {
 } from '@store/noop.store'
 import type {
     WaCreateStoreOptions,
-    WaCreateStoreOptionsStrict,
+    WaCreateStoreOptionsStrictFor,
     WaStore,
-    WaStoreBackend,
+    WaStoreBackendMap,
     WaStoreMemoryLimitSelection,
     WaStoreSession
 } from '@store/types'
 import { resolvePositive } from '@util/coercion'
+import { toError } from '@util/primitives'
 
 interface Destroyable {
     destroy: () => void | Promise<void>
@@ -73,6 +77,7 @@ interface Destroyable {
 const DEFAULT_CACHE_TTLS_MS = Object.freeze({
     retryMs: 60 * 1000,
     groupMetadataMs: 5 * 60 * 1000,
+    chatMetadataMs: 30 * 60 * 1000,
     deviceListMs: 5 * 60 * 1000,
     messageSecretMs: 30 * 60 * 1000
 } as const)
@@ -111,7 +116,7 @@ function usesBackend(provider: string | undefined): boolean {
 
 function resolveStore<T>(
     sessionId: string,
-    backends: Readonly<Record<string, WaStoreBackend>>,
+    backends: WaStoreBackendMap,
     provider: string | undefined,
     domain: string,
     kind: 'stores' | 'caches',
@@ -150,6 +155,14 @@ function resolveStore<T>(
  *   messageSecret) stay opt-in and default to memory - they are small,
  *   hot, and cheap to rebuild.
  *
+ * **Domain coverage:** the backend map is inferred, so each domain only
+ * accepts the backends whose bundle actually declares it. A backend that
+ * covers part of the matrix (`WaStoreBackend<'auth', never>`, say) can only
+ * be named on the domains it implements - the rest fall back to `'memory'`
+ * / `'none'`, checked by the compiler rather than by the
+ * `backend '<name>' does not provide <kind>.<domain>` throw on first
+ * `session()`.
+ *
  * @example
  * ```ts
  * // Persistent setup with @zapo-js/store-sqlite (recommended for production)
@@ -185,10 +198,12 @@ export function createStore(
         readonly providers?: undefined
     }
 ): WaStore
-export function createStore<B extends string>(options: WaCreateStoreOptionsStrict<B>): WaStore
-export function createStore<B extends string>(options?: WaCreateStoreOptions<B>): WaStore {
+export function createStore<TBackends extends WaStoreBackendMap>(
+    options: WaCreateStoreOptionsStrictFor<TBackends>
+): WaStore
+export function createStore(options?: WaCreateStoreOptions): WaStore {
     options = options ?? {}
-    const backends = (options.backends ?? {}) as Readonly<Record<string, WaStoreBackend>>
+    const backends: WaStoreBackendMap = options.backends ?? {}
     const providers = options.providers ?? {}
     const cacheProviders = options.cacheProviders ?? {}
     const cacheLayer = options.cacheLayer ?? {}
@@ -223,6 +238,11 @@ export function createStore<B extends string>(options?: WaCreateStoreOptions<B>)
             DEFAULT_CACHE_TTLS_MS.groupMetadataMs,
             'memory.cacheTtlMs.groupMetadataMs'
         ),
+        chatMetadata: resolvePositive(
+            options.memory?.cacheTtlMs?.chatMetadataMs,
+            DEFAULT_CACHE_TTLS_MS.chatMetadataMs,
+            'memory.cacheTtlMs.chatMetadataMs'
+        ),
         deviceList: resolvePositive(
             options.memory?.cacheTtlMs?.deviceListMs,
             DEFAULT_CACHE_TTLS_MS.deviceListMs,
@@ -235,6 +255,7 @@ export function createStore<B extends string>(options?: WaCreateStoreOptions<B>)
         )
     } as const)
     const sessions = new Map<string, WaStoreSession>()
+    const pendingSessionDestroys = new Set<Promise<void>>()
     let storeDestroyed = false
 
     return {
@@ -359,69 +380,105 @@ export function createStore<B extends string>(options?: WaCreateStoreOptions<B>)
                 'stores',
                 () => new WaPrivacyTokenMemoryStore(ml.privacyTokens)
             )
-            const rawRetry = resolveStore<WaRetryStore>(
-                id,
-                backends,
-                cacheProviders.retry ?? 'memory',
-                'retry',
-                'caches',
-                () =>
-                    cacheProviders.retry === 'memory' || !cacheProviders.retry
-                        ? new WaRetryMemoryStore(cacheTtlsMs.retry, {
-                              maxOutboundMessages: ml.retryOutboundMessages,
-                              maxInboundCounters: ml.retryInboundCounters,
-                              logger: memoryLogger?.child({ domain: 'retry', sessionId: id })
-                          })
-                        : NOOP_RETRY_STORE
-            )
-            const rawGroupMetadata = resolveStore<WaGroupMetadataStore>(
-                id,
-                backends,
-                cacheProviders.groupMetadata ?? 'memory',
-                'groupMetadata',
-                'caches',
-                () =>
-                    cacheProviders.groupMetadata === 'memory' || !cacheProviders.groupMetadata
-                        ? new WaGroupMetadataMemoryStore(cacheTtlsMs.groupMetadata, {
-                              maxGroups: ml.groupMetadataGroups,
-                              logger: memoryLogger?.child({
-                                  domain: 'groupMetadata',
-                                  sessionId: id
+            const buildCaches = () => ({
+                retry: withRetryLock(
+                    resolveStore<WaRetryStore>(
+                        id,
+                        backends,
+                        cacheProviders.retry ?? 'memory',
+                        'retry',
+                        'caches',
+                        () =>
+                            cacheProviders.retry === 'memory' || !cacheProviders.retry
+                                ? new WaRetryMemoryStore(cacheTtlsMs.retry, {
+                                      maxOutboundMessages: ml.retryOutboundMessages,
+                                      maxInboundCounters: ml.retryInboundCounters,
+                                      logger: memoryLogger?.child({
+                                          domain: 'retry',
+                                          sessionId: id
+                                      })
+                                  })
+                                : NOOP_RETRY_STORE
+                    )
+                ),
+                groupMetadata: withGroupMetadataLock(
+                    resolveStore<WaGroupMetadataStore>(
+                        id,
+                        backends,
+                        cacheProviders.groupMetadata ?? 'memory',
+                        'groupMetadata',
+                        'caches',
+                        () =>
+                            cacheProviders.groupMetadata === 'memory' ||
+                            !cacheProviders.groupMetadata
+                                ? new WaGroupMetadataMemoryStore(cacheTtlsMs.groupMetadata, {
+                                      maxGroups: ml.groupMetadataGroups,
+                                      logger: memoryLogger?.child({
+                                          domain: 'groupMetadata',
+                                          sessionId: id
+                                      })
+                                  })
+                                : NOOP_GROUP_METADATA_STORE
+                    )
+                ),
+                chatMetadata: resolveStore<WaChatMetadataStore>(
+                    id,
+                    backends,
+                    cacheProviders.chatMetadata ?? 'memory',
+                    'chatMetadata',
+                    'caches',
+                    () =>
+                        cacheProviders.chatMetadata === 'memory' || !cacheProviders.chatMetadata
+                            ? new WaChatMetadataMemoryStore(cacheTtlsMs.chatMetadata, {
+                                  maxChats: ml.chatMetadataChats,
+                                  logger: memoryLogger?.child({
+                                      domain: 'chatMetadata',
+                                      sessionId: id
+                                  })
                               })
-                          })
-                        : NOOP_GROUP_METADATA_STORE
-            )
-            const rawDeviceList = resolveStore<WaDeviceListStore>(
-                id,
-                backends,
-                cacheProviders.deviceList ?? 'memory',
-                'deviceList',
-                'caches',
-                () =>
-                    cacheProviders.deviceList === 'memory'
-                        ? new WaDeviceListMemoryStore(cacheTtlsMs.deviceList, {
-                              maxUsers: ml.deviceListUsers,
-                              logger: memoryLogger?.child({ domain: 'deviceList', sessionId: id })
-                          })
-                        : NOOP_DEVICE_LIST_STORE
-            )
-            const rawMessageSecret = resolveStore<WaMessageSecretStore>(
-                id,
-                backends,
-                cacheProviders.messageSecret ?? 'memory',
-                'messageSecret',
-                'caches',
-                () =>
-                    cacheProviders.messageSecret === 'memory' || !cacheProviders.messageSecret
-                        ? new WaMessageSecretMemoryStore(cacheTtlsMs.messageSecret, {
-                              maxSecrets: ml.messageSecrets,
-                              logger: memoryLogger?.child({
-                                  domain: 'messageSecret',
-                                  sessionId: id
-                              })
-                          })
-                        : NOOP_MESSAGE_SECRET_STORE
-            )
+                            : NOOP_CHAT_METADATA_STORE
+                ),
+                deviceList: withDeviceListLock(
+                    resolveStore<WaDeviceListStore>(
+                        id,
+                        backends,
+                        cacheProviders.deviceList ?? 'memory',
+                        'deviceList',
+                        'caches',
+                        () =>
+                            cacheProviders.deviceList === 'memory' || !cacheProviders.deviceList
+                                ? new WaDeviceListMemoryStore(cacheTtlsMs.deviceList, {
+                                      maxUsers: ml.deviceListUsers,
+                                      logger: memoryLogger?.child({
+                                          domain: 'deviceList',
+                                          sessionId: id
+                                      })
+                                  })
+                                : NOOP_DEVICE_LIST_STORE
+                    )
+                ),
+                messageSecret: withMessageSecretLock(
+                    resolveStore<WaMessageSecretStore>(
+                        id,
+                        backends,
+                        cacheProviders.messageSecret ?? 'memory',
+                        'messageSecret',
+                        'caches',
+                        () =>
+                            cacheProviders.messageSecret === 'memory' ||
+                            !cacheProviders.messageSecret
+                                ? new WaMessageSecretMemoryStore(cacheTtlsMs.messageSecret, {
+                                      maxSecrets: ml.messageSecrets,
+                                      logger: memoryLogger?.child({
+                                          domain: 'messageSecret',
+                                          sessionId: id
+                                      })
+                                  })
+                                : NOOP_MESSAGE_SECRET_STORE
+                    )
+                )
+            })
+            let caches = buildCaches()
 
             const authStore = withAuthLock(rawAuth)
             const signalStore = withSignalLock(rawSignal)
@@ -442,11 +499,7 @@ export function createStore<B extends string>(options?: WaCreateStoreOptions<B>)
                     : rawSenderKey
             )
             const appStateStore = withAppStateLock(rawAppState)
-            const retryStore = withRetryLock(rawRetry)
-            const groupMetadataStore = withGroupMetadataLock(rawGroupMetadata)
-            const deviceListStore = withDeviceListLock(rawDeviceList)
             const messageStore = withMessageLock(rawMessages)
-            const messageSecretStore = withMessageSecretLock(rawMessageSecret)
             const threadStore = withThreadLock(rawThreads)
             const contactStore = withContactLock(rawContacts)
             const privacyTokenStore = withPrivacyTokenLock(
@@ -455,31 +508,83 @@ export function createStore<B extends string>(options?: WaCreateStoreOptions<B>)
                     : rawPrivacyToken
             )
 
-            let cachesDestroyed = false
             let sessionDestroyed = false
+            let destroyPromise: Promise<void> | null = null
+            let cacheLifecycle: Promise<void> = Promise.resolve()
 
-            const destroyCaches = async (): Promise<void> => {
-                if (cachesDestroyed) return
-                cachesDestroyed = true
-                await Promise.all([
-                    retryStore.clear(),
-                    groupMetadataStore.clear(),
-                    deviceListStore.clear(),
-                    messageSecretStore.clear()
+            const teardownCaches = async (
+                target: ReturnType<typeof buildCaches>
+            ): Promise<number> => {
+                const cleared = await Promise.allSettled([
+                    target.retry.clear(),
+                    target.groupMetadata.clear(),
+                    target.chatMetadata.clear(),
+                    target.deviceList.clear(),
+                    target.messageSecret.clear()
                 ])
-                await Promise.all([
-                    destroyIfSupported(retryStore),
-                    destroyIfSupported(groupMetadataStore),
-                    destroyIfSupported(deviceListStore),
-                    destroyIfSupported(messageSecretStore)
+                const destroyed = await Promise.allSettled([
+                    destroyIfSupported(target.retry),
+                    destroyIfSupported(target.groupMetadata),
+                    destroyIfSupported(target.chatMetadata),
+                    destroyIfSupported(target.deviceList),
+                    destroyIfSupported(target.messageSecret)
                 ])
+                const failures = [...cleared, ...destroyed].filter(
+                    (result): result is PromiseRejectedResult => result.status === 'rejected'
+                )
+                if (failures.length > 0) {
+                    storeLogger?.warn('cache teardown had failures', {
+                        sessionId: id,
+                        droppedCount: failures.length,
+                        totalExpected: cleared.length + destroyed.length,
+                        sample: toError(failures[0].reason).message
+                    })
+                }
+                return failures.length
             }
 
-            const destroy = async (): Promise<void> => {
-                if (sessionDestroyed) return
+            const destroyCaches = (): Promise<void> => {
+                const run = cacheLifecycle.then(async () => {
+                    if (sessionDestroyed) return
+                    const failureCount = await teardownCaches(caches)
+                    caches = buildCaches()
+                    if (failureCount > 0) {
+                        throw new Error(
+                            `cache reset finished with ${failureCount} teardown failure(s); ` +
+                                'fresh caches are in place but old persistent entries may remain'
+                        )
+                    }
+                })
+                cacheLifecycle = run.then(
+                    () => undefined,
+                    () => undefined
+                )
+                return run
+            }
+
+            const destroy = (): Promise<void> => {
+                if (!destroyPromise) {
+                    const pending: Promise<void> = destroyInternal().finally(() =>
+                        pendingSessionDestroys.delete(pending)
+                    )
+                    destroyPromise = pending
+                    pendingSessionDestroys.add(pending)
+                }
+                return destroyPromise
+            }
+
+            const destroyInternal = async (): Promise<void> => {
                 sessionDestroyed = true
-                await destroyCaches()
-                await Promise.all([
+                if (sessions.get(id) === storeSession) {
+                    sessions.delete(id)
+                }
+                await cacheLifecycle
+                await teardownCaches(caches)
+                await destroyPersistentStores()
+            }
+
+            const destroyPersistentStores = async (): Promise<void> => {
+                const results = await Promise.allSettled([
                     destroyIfSupported(authStore),
                     destroyIfSupported(signalStore),
                     destroyIfSupported(preKeyStore),
@@ -492,6 +597,17 @@ export function createStore<B extends string>(options?: WaCreateStoreOptions<B>)
                     destroyIfSupported(contactStore),
                     destroyIfSupported(privacyTokenStore)
                 ])
+                const failures = results.filter(
+                    (result): result is PromiseRejectedResult => result.status === 'rejected'
+                )
+                if (failures.length > 0) {
+                    storeLogger?.warn('persistent store teardown had failures', {
+                        sessionId: id,
+                        droppedCount: failures.length,
+                        totalExpected: results.length,
+                        sample: toError(failures[0].reason).message
+                    })
+                }
             }
 
             const storeSession: WaStoreSession = {
@@ -502,11 +618,22 @@ export function createStore<B extends string>(options?: WaCreateStoreOptions<B>)
                 identity: identityStore,
                 senderKey: senderKeyStore,
                 appState: appStateStore,
-                retry: retryStore,
-                groupMetadata: groupMetadataStore,
-                deviceList: deviceListStore,
+                get retry() {
+                    return caches.retry
+                },
+                get groupMetadata() {
+                    return caches.groupMetadata
+                },
+                get chatMetadata() {
+                    return caches.chatMetadata
+                },
+                get deviceList() {
+                    return caches.deviceList
+                },
                 messages: messageStore,
-                messageSecret: messageSecretStore,
+                get messageSecret() {
+                    return caches.messageSecret
+                },
                 threads: threadStore,
                 contacts: contactStore,
                 privacyToken: privacyTokenStore,
@@ -529,6 +656,7 @@ export function createStore<B extends string>(options?: WaCreateStoreOptions<B>)
             const list = Array.from(sessions.values())
             sessions.clear()
             await Promise.all(list.map((s) => s.destroy()))
+            await Promise.all(Array.from(pendingSessionDestroys))
             const uniqueBackends = new Set(Object.values(backends))
             await Promise.all(Array.from(uniqueBackends, (backend) => destroyIfSupported(backend)))
         }

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { gzipSync } from 'node:zlib'
 
+import type { WaAbPropName } from '@abprops-spec'
 import { parseDirtyBits } from '@client/events/dirty'
 import { processHistorySyncNotification } from '@client/persistence/history-sync'
 import type { WaClientOptions } from '@client/types'
@@ -9,7 +10,6 @@ import { WaClient } from '@client/WaClient'
 import { buildWaClientDependencies, resolveWaClientBase } from '@client/WaClientFactory'
 import { createNoopLogger } from '@infra/log/types'
 import { proto } from '@proto'
-import type { AbPropName } from '@protocol/abprops'
 import { WaPrivacyTokenMemoryStore } from '@store/memory/privacy-token.store'
 import type { BinaryNode } from '@transport/types'
 
@@ -79,7 +79,7 @@ test('history sync processor persists conversations and emits chunk event', asyn
         {
             logger: createNoopLogger(),
             mediaTransfer: {
-                downloadAndDecrypt: async () => {
+                downloadAndDecryptStream: async () => {
                     throw new Error('should not be called for inline payload')
                 }
             } as never,
@@ -143,7 +143,7 @@ test('history sync processor handles ON_DEMAND chunks (peer-data-operation respo
         {
             logger: createNoopLogger(),
             mediaTransfer: {
-                downloadAndDecrypt: async () => {
+                downloadAndDecryptStream: async () => {
                     throw new Error('should not be called for inline payload')
                 }
             } as never,
@@ -206,7 +206,7 @@ test('history sync processor does not emit chunk event when chunk persistence fa
                 {
                     logger: createNoopLogger(),
                     mediaTransfer: {
-                        downloadAndDecrypt: async () => {
+                        downloadAndDecryptStream: async () => {
                             throw new Error('should not be called for inline payload')
                         }
                     } as never,
@@ -258,7 +258,7 @@ test('history sync processor forwards privacy token payloads and nct salt hooks'
         {
             logger: createNoopLogger(),
             mediaTransfer: {
-                downloadAndDecrypt: async () => {
+                downloadAndDecryptStream: async () => {
                     throw new Error('should not be called for inline payload')
                 }
             } as never,
@@ -333,7 +333,7 @@ test('history sync processor skips stub messages (system events)', async () => {
         {
             logger: createNoopLogger(),
             mediaTransfer: {
-                downloadAndDecrypt: async () => {
+                downloadAndDecryptStream: async () => {
                     throw new Error('should not be called for inline payload')
                 }
             } as never,
@@ -376,7 +376,7 @@ test('history sync processor persists phoneNumberToLidMappings as a single LID-c
         {
             logger: createNoopLogger(),
             mediaTransfer: {
-                downloadAndDecrypt: async () => {
+                downloadAndDecryptStream: async () => {
                     throw new Error('should not be called for inline payload')
                 }
             } as never,
@@ -433,7 +433,7 @@ test('history sync processor coalesces pushname onto the LID-canonical row when 
         {
             logger: createNoopLogger(),
             mediaTransfer: {
-                downloadAndDecrypt: async () => {
+                downloadAndDecryptStream: async () => {
                     throw new Error('should not be called for inline payload')
                 }
             } as never,
@@ -485,7 +485,7 @@ test('history sync processor invokes onProcessed after handled chunk (for hist_s
         {
             logger: createNoopLogger(),
             mediaTransfer: {
-                downloadAndDecrypt: async () => {
+                downloadAndDecryptStream: async () => {
                     throw new Error('should not be called for inline payload')
                 }
             } as never,
@@ -514,7 +514,7 @@ test('history sync processor invokes onProcessed for INITIAL_STATUS_V3 (recogniz
         {
             logger: createNoopLogger(),
             mediaTransfer: {
-                downloadAndDecrypt: async () => {
+                downloadAndDecryptStream: async () => {
                     throw new Error('should not be called - status_v3 is skipped before download')
                 }
             } as never,
@@ -541,7 +541,7 @@ test('history sync processor does NOT invoke onProcessed when syncType is null',
     await processHistorySyncNotification(
         {
             logger: createNoopLogger(),
-            mediaTransfer: { downloadAndDecrypt: async () => new Uint8Array() } as never,
+            mediaTransfer: { downloadAndDecryptStream: async () => new Uint8Array() } as never,
             writeBehind: {
                 persistMessageAsync: async () => undefined,
                 persistThreadAsync: async () => undefined,
@@ -578,7 +578,7 @@ test('history sync processor handles NON_BLOCKING_DATA syncType (previously skip
         {
             logger: createNoopLogger(),
             mediaTransfer: {
-                downloadAndDecrypt: async () => {
+                downloadAndDecryptStream: async () => {
                     throw new Error('should not be called for inline payload')
                 }
             } as never,
@@ -752,6 +752,7 @@ test('buildWaClientDependencies wires privacy coordinator', () => {
         clearStoredState: async () => undefined,
         resumeIncomingEvents: () => undefined,
         subscribeProtocolMessage: () => () => undefined,
+        hasEventListener: () => false,
         persistContact: () => undefined
     }
 
@@ -796,6 +797,7 @@ test('buildWaClientDependencies wires trusted contact token AB prop overrides', 
         clearStoredState: async () => undefined,
         resumeIncomingEvents: () => undefined,
         subscribeProtocolMessage: () => () => undefined,
+        hasEventListener: () => false,
         persistContact: () => undefined
     }
 
@@ -803,7 +805,7 @@ test('buildWaClientDependencies wires trusted contact token AB prop overrides', 
     const originalGetConfigValue = dependencies.abPropsCoordinator.getConfigValue.bind(
         dependencies.abPropsCoordinator
     )
-    dependencies.abPropsCoordinator.getConfigValue = ((name: AbPropName) => {
+    dependencies.abPropsCoordinator.getConfigValue = ((name: WaAbPropName) => {
         switch (name) {
             case 'tctoken_duration':
                 return 60 as never
@@ -1107,52 +1109,122 @@ test('uploadNewsletterMedia builds plaintext URL and parses response', async () 
     assert.equal(result.fileSha256.byteLength, 32)
 })
 
-test('uploadNewsletterLinkPreviewThumbnail uses the public newsletter thumbnail endpoint', async () => {
-    const { uploadNewsletterLinkPreviewThumbnail } = await import('@client/newsletter/content')
-    const thumbnail = new Uint8Array([0xff, 0xd8, 0xff, 0xd9])
-    const captured: { url?: string; body?: Uint8Array } = {}
-    const responseBody = new TextEncoder().encode(
-        JSON.stringify({
-            url: 'https://media.example/link-thumbnail',
-            direct_path: '/newsletter/link-thumbnail'
-        })
+test('buildNewsletterMessageContent resolves the plaintext mediatype for raw payloads', async () => {
+    const { buildNewsletterMessageContent } = await import('@client/newsletter/content')
+    const options = { logger: createNoopLogger() }
+
+    const linkPreview = await buildNewsletterMessageContent(options, {
+        extendedTextMessage: {
+            text: 'look at https://example.com',
+            matchedText: 'https://example.com',
+            title: 'Example',
+            previewType: proto.Message.ExtendedTextMessage.PreviewType.NONE
+        }
+    })
+    assert.equal(linkPreview.kind, 'media')
+    assert.equal(linkPreview.mediaType, 'url')
+
+    const vcard = await buildNewsletterMessageContent(options, {
+        contactMessage: { displayName: 'Ada', vcard: 'BEGIN:VCARD\nEND:VCARD' }
+    })
+    assert.equal(vcard.kind, 'media')
+    assert.equal(vcard.mediaType, 'vcard')
+
+    const plain = await buildNewsletterMessageContent(options, {
+        extendedTextMessage: { text: 'no link here' }
+    })
+    assert.equal(plain.kind, 'text')
+    assert.equal(plain.mediaType, null)
+
+    const location = await buildNewsletterMessageContent(options, {
+        locationMessage: { degreesLatitude: 1, degreesLongitude: 2 }
+    })
+    assert.equal(location.kind, 'text')
+    assert.equal(location.mediaType, null)
+})
+
+test('buildNewsletterMessageContent applies the resolved link preview to a text send', async () => {
+    const { buildNewsletterMessageContent } = await import('@client/newsletter/content')
+    const built = await buildNewsletterMessageContent(
+        {
+            logger: createNoopLogger(),
+            linkPreviewResolver: async () => ({
+                resolved: {
+                    matchedText: 'https://example.com',
+                    previewType: proto.Message.ExtendedTextMessage.PreviewType.NONE,
+                    title: 'Example'
+                },
+                thumbnailFields: {
+                    thumbnailDirectPath: '/v/newsletter/thumb',
+                    thumbnailSha256: new Uint8Array(32).fill(7)
+                }
+            })
+        },
+        { type: 'text', text: 'see https://example.com', linkPreview: true }
     )
-    const mediaTransfer = {
-        uploadStream: async (request: { url: string; body: Uint8Array }) => {
-            captured.url = request.url
-            captured.body = request.body
-            return {
-                url: request.url,
-                status: 200,
-                ok: true,
-                headers: {},
-                body: null
+
+    assert.equal(built.kind, 'media')
+    assert.equal(built.mediaType, 'url')
+    const decoded = proto.Message.decode(built.plaintext)
+    assert.equal(decoded.extendedTextMessage?.matchedText, 'https://example.com')
+    assert.equal(decoded.extendedTextMessage?.title, 'Example')
+    assert.equal(decoded.extendedTextMessage?.thumbnailDirectPath, '/v/newsletter/thumb')
+    assert.deepEqual(
+        Uint8Array.from(decoded.extendedTextMessage?.thumbnailSha256 ?? []),
+        new Uint8Array(32).fill(7)
+    )
+    assert.equal(decoded.extendedTextMessage?.mediaKey?.length ?? 0, 0)
+    assert.equal(decoded.extendedTextMessage?.thumbnailEncSha256?.length ?? 0, 0)
+})
+
+test('buildNewsletterMessageContent falls back to plain text when the resolver throws', async () => {
+    const { buildNewsletterMessageContent } = await import('@client/newsletter/content')
+    const built = await buildNewsletterMessageContent(
+        {
+            logger: createNoopLogger(),
+            linkPreviewResolver: async () => {
+                throw new Error('fetch exploded')
             }
         },
-        readResponseBytes: async () => responseBody
-    } as unknown as Parameters<typeof uploadNewsletterLinkPreviewThumbnail>[0]['mediaTransfer']
+        { type: 'text', text: 'see https://example.com' }
+    )
 
-    const result = await uploadNewsletterLinkPreviewThumbnail(
-        { mediaTransfer, logger: createNoopLogger() },
-        {
-            thumbnail: { bytes: thumbnail, width: 200, height: 100 },
-            mediaConn: {
-                auth: 'AUTH-TOKEN',
-                expiresAtMs: Date.now() + 60_000,
-                hosts: [{ hostname: 'mmg.whatsapp.net', isFallback: false }]
-            }
+    assert.equal(built.kind, 'text')
+    assert.equal(built.mediaType, null)
+    const decoded = proto.Message.decode(built.plaintext)
+    assert.equal(decoded.extendedTextMessage?.text, 'see https://example.com')
+    assert.equal(decoded.extendedTextMessage?.matchedText ?? '', '')
+})
+
+test('newsletter send publishes a link preview as type=media with mediatype=url', async () => {
+    const { createMessagingOps } = await import('@client/newsletter/messaging')
+    const published: BinaryNode[] = []
+    const ops = createMessagingOps({
+        logger: createNoopLogger(),
+        mexSocket: { query: async () => ({ tag: 'iq', attrs: {} }) },
+        sendNode: async () => undefined,
+        publishMessageNode: async (node: BinaryNode) => {
+            published.push(node)
+            return { id: node.attrs.id ?? '', ack: 0 }
+        },
+        generateStanzaId: async () => 'STANZA-1'
+    } as unknown as Parameters<typeof createMessagingOps>[0])
+
+    await ops.send('123@newsletter', {
+        extendedTextMessage: {
+            text: 'look at https://example.com',
+            matchedText: 'https://example.com'
         }
-    )
+    })
 
-    assert.match(
-        captured.url ?? '',
-        /^https:\/\/mmg\.whatsapp\.net\/newsletter\/newsletter-thumbnail-link\//
-    )
-    assert.deepEqual(captured.body, thumbnail)
-    assert.equal(result.thumbnailDirectPath, '/newsletter/link-thumbnail')
-    assert.equal(result.thumbnailSha256?.byteLength, 32)
-    assert.equal(result.thumbnailWidth, 200)
-    assert.equal(result.thumbnailHeight, 100)
-    assert.equal(result.thumbnailEncSha256, undefined)
-    assert.equal(result.mediaKey, undefined)
+    const node = published[0]
+    assert.equal(node.tag, 'message')
+    assert.equal(node.attrs.to, '123@newsletter')
+    assert.equal(node.attrs.id, 'STANZA-1')
+    assert.equal(node.attrs.type, 'media')
+    assert.equal(node.attrs.media_id, undefined)
+    const plaintext = (node.content as BinaryNode[])[0]
+    assert.equal(plaintext.tag, 'plaintext')
+    assert.equal(plaintext.attrs.mediatype, 'url')
+    assert.ok(plaintext.content instanceof Uint8Array)
 })

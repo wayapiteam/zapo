@@ -17,6 +17,11 @@ import type { WaPrivacyCoordinator } from '@client/coordinators/WaPrivacyCoordin
 import type { WaProfileCoordinator } from '@client/coordinators/WaProfileCoordinator'
 import type { WaStatusCoordinator } from '@client/coordinators/WaStatusCoordinator'
 import { createIgnoreKeyFilter, validateIgnoreKey } from '@client/messaging/ignore-key'
+import {
+    createEphemeralObserver,
+    persistIncomingEphemeralSetting
+} from '@client/persistence/ephemeral-setting'
+import { runGroupHistoryBundle } from '@client/persistence/group-history'
 import { runHistorySyncNotification } from '@client/persistence/history-sync'
 import { persistIncomingMailboxEntities } from '@client/persistence/mailbox'
 import { WriteBehindPersistence } from '@client/persistence/WriteBehindPersistence'
@@ -42,6 +47,7 @@ import {
 import { ConsoleLogger } from '@infra/log/ConsoleLogger'
 import type { Logger } from '@infra/log/types'
 import type { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
+import { unwrapMessage } from '@message/encode/content'
 import { proto, type Proto } from '@proto'
 import { WA_DEFAULTS, WA_MESSAGE_TYPES } from '@protocol/constants'
 import { normalizeDeviceJid } from '@protocol/jid'
@@ -69,6 +75,7 @@ class WaClientImpl extends EventEmitter {
     private readonly appStateSync!: WaAppStateSyncClient
     private readonly mediaTransfer!: WaMediaTransferClient
     private readonly writeBehind!: WriteBehindPersistence
+    private readonly observeEphemeralSetting!: (event: WaIncomingMessageEvent) => void
     private connectPromise: Promise<void> | null = null
     private acceptingIncomingEvents = true
     private activeIncomingHandlers = 0
@@ -96,6 +103,10 @@ class WaClientImpl extends EventEmitter {
             this.logger,
             this.options.writeBehind
         )
+        this.observeEphemeralSetting = createEphemeralObserver({
+            logger: this.logger,
+            chatMetadataStore: this.stores.chatMetadata
+        })
 
         const dependencies = buildWaClientDependencies({
             base,
@@ -108,6 +119,7 @@ class WaClientImpl extends EventEmitter {
                 syncAppStateWithOptions: (syncOptions) =>
                     this.deps.chatCoordinator.sync(syncOptions),
                 emitEvent: this.emit.bind(this),
+                hasEventListener: (event) => this.listenerCount(event) > 0,
                 handleIncomingMessageEvent: this.handleIncomingMessageEvent.bind(this),
                 handleError: this.handleError.bind(this),
                 handleIncomingFrame: this.handleIncomingFrame.bind(this),
@@ -275,6 +287,7 @@ class WaClientImpl extends EventEmitter {
         }
         try {
             this.emit('message', event)
+            this.observeEphemeralSetting(event)
             void persistIncomingMailboxEntities({
                 logger: this.logger,
                 writeBehind: this.writeBehind,
@@ -299,6 +312,9 @@ class WaClientImpl extends EventEmitter {
                         message: toError(err).message
                     })
                 })
+            }
+            if (this.options.history?.groupBundles === true && event.message && !event.key.fromMe) {
+                this.tryProcessGroupHistoryBundle(event)
             }
             const protocolMessage = event.message?.protocolMessage
             if (!protocolMessage) {
@@ -357,6 +373,7 @@ class WaClientImpl extends EventEmitter {
                         {
                             logger: this.logger,
                             mediaTransfer: this.mediaTransfer,
+                            chatMetadataStore: this.stores.chatMetadata,
                             writeBehind: this.writeBehind,
                             emitEvent: this.emit.bind(this),
                             onPrivacyTokens: (conversations) =>
@@ -370,6 +387,17 @@ class WaClientImpl extends EventEmitter {
                 } else if (sendHistSyncReceipt) {
                     await sendHistSyncReceipt()
                 }
+                return
+            }
+
+            if (protocolType === proto.Message.ProtocolMessage.Type.EPHEMERAL_SETTING) {
+                persistIncomingEphemeralSetting({
+                    logger: this.logger,
+                    writeBehind: this.writeBehind,
+                    chatMetadataStore: this.stores.chatMetadata,
+                    event,
+                    protocolMessage
+                })
                 return
             }
 
@@ -390,6 +418,47 @@ class WaClientImpl extends EventEmitter {
         } finally {
             this.leaveIncomingHandler()
         }
+    }
+
+    /**
+     * Kicks off the group-history bundle download when the incoming message
+     * carries one. Fire-and-forget: the blob can be large, and the incoming
+     * handler must not stall behind a CDN fetch.
+     *
+     * The download outlives the handler that started it, so it takes a slot of
+     * its own in the drain accounting - `disconnect()` and `clearStoredState()`
+     * must not flush or wipe the stores while a bundle is still writing.
+     */
+    private tryProcessGroupHistoryBundle(event: WaIncomingMessageEvent): void {
+        const bundle = unwrapMessage(event.message ?? {}).messageHistoryBundle
+        const groupJid = event.key.remoteJid
+        if (!bundle || !groupJid) {
+            return
+        }
+        if (!this.tryEnterIncomingHandler()) {
+            return
+        }
+        const credentials = this.deps.authClient.getCurrentCredentials()
+        void runGroupHistoryBundle(
+            {
+                logger: this.logger,
+                mediaTransfer: this.mediaTransfer,
+                writeBehind: this.writeBehind,
+                emitEvent: this.emit.bind(this),
+                meJid: credentials?.meJid,
+                meLid: credentials?.meLid,
+                getAbPropNumber: (name) => this.deps.abPropsCoordinator.getConfigValue<number>(name)
+            },
+            {
+                bundle,
+                groupJid,
+                senderJid: event.key.participant ?? undefined,
+                bundleMessageId: event.key.id,
+                sentAtSeconds: event.timestampSeconds
+            }
+        ).finally(() => {
+            this.leaveIncomingHandler()
+        })
     }
 
     private async queryWithContext(
@@ -487,6 +556,7 @@ class WaClientImpl extends EventEmitter {
      * your own backoff.
      */
     public async disconnect(): Promise<void> {
+        this.deps.privacyCoordinator.stopAccountSyncRefresh()
         await this.pauseIncomingEventsAndWaitDrain()
         const writeBehindFlush = await this.writeBehind.flush(
             this.options.writeBehind?.flushTimeoutMs
@@ -543,7 +613,7 @@ class WaClientImpl extends EventEmitter {
     public get auth(): WaAuthClient {
         return this.deps.authClient
     }
-    /** Message coordinator: send/receive, receipts, addons, media download. */
+    /** Message coordinator: send/receive, receipts, addons, media upload/download. */
     public get message(): WaMessageCoordinator {
         return this.deps.messageCoordinator
     }

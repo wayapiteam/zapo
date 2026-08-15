@@ -41,8 +41,8 @@ npm install zapo-js
 ```
 
 Zero mandatory runtime dependencies. Pick the optional packages you need
-on top: a persistent store and (optionally) the media processor for
-thumbnails / voice-note metadata.
+on top: a persistent store, the media processor for thumbnails /
+voice-note metadata, and the native crypto accelerator.
 
 ```bash
 # Persistent store - choose one
@@ -56,9 +56,20 @@ npm install @zapo-js/store-sqlite better-sqlite3
 npm install @zapo-js/media-utils sharp
 # plus a system `ffmpeg` + `ffprobe` on PATH (see media-utils README)
 
+# Optional - Rust crypto accelerator, no code change required
+npm install @zapo-js/native
+
 # Optional - structured logging
 npm install pino pino-pretty
 ```
+
+`@zapo-js/native` is picked up automatically once installed: the core
+resolves it on first use and falls back to the JS implementation when it is
+absent, so nothing else changes. It accelerates the two primitives that
+dominate the messaging hot path, X25519 ECDH and XEdDSA sign / verify. The
+published build is the WASM one (`ZAPO_NATIVE_BACKEND=auto` tries the NAPI
+addon first, then WASM); the compiled NAPI addon is not on npm yet and has
+to be built from `packages/native`. Set `ZAPO_NATIVE_BACKEND=js` to opt out.
 
 ## Quick Start
 
@@ -116,16 +127,19 @@ The core lives at the repo root (`zapo-js`). Optional packages live in
 [`packages/`](packages/) and ship under the `@zapo-js/*` scope. Install
 only what you need.
 
-| Package                                              | Peer dependency             | Purpose                                                                                                                                          |
-| ---------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| [`@zapo-js/store-sqlite`](packages/store-sqlite)     | `better-sqlite3`            | SQLite persistent store (single-process bots, dev sessions, small-to-medium prod).                                                               |
-| [`@zapo-js/store-redis`](packages/store-redis)       | `ioredis`                   | Redis-backed store with native TTL eviction.                                                                                                     |
-| [`@zapo-js/store-mongo`](packages/store-mongo)       | `mongodb`                   | MongoDB-backed store with TTL-index eviction.                                                                                                    |
-| [`@zapo-js/store-mysql`](packages/store-mysql)       | `mysql2`                    | MySQL / MariaDB-backed store with background cleanup poller.                                                                                     |
-| [`@zapo-js/store-postgres`](packages/store-postgres) | `pg`                        | PostgreSQL-backed store with background cleanup poller.                                                                                          |
-| [`@zapo-js/media-utils`](packages/media-utils)       | `sharp` + `ffmpeg`          | `WaMediaProcessor`: thumbnails, waveforms, voice-note normalization.                                                                             |
-| [`@zapo-js/fake-server`](packages/fake-server)       | (none)                      | In-process fake WhatsApp Web server for end-to-end testing.                                                                                      |
-| [`@zapo-js/mcp-server`](packages/mcp-server)         | `@modelcontextprotocol/sdk` | **Dev-only.** MCP server exposing multi-session `WaClient`s as dynamic tools for an LLM agent (Claude Code / Cursor / etc.). Not for production. |
+| Package                                              | Peer dependency                  | Purpose                                                                                                                                          |
+| ---------------------------------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [`@zapo-js/store-sqlite`](packages/store-sqlite)     | `better-sqlite3`                 | SQLite persistent store (single-process bots, dev sessions, small-to-medium prod).                                                               |
+| [`@zapo-js/store-redis`](packages/store-redis)       | `ioredis`                        | Redis-backed store with native TTL eviction.                                                                                                     |
+| [`@zapo-js/store-mongo`](packages/store-mongo)       | `mongodb`                        | MongoDB-backed store with TTL-index eviction.                                                                                                    |
+| [`@zapo-js/store-mysql`](packages/store-mysql)       | `mysql2`                         | MySQL / MariaDB-backed store with background cleanup poller.                                                                                     |
+| [`@zapo-js/store-postgres`](packages/store-postgres) | `pg`                             | PostgreSQL-backed store with background cleanup poller.                                                                                          |
+| [`@zapo-js/media-utils`](packages/media-utils)       | `sharp` + `file-type` + `ffmpeg` | `WaMediaProcessor`: thumbnails, waveforms, voice-note normalization.                                                                             |
+| [`@zapo-js/native`](packages/native)                 | (none)                           | Rust crypto accelerator for the messaging hot path (X25519 ECDH, XEdDSA sign / verify). Auto-detected once installed; ships as a WASM build.     |
+| [`@zapo-js/voip`](packages/voip)                     | `@roamhq/wrtc` + `libmlow-wasm`  | `client.voip` plugin for calls: MLow/WASM codec, SRTP, STUN, WebRTC/SCTP relay transport.                                                        |
+| [`@zapo-js/wam`](packages/wam)                       | (none)                           | `client.wam` plugin emitting the client-side WAM telemetry batches WA Web sends, for wire parity and anti-fingerprinting.                        |
+| [`@zapo-js/fake-server`](packages/fake-server)       | (none)                           | In-process fake WhatsApp Web server for end-to-end testing.                                                                                      |
+| [`@zapo-js/mcp-server`](packages/mcp-server)         | `@modelcontextprotocol/sdk`      | **Dev-only.** MCP server exposing multi-session `WaClient`s as dynamic tools for an LLM agent (Claude Code / Cursor / etc.). Not for production. |
 
 Each package's README has the install + config + integration notes.
 

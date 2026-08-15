@@ -76,11 +76,13 @@ import {
 } from '@transport/node/builders/prekeys'
 import { buildPresenceNode, buildPresenceSubscribeNode } from '@transport/node/builders/presence'
 import {
-    buildBlocklistChangeIq,
+    buildBlocklistBlockIq,
+    buildBlocklistUnblockIq,
     buildGetBlocklistIq,
     buildGetPrivacyDisallowedListIq,
     buildGetPrivacySettingsIq,
-    buildSetPrivacyCategoryIq
+    buildSetPrivacyCategoryIq,
+    buildSetPrivacyDisallowedListIq
 } from '@transport/node/builders/privacy'
 import {
     buildCsTokenMessageNode,
@@ -779,6 +781,29 @@ test('message builders create fanout nodes and validate participant requirements
     }
     assert.equal(interactiveChild.content[0].tag, 'native_flow')
     assert.equal(interactiveChild.content[0].attrs.name, 'mixed')
+    assert.equal(interactiveChild.content[0].attrs.v, '9')
+
+    const pixAddon = buildButtonAddonNode('payment_info')
+    assert.equal(pixAddon.tag, 'biz')
+    if (!Array.isArray(pixAddon.content)) throw new Error('expected biz children')
+    const pixInteractive = pixAddon.content[0]
+    assert.equal(pixInteractive.tag, 'interactive')
+    assert.equal(pixInteractive.attrs.type, 'native_flow')
+    if (!Array.isArray(pixInteractive.content)) {
+        throw new Error('expected native_flow child')
+    }
+    assert.equal(pixInteractive.content[0].tag, 'native_flow')
+    assert.equal(pixInteractive.content[0].attrs.name, 'payment_info')
+    assert.equal(pixInteractive.content[0].attrs.v, undefined)
+
+    const reviewAddon = buildButtonAddonNode('order_details')
+    if (!Array.isArray(reviewAddon.content)) throw new Error('expected biz children')
+    const reviewInteractive = reviewAddon.content[0]
+    if (!Array.isArray(reviewInteractive.content)) {
+        throw new Error('expected native_flow child')
+    }
+    assert.equal(reviewInteractive.content[0].attrs.name, 'order_details')
+    assert.equal(reviewInteractive.content[0].attrs.v, undefined)
 
     const fanoutWithAddon = buildDirectMessageFanoutNode({
         to: '5511@s.whatsapp.net',
@@ -867,7 +892,7 @@ test('privacy builders generate expected iq payloads', () => {
     assert.equal(setCategory.content[0].content[0].attrs.name, WA_PRIVACY_CATEGORIES.ONLINE)
     assert.equal(setCategory.content[0].content[0].attrs.value, 'match_last_seen')
 
-    const disallowed = buildGetPrivacyDisallowedListIq(WA_PRIVACY_CATEGORIES.ABOUT)
+    const disallowed = buildGetPrivacyDisallowedListIq(WA_PRIVACY_CATEGORIES.ABOUT, false)
     assert.equal(disallowed.attrs.type, 'get')
     assert.equal(disallowed.attrs.xmlns, WA_XMLNS.PRIVACY)
     assert.ok(Array.isArray(disallowed.content))
@@ -875,6 +900,7 @@ test('privacy builders generate expected iq payloads', () => {
         throw new Error('expected get disallowed list content array')
     }
     assert.equal(disallowed.content[0].tag, WA_NODE_TAGS.PRIVACY)
+    assert.equal(disallowed.content[0].attrs.addressing_mode, undefined)
     assert.ok(Array.isArray(disallowed.content[0].content))
     if (!Array.isArray(disallowed.content[0].content)) {
         throw new Error('expected get disallowed list payload array')
@@ -883,21 +909,116 @@ test('privacy builders generate expected iq payloads', () => {
     assert.equal(disallowed.content[0].content[0].attrs.name, WA_PRIVACY_CATEGORIES.ABOUT)
     assert.equal(disallowed.content[0].content[0].attrs.value, 'contact_blacklist')
 
+    const disallowedLid = buildGetPrivacyDisallowedListIq(WA_PRIVACY_CATEGORIES.LAST_SEEN, true)
+    if (!Array.isArray(disallowedLid.content)) {
+        throw new Error('expected lid disallowed list content array')
+    }
+    assert.equal(disallowedLid.content[0].attrs.addressing_mode, 'lid')
+
+    const listSet = buildSetPrivacyDisallowedListIq(
+        WA_PRIVACY_CATEGORIES.LAST_SEEN,
+        [
+            { action: 'add', lidJid: '999@lid', pnJid: '5511@s.whatsapp.net' },
+            { action: 'remove', lidJid: '888@lid', pnJid: null }
+        ],
+        '1785262526802',
+        true
+    )
+    assert.equal(listSet.attrs.type, 'set')
+    if (!Array.isArray(listSet.content) || !Array.isArray(listSet.content[0].content)) {
+        throw new Error('expected set disallowed list payload array')
+    }
+    assert.equal(listSet.content[0].attrs.addressing_mode, 'lid')
+    const listCategory = listSet.content[0].content[0]
+    assert.deepEqual(listCategory.attrs, {
+        name: WA_PRIVACY_CATEGORIES.LAST_SEEN,
+        value: 'contact_blacklist',
+        dhash: '1785262526802'
+    })
+    if (!Array.isArray(listCategory.content)) {
+        throw new Error('expected set disallowed list user array')
+    }
+    assert.deepEqual(listCategory.content[0].attrs, {
+        action: 'add',
+        jid: '999@lid',
+        pn_jid: '5511@s.whatsapp.net'
+    })
+    assert.deepEqual(listCategory.content[1].attrs, { action: 'remove', jid: '888@lid' })
+
+    const listSetPn = buildSetPrivacyDisallowedListIq(
+        WA_PRIVACY_CATEGORIES.LAST_SEEN,
+        [{ action: 'add', lidJid: null, pnJid: '5511@s.whatsapp.net' }],
+        null,
+        false
+    )
+    if (!Array.isArray(listSetPn.content) || !Array.isArray(listSetPn.content[0].content)) {
+        throw new Error('expected pn disallowed list payload array')
+    }
+    assert.equal(listSetPn.content[0].attrs.addressing_mode, undefined)
+    const pnCategory = listSetPn.content[0].content[0]
+    assert.equal(pnCategory.attrs.dhash, 'none')
+    if (!Array.isArray(pnCategory.content)) {
+        throw new Error('expected pn disallowed list user array')
+    }
+    assert.deepEqual(pnCategory.content[0].attrs, {
+        action: 'add',
+        jid: '5511@s.whatsapp.net'
+    })
+
     const blocklist = buildGetBlocklistIq()
     assert.equal(blocklist.attrs.type, 'get')
     assert.equal(blocklist.attrs.xmlns, WA_XMLNS.BLOCKLIST)
     assert.equal(blocklist.content, undefined)
 
-    const block = buildBlocklistChangeIq('5511999999999@s.whatsapp.net', 'block')
-    assert.equal(block.attrs.type, 'set')
-    assert.equal(block.attrs.xmlns, WA_XMLNS.BLOCKLIST)
-    assert.ok(Array.isArray(block.content))
-    if (!Array.isArray(block.content)) {
+    const nonMigratedBlock = buildBlocklistBlockIq({
+        lidJid: null,
+        pnJid: '5511999999999@s.whatsapp.net'
+    })
+    assert.equal(nonMigratedBlock.attrs.type, 'set')
+    assert.equal(nonMigratedBlock.attrs.xmlns, WA_XMLNS.BLOCKLIST)
+    assert.ok(Array.isArray(nonMigratedBlock.content))
+    if (!Array.isArray(nonMigratedBlock.content)) {
         throw new Error('expected blocklist change content array')
     }
-    assert.equal(block.content[0].tag, 'item')
-    assert.equal(block.content[0].attrs.jid, '5511999999999@s.whatsapp.net')
-    assert.equal(block.content[0].attrs.action, 'block')
+    assert.equal(nonMigratedBlock.content[0].tag, 'item')
+    assert.deepEqual(nonMigratedBlock.content[0].attrs, {
+        action: 'block',
+        jid: '5511999999999@s.whatsapp.net'
+    })
+
+    const migratedBlock = buildBlocklistBlockIq({
+        lidJid: '999@lid',
+        pnJid: '5511999999999@s.whatsapp.net'
+    })
+    assert.ok(Array.isArray(migratedBlock.content))
+    if (!Array.isArray(migratedBlock.content)) {
+        throw new Error('expected migrated block content array')
+    }
+    assert.deepEqual(migratedBlock.content[0].attrs, {
+        action: 'block',
+        jid: '999@lid',
+        pn_jid: '5511999999999@s.whatsapp.net'
+    })
+
+    const unknownIdentifierBlock = buildBlocklistBlockIq({ lidJid: '999@lid', pnJid: null })
+    assert.ok(Array.isArray(unknownIdentifierBlock.content))
+    if (!Array.isArray(unknownIdentifierBlock.content)) {
+        throw new Error('expected unknown-identifier block content array')
+    }
+    assert.deepEqual(unknownIdentifierBlock.content[0].attrs, {
+        action: 'block',
+        jid: '999@lid',
+        unknown_identifier: 'true'
+    })
+
+    const unblock = buildBlocklistUnblockIq('999@lid')
+    assert.equal(unblock.attrs.type, 'set')
+    assert.equal(unblock.attrs.xmlns, WA_XMLNS.BLOCKLIST)
+    assert.ok(Array.isArray(unblock.content))
+    if (!Array.isArray(unblock.content)) {
+        throw new Error('expected unblock content array')
+    }
+    assert.deepEqual(unblock.content[0].attrs, { jid: '999@lid', action: 'unblock' })
 })
 
 test('message builders cover group and inbound receipt branches', () => {

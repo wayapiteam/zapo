@@ -4,10 +4,12 @@ import {
     assertMediaUploadStatus,
     buildMediaUploadUrl,
     parseMediaUploadJsonBody,
-    selectMediaUploadHost
+    performPlaintextMediaUpload,
+    selectMediaUploadHost,
+    type WaUploadMediaSource
 } from '@client/media'
 import type { Logger } from '@infra/log/types'
-import { MEDIA_UPLOAD_PATHS } from '@media/constants'
+import { MEDIA_UPLOAD_PATHS, NEWSLETTER_MEDIA_UPLOAD_PATHS } from '@media/constants'
 import { WaMediaCrypto } from '@media/crypto/WaMediaCrypto'
 import type { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
 import type { WaMediaConn } from '@media/types'
@@ -28,9 +30,11 @@ import { toError } from '@util/primitives'
 
 const INLINE_THUMBNAIL_MAX_BYTES = 64 * 1024
 
-export type WaLinkPreviewThumbnailUploader = (
-    thumbnail: WaLinkPreviewThumbnailInput
-) => Promise<WaLinkPreviewThumbnailFields>
+/**
+ * Where the preview is published. `chat` uploads the HQ thumbnail encrypted;
+ * `newsletter` uploads it in the clear, since channel media is not encrypted.
+ */
+export type WaLinkPreviewSurface = 'chat' | 'newsletter'
 
 export interface ResolveLinkPreviewDeps {
     readonly logger: Logger
@@ -39,7 +43,8 @@ export interface ResolveLinkPreviewDeps {
     readonly fetcher: WaLinkPreviewFetcher
     readonly options: WaLinkPreviewOptions
     readonly serverClock: ServerClock
-    readonly thumbnailUploader?: WaLinkPreviewThumbnailUploader
+    /** Defaults to `chat`. */
+    readonly surface?: WaLinkPreviewSurface
 }
 
 export interface ResolvedLinkPreviewResult {
@@ -111,9 +116,7 @@ async function resolveBytesThumbnailFields(
         return inlineFields
     }
     try {
-        const hqFields = deps.thumbnailUploader
-            ? await deps.thumbnailUploader(thumbnail)
-            : await uploadHqFromBytes(deps, thumbnail)
+        const hqFields = await uploadHqFromBytes(deps, thumbnail)
         return { ...inlineFields, ...hqFields }
     } catch (error) {
         deps.logger.warn('link preview thumbnail upload failed', {
@@ -132,9 +135,7 @@ async function resolveStreamThumbnailFields(
         return {}
     }
     try {
-        return deps.thumbnailUploader
-            ? await deps.thumbnailUploader(thumbnail)
-            : await uploadHqFromStream(deps, thumbnail)
+        return await uploadHqFromStream(deps, thumbnail)
     } catch (error) {
         deps.logger.warn('link preview thumbnail upload failed', {
             message: toError(error).message
@@ -156,6 +157,9 @@ async function uploadHqFromBytes(
     deps: ResolveLinkPreviewDeps,
     thumbnail: WaLinkPreviewThumbnailBytes
 ): Promise<WaLinkPreviewThumbnailFields> {
+    if (deps.surface === 'newsletter') {
+        return uploadPlaintextHq(deps, thumbnail.bytes, thumbnail)
+    }
     const mediaKey = await WaMediaCrypto.generateMediaKey()
     const encrypted = await WaMediaCrypto.encryptBytes(
         'thumbnail-link',
@@ -184,6 +188,9 @@ async function uploadHqFromStream(
     deps: ResolveLinkPreviewDeps,
     thumbnail: WaLinkPreviewThumbnailStream
 ): Promise<WaLinkPreviewThumbnailFields> {
+    if (deps.surface === 'newsletter') {
+        return uploadPlaintextHq(deps, thumbnail.stream, thumbnail)
+    }
     const mediaKey = await WaMediaCrypto.generateMediaKey()
     const encrypted = await WaMediaCrypto.encryptToFile(
         'thumbnail-link',
@@ -217,6 +224,38 @@ async function uploadHqFromStream(
             })
         }
         await WaMediaCrypto.cleanupEncryptedFile(encrypted.filePath)
+    }
+}
+
+/** Uploads the HQ thumbnail unencrypted, so no `mediaKey` / `thumbnailEncSha256`. */
+async function uploadPlaintextHq(
+    deps: ResolveLinkPreviewDeps,
+    source: WaUploadMediaSource,
+    dimensions: { readonly width?: number; readonly height?: number }
+): Promise<WaLinkPreviewThumbnailFields> {
+    const mediaConn = await deps.getMediaConn()
+    const upload = await performPlaintextMediaUpload(
+        { mediaTransfer: deps.mediaTransfer, mediaConn, logger: deps.logger },
+        {
+            source,
+            path: NEWSLETTER_MEDIA_UPLOAD_PATHS['thumbnail-link'],
+            mimetype: 'image/jpeg',
+            logLabel: 'uploading newsletter link preview thumbnail'
+        }
+    )
+    assertMediaUploadStatus(upload.status, 'newsletter thumbnail-link upload')
+    const parsed = parseMediaUploadJsonBody<{ readonly direct_path?: string }>(
+        upload.responseBytes,
+        'newsletter thumbnail-link upload'
+    )
+    if (!parsed.direct_path) {
+        throw new Error('newsletter thumbnail-link upload response missing direct_path')
+    }
+    return {
+        thumbnailDirectPath: parsed.direct_path,
+        thumbnailSha256: upload.fileSha256,
+        ...(dimensions.width !== undefined ? { thumbnailWidth: dimensions.width } : {}),
+        ...(dimensions.height !== undefined ? { thumbnailHeight: dimensions.height } : {})
     }
 }
 

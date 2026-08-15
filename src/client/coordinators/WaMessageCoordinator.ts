@@ -1,11 +1,22 @@
-import { createWriteStream } from 'node:fs'
+import { createReadStream, createWriteStream } from 'node:fs'
 import type { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 
+import type { WaAbPropName } from '@abprops-spec'
 import type { WaMessageDispatchCoordinator } from '@client/coordinators/WaMessageDispatchCoordinator'
 import type { WaTrustedContactTokenCoordinator } from '@client/coordinators/WaTrustedContactTokenCoordinator'
 import { aggregateReceiptTargets } from '@client/events/receipt'
-import { downloadMediaMessage } from '@client/media'
+import {
+    assertReadableFile,
+    downloadMediaMessage,
+    isReadableStream,
+    type WaUploadMediaSource
+} from '@client/media'
+import {
+    uploadMedia,
+    type UploadResult,
+    type WaMediaMessageOptions
+} from '@client/messaging/messages'
 import type {
     WaDownloadMediaOptions,
     WaIncomingAddonEvent,
@@ -13,17 +24,27 @@ import type {
     WaSendMessageOptions
 } from '@client/types'
 import type { Logger } from '@infra/log/types'
+import { MEDIA_UPLOAD_PATHS } from '@media/constants'
 import type { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
+import type { MediaKind } from '@media/types'
 import {
-    buildAddonAdditionalData,
+    buildAddonSenderPairs,
+    collectUniqueUserJids,
     decodeAddonPlaintext,
-    decryptAddonPayload,
+    decryptAddonPayloadWithSenderFallback,
     identifyEncryptedAddon,
+    resolveAddonParentSenderFromKey,
     resolveParentMessageSecret,
-    resolvePollOptionNames,
-    shouldUseAddonAdditionalData
+    resolvePollOptionNames
 } from '@message/crypto/addon-crypto'
 import { unwrapMessage } from '@message/encode/content'
+import { resolveMediaPayload } from '@message/encode/media-payload'
+import { encodeGroupHistoryBundle } from '@message/kinds/group-history'
+import type {
+    WaMediaRetryRequest,
+    WaMediaRetryRequester,
+    WaMediaRetryResult
+} from '@message/primitives/media-retry'
 import type { PeerDataOperationRequester } from '@message/primitives/peer-data-operation'
 import type {
     WaMessagePublishResult,
@@ -34,17 +55,21 @@ import type {
 } from '@message/types'
 import type { WaMexOperationResponses } from '@mex'
 import { proto, type Proto } from '@proto'
-import { applyDeviceToJid, normalizeRecipientJid } from '@protocol/jid'
+import { applyDeviceToJid, isGroupJid, normalizeRecipientJid } from '@protocol/jid'
 import type { WaMessageSecretStore } from '@store/contracts/message-secret.store'
 import type { WaMessageStore } from '@store/contracts/message.store'
 import { runMexQuery, type WaMexQuerySocket } from '@transport/node/mex/client'
 import { readAllBytes } from '@util/bytes'
-import { tryAsNumber, tryAsString } from '@util/coercion'
-import { toError } from '@util/primitives'
+import { resolveOptionalPositive, resolvePositive, tryAsNumber, tryAsString } from '@util/coercion'
+import { longToNumber, toError } from '@util/primitives'
 
 export interface WaMessageCoordinatorDeps {
     readonly messageDispatch: WaMessageDispatchCoordinator
     readonly mediaTransfer: WaMediaTransferClient
+    /** Backs {@link WaMessageCoordinator.requestMediaReupload}. */
+    readonly mediaRetry: WaMediaRetryRequester
+    /** Media upload wiring shared with the send path; backs {@link WaMessageCoordinator.upload}. */
+    readonly mediaUploadOptions: WaMediaMessageOptions
     readonly logger: Logger
     readonly messageStore: WaMessageStore
     readonly messageSecretStore: WaMessageSecretStore
@@ -52,6 +77,82 @@ export interface WaMessageCoordinatorDeps {
     readonly emitAddon: (event: WaIncomingAddonEvent) => void
     readonly mexSocket: WaMexQuerySocket
     readonly peerDataOperation: PeerDataOperationRequester
+    /**
+     * Server-synced `group_history_send` AB-prop. WhatsApp gates the sender
+     * side per account, and rejects the stanza with SMAX_INVALID when it is
+     * off, so {@link WaMessageCoordinator.shareGroupHistory} checks it before
+     * spending an upload.
+     */
+    readonly isGroupHistorySendEnabled: () => boolean
+    /**
+     * Reads a server-synced numeric AB-prop, falling back to its shipped
+     * default. Sole source for the group-history message-count limit, so a
+     * server-side change takes effect without a release.
+     */
+    readonly getAbPropNumber: (name: WaAbPropName) => number
+}
+
+/** MIME type the group-history bundle is uploaded and advertised under. */
+const GROUP_HISTORY_BUNDLE_MIMETYPE = 'application/protobuf'
+
+/** Oldest `messageTimestamp` across `messages`, in seconds; `undefined` when none carries one. */
+function oldestTimestampSeconds(messages: readonly Proto.IWebMessageInfo[]): number | undefined {
+    let oldest: number | undefined
+    for (let index = 0; index < messages.length; index += 1) {
+        const timestamp = longToNumber(messages[index].messageTimestamp)
+        if (timestamp > 0 && (oldest === undefined || timestamp < oldest)) {
+            oldest = timestamp
+        }
+    }
+    return oldest
+}
+
+export interface WaShareGroupHistoryInput {
+    /**
+     * Members to share the history with. Must be current members of the group,
+     * written in the group's own addressing mode - a LID-addressed group only
+     * matches `@lid` entries, and a PN one only matches `@s.whatsapp.net`.
+     * Anything else throws, naming the mode the group uses. Read the mode off
+     * `client.group.queryGroupMetadata()`, whose participants carry both forms.
+     */
+    readonly toJids: readonly string[]
+    /**
+     * How many of the most recent messages to read from the mailbox store.
+     * Defaults to WhatsApp's `group_history_message_count_limit` (100).
+     * Ignored when {@link messages} is supplied - that list is bundled as-is.
+     */
+    readonly count?: number
+    /**
+     * Only read messages at or after this timestamp (ms) from the mailbox
+     * store. Ignored when {@link messages} is supplied.
+     */
+    readonly sinceMs?: number
+    /**
+     * Messages to bundle, bypassing the mailbox store entirely - {@link count}
+     * and {@link sinceMs} do not apply, so the caller owns the windowing.
+     * Required when the `messages` store domain is `'none'` (the default),
+     * since there is nothing to read back in that case.
+     */
+    readonly messages?: readonly Proto.IWebMessageInfo[]
+    /**
+     * Pinned messages older than the shared window. The receiver injects these
+     * regardless of the age cutoff it applies to `messages`.
+     */
+    readonly outOfWindowPinnedMessages?: readonly Proto.IWebMessageInfo[]
+}
+
+export interface WaShareGroupHistoryResult {
+    /** Stanza id of the bundle message, fanned out only to `historyReceivers`. */
+    readonly bundleMessageId: string
+    /**
+     * Stanza id of the notice message, sent to the whole group. Absent when the
+     * notice failed to send: the bundle still reached its receivers, so do not
+     * retry the share - it would upload and deliver the history a second time.
+     */
+    readonly noticeMessageId?: string
+    readonly messagesCount: number
+    readonly historyReceivers: readonly string[]
+    readonly nonHistoryReceivers: readonly string[]
 }
 
 export interface WaRequestHistorySyncInput {
@@ -123,13 +224,72 @@ function parseMessageCappingMexResponse(
 }
 
 /**
+ * Media kinds accepted by {@link WaMessageCoordinator.upload}. `gif` is a
+ * GIF-playback video, `ptt` a voice note, `ptv` a round video note.
+ */
+export type WaUploadMediaType = MediaKind | 'gif' | 'ptt'
+
+/** Options for {@link WaMessageCoordinator.upload}. */
+export interface WaUploadMediaOptions {
+    /** Media type: sets the encryption context and CDN upload path. */
+    readonly type: WaUploadMediaType
+    /** `Content-Type` for the upload and the mimetype for the message proto. */
+    readonly mimetype?: string
+    /** Reuse a 32-byte media key instead of generating one. */
+    readonly mediaKey?: Uint8Array
+    /** Override the streaming sidecar (default on for video/ptv/audio/gif/ptt). */
+    readonly sidecar?: boolean
+    /** Animated-sticker first-frame length for the first-frame sidecar. */
+    readonly firstFrameLength?: number
+    /** Per-upload transfer timeout override (ms). */
+    readonly timeoutMs?: number
+    /** Cancellation signal forwarded to the CDN request. */
+    readonly signal?: AbortSignal
+}
+
+/**
+ * Reusable descriptor returned by {@link WaMessageCoordinator.upload}: the
+ * {@link UploadResult} fields plus the media-key timestamp and echoed mimetype.
+ */
+export interface WaMediaUploadResult extends UploadResult {
+    /** Unix seconds the media key was minted; belongs on the message proto. */
+    readonly mediaKeyTimestamp: number
+    /** Echo of the `mimetype` option when provided. */
+    readonly mimetype?: string
+}
+
+const SIDECAR_UPLOAD_TYPES: ReadonlySet<WaUploadMediaType> = new Set([
+    'video',
+    'ptv',
+    'audio',
+    'gif',
+    'ptt'
+])
+
+async function normalizeUploadSource(source: WaUploadMediaSource): Promise<Uint8Array | Readable> {
+    if (source instanceof Uint8Array) {
+        return source
+    }
+    if (typeof source === 'string') {
+        await assertReadableFile(source)
+        return createReadStream(source)
+    }
+    if (isReadableStream(source)) {
+        return source
+    }
+    throw new Error('media upload received unsupported source type')
+}
+
+/**
  * Coordinates outbound message sending, receipts, addon decryption, media
- * download, and the related MEX account queries. Accessed via
+ * upload/download, and the related MEX account queries. Accessed via
  * {@link WaClient.message}.
  */
 export class WaMessageCoordinator {
     private readonly messageDispatch: WaMessageDispatchCoordinator
     private readonly mediaTransfer: WaMediaTransferClient
+    private readonly mediaRetry: WaMediaRetryRequester
+    private readonly mediaUploadOptions: WaMediaMessageOptions
     private readonly logger: Logger
     private readonly messageStore: WaMessageStore
     private readonly messageSecretStore: WaMessageSecretStore
@@ -137,10 +297,14 @@ export class WaMessageCoordinator {
     private readonly emitAddon: (event: WaIncomingAddonEvent) => void
     private readonly mexSocket: WaMexQuerySocket
     private readonly peerDataOperation: PeerDataOperationRequester
+    private readonly isGroupHistorySendEnabled: () => boolean
+    private readonly getAbPropNumber: (name: WaAbPropName) => number
 
     public constructor(deps: WaMessageCoordinatorDeps) {
         this.messageDispatch = deps.messageDispatch
         this.mediaTransfer = deps.mediaTransfer
+        this.mediaRetry = deps.mediaRetry
+        this.mediaUploadOptions = deps.mediaUploadOptions
         this.logger = deps.logger
         this.messageStore = deps.messageStore
         this.messageSecretStore = deps.messageSecretStore
@@ -148,6 +312,8 @@ export class WaMessageCoordinator {
         this.emitAddon = deps.emitAddon
         this.mexSocket = deps.mexSocket
         this.peerDataOperation = deps.peerDataOperation
+        this.isGroupHistorySendEnabled = deps.isGroupHistorySendEnabled
+        this.getAbPropNumber = deps.getAbPropNumber
     }
 
     /**
@@ -167,15 +333,7 @@ export class WaMessageCoordinator {
         input: WaRequestHistorySyncInput
     ): Promise<{ readonly messageId: string }> {
         const chatJid = normalizeRecipientJid(input.chatJid)
-        if (input.count !== undefined) {
-            if (
-                !Number.isFinite(input.count) ||
-                !Number.isSafeInteger(input.count) ||
-                input.count <= 0
-            ) {
-                throw new Error(`invalid count: ${input.count}`)
-            }
-        }
+        const onDemandMsgCount = resolveOptionalPositive(input.count, 'count')
         if (input.oldestMsgTimestampMs !== undefined) {
             if (
                 !Number.isFinite(input.oldestMsgTimestampMs) ||
@@ -196,12 +354,191 @@ export class WaMessageCoordinator {
                 ...(input.oldestMsgTimestampMs === undefined
                     ? {}
                     : { oldestMsgTimestampMs: input.oldestMsgTimestampMs }),
-                ...(input.count === undefined ? {} : { onDemandMsgCount: input.count })
+                ...(onDemandMsgCount === undefined ? {} : { onDemandMsgCount })
             }
         return this.peerDataOperation.send(
             proto.Message.PeerDataOperationRequestType.HISTORY_SYNC_ON_DEMAND,
             { historySyncOnDemandRequest }
         )
+    }
+
+    /**
+     * Shares recent group history with members who joined after the fact - the
+     * counterpart of the `group_history_bundle` event on the receiving side.
+     *
+     * Sends two messages: the bundle itself, encrypted per device and fanned
+     * out **only** to `toJids` (never to the whole group), followed by a hidden
+     * notice addressed to everyone so other clients can render the "history was
+     * shared" marker.
+     *
+     * WhatsApp gates the sender side per account through the `group_history_send`
+     * AB-prop and rejects the stanza with SMAX_INVALID when it is off, so this
+     * throws up front rather than spending an upload. Admin-only groups
+     * (`memberShareGroupHistoryMode: 'admin_share'`) reject a share from a
+     * regular member server-side - read `client.group.queryGroupMetadata()`
+     * first if you want to check that too.
+     *
+     * @throws when the account is not allowed to share group history, when
+     * `groupJid` is not a group, when any of `toJids` is not a current member
+     * (or is this account), or when there is nothing to bundle.
+     * @example
+     * ```ts
+     * await client.message.shareGroupHistory('12036@g.us', {
+     *     toJids: ['5511999999999@s.whatsapp.net'],
+     *     count: 50
+     * })
+     * ```
+     */
+    public async shareGroupHistory(
+        groupJid: string,
+        input: WaShareGroupHistoryInput
+    ): Promise<WaShareGroupHistoryResult> {
+        const normalizedGroupJid = normalizeRecipientJid(groupJid)
+        if (!isGroupJid(normalizedGroupJid)) {
+            throw new Error(`shareGroupHistory requires a group jid: ${normalizedGroupJid}`)
+        }
+        if (input.toJids.length === 0) {
+            throw new Error('shareGroupHistory requires at least one recipient')
+        }
+        const messageLimit = resolvePositive(
+            input.count,
+            this.getAbPropNumber('group_history_message_count_limit'),
+            'count'
+        )
+        if (!this.isGroupHistorySendEnabled()) {
+            throw new Error(
+                'shareGroupHistory is disabled for this account (group_history_send is off)'
+            )
+        }
+
+        const audience = await this.messageDispatch.resolveGroupHistoryAudience(
+            normalizedGroupJid,
+            input.toJids
+        )
+        if (audience.requestedSelf) {
+            throw new Error('shareGroupHistory cannot share history with this account itself')
+        }
+        if (audience.unknownJids.length > 0) {
+            throw new Error(
+                `shareGroupHistory recipients are not members of the group (addressing mode: ${audience.addressingMode}): ${audience.unknownJids.join(', ')}`
+            )
+        }
+        if (audience.historyReceivers.length === 0) {
+            throw new Error('shareGroupHistory resolved no recipients')
+        }
+
+        const messages =
+            input.messages ??
+            (await this.loadGroupHistoryMessages(normalizedGroupJid, messageLimit, input.sinceMs))
+        if (messages.length === 0) {
+            throw new Error('shareGroupHistory found no messages to share')
+        }
+
+        const { compressed } = await encodeGroupHistoryBundle(
+            messages,
+            input.outOfWindowPinnedMessages
+        )
+        const upload = await uploadMedia(this.mediaUploadOptions, {
+            source: compressed,
+            cryptoType: 'group-history',
+            uploadPath: MEDIA_UPLOAD_PATHS['group-history'],
+            contentType: GROUP_HISTORY_BUNDLE_MIMETYPE,
+            sidecar: false,
+            logLabel: 'group history bundle upload'
+        })
+
+        const oldestInWindow = oldestTimestampSeconds(messages)
+        const oldestPin = oldestTimestampSeconds(input.outOfWindowPinnedMessages ?? [])
+        const oldestInBundle =
+            oldestPin === undefined
+                ? oldestInWindow
+                : oldestInWindow === undefined
+                  ? oldestPin
+                  : Math.min(oldestInWindow, oldestPin)
+        const metadata: Proto.Message.IMessageHistoryMetadata = {
+            historyReceivers: audience.historyReceivers as string[],
+            nonHistoryReceivers: audience.nonHistoryReceivers as string[],
+            messageCount: messages.length,
+            oldestMessageTimestampInWindow: oldestInWindow,
+            oldestMessageTimestampInBundle: oldestInBundle
+        }
+
+        const bundleResult = await this.send(normalizedGroupJid, {
+            messageHistoryBundle: {
+                mimetype: GROUP_HISTORY_BUNDLE_MIMETYPE,
+                fileSha256: upload.fileSha256,
+                fileEncSha256: upload.fileEncSha256,
+                mediaKey: upload.mediaKey,
+                directPath: upload.directPath,
+                mediaKeyTimestamp: this.mediaUploadOptions.serverClock.nowSeconds(),
+                messageHistoryMetadata: metadata
+            }
+        })
+
+        let noticeMessageId: string | undefined
+        try {
+            noticeMessageId = (
+                await this.send(normalizedGroupJid, {
+                    messageHistoryNotice: { messageHistoryMetadata: metadata }
+                })
+            ).id
+        } catch (error) {
+            this.logger.warn('group history notice failed after the bundle was delivered', {
+                groupJid: normalizedGroupJid,
+                id: bundleResult.id,
+                receiverCount: audience.historyReceivers.length,
+                message: toError(error).message
+            })
+        }
+
+        this.logger.debug('shared group history', {
+            groupJid: normalizedGroupJid,
+            id: bundleResult.id,
+            messagesCount: messages.length,
+            receiverCount: audience.historyReceivers.length
+        })
+
+        return {
+            bundleMessageId: bundleResult.id,
+            noticeMessageId,
+            messagesCount: messages.length,
+            historyReceivers: audience.historyReceivers,
+            nonHistoryReceivers: audience.nonHistoryReceivers
+        }
+    }
+
+    /**
+     * Reads the most recent messages of a group back out of the mailbox store
+     * and rebuilds the `WebMessageInfo` shape a bundle carries. Yields nothing
+     * when the `messages` store domain is `'none'`.
+     */
+    private async loadGroupHistoryMessages(
+        groupJid: string,
+        limit: number,
+        sinceMs?: number
+    ): Promise<readonly Proto.IWebMessageInfo[]> {
+        const records = await this.messageStore.listByThread(groupJid, limit)
+        const messages: Proto.IWebMessageInfo[] = []
+        for (let index = 0; index < records.length; index += 1) {
+            const record = records[index]
+            if (!record.messageBytes) {
+                continue
+            }
+            if (sinceMs !== undefined && (record.timestampMs ?? 0) < sinceMs) {
+                continue
+            }
+            messages[messages.length] = {
+                key: {
+                    id: record.id,
+                    remoteJid: groupJid,
+                    fromMe: record.fromMe,
+                    participant: record.participantJid ?? record.senderJid
+                },
+                message: proto.Message.decode(record.messageBytes),
+                messageTimestamp: Math.floor((record.timestampMs ?? 0) / 1_000)
+            }
+        }
+        return messages
     }
 
     /**
@@ -370,6 +707,62 @@ export class WaMessageCoordinator {
     }
 
     /**
+     * Encrypts and uploads standalone media to the WhatsApp CDN and returns the
+     * reusable descriptor, without sending a message - pre-upload once and
+     * reference it across sends, or build custom protos. Needs a connected
+     * session (the host token comes from a `media_conn` IQ). `source` is bytes,
+     * a file path, or a `Readable`. To send the result, spread its fields onto
+     * the matching proto message and pass that to {@link send}.
+     *
+     * @throws when `source` is unsupported, the file is unreadable, or the upload fails.
+     * @example
+     * ```ts
+     * const media = await client.message.upload(await readFile('photo.jpg'), {
+     *     type: 'image',
+     *     mimetype: 'image/jpeg'
+     * })
+     * await client.message.send(jid, {
+     *     imageMessage: {
+     *         url: media.url,
+     *         directPath: media.directPath,
+     *         mediaKey: media.mediaKey,
+     *         fileSha256: media.fileSha256,
+     *         fileEncSha256: media.fileEncSha256,
+     *         fileLength: media.fileLength,
+     *         mediaKeyTimestamp: media.mediaKeyTimestamp,
+     *         mimetype: media.mimetype
+     *     }
+     * })
+     * ```
+     */
+    public async upload(
+        source: WaUploadMediaSource,
+        options: WaUploadMediaOptions
+    ): Promise<WaMediaUploadResult> {
+        const uploadPath = MEDIA_UPLOAD_PATHS[options.type as keyof typeof MEDIA_UPLOAD_PATHS]
+        if (!uploadPath) {
+            throw new Error(`unknown media upload type: ${String(options.type)}`)
+        }
+        const result = await uploadMedia(this.mediaUploadOptions, {
+            source: await normalizeUploadSource(source),
+            cryptoType: options.type,
+            uploadPath,
+            contentType: options.mimetype,
+            mediaKey: options.mediaKey,
+            sidecar: options.sidecar ?? SIDECAR_UPLOAD_TYPES.has(options.type),
+            firstFrameLength: options.firstFrameLength,
+            timeoutMs: options.timeoutMs,
+            signal: options.signal,
+            logLabel: 'user media upload'
+        })
+        return {
+            ...result,
+            mediaKeyTimestamp: this.mediaUploadOptions.serverClock.nowSeconds(),
+            mimetype: options.mimetype
+        }
+    }
+
+    /**
      * Resolves the media payload inside `source` and returns a `Readable`
      * stream of the decrypted bytes. Throws when the message has no
      * downloadable media.
@@ -414,6 +807,81 @@ export class WaMessageCoordinator {
     ): Promise<Uint8Array> {
         const stream = await this.download(source, options)
         return readAllBytes(stream, { maxBytes: options.maxBytes })
+    }
+
+    /**
+     * Asks the sender's primary device to re-upload a message's media, for when
+     * the CDN answers `404`/`410` because the blob expired - typically old
+     * media surfaced by a history sync. Sends a `server-error` receipt carrying
+     * the sealed request and resolves once the server answers with a
+     * `mediaretry` notification, usually within a couple of seconds.
+     *
+     * On `result: 'success'` only the `directPath` changes - the media key,
+     * hashes, and length of the original message stay valid, so patch the path
+     * into the message and download again. A second call for a message already
+     * in flight joins the first request instead of sending another receipt.
+     *
+     * The other three `result` values are answers too, not thrown errors:
+     * `not_found` means the sender no longer holds the file and nothing can
+     * recover it, `decryption_error` that it could not open its own copy, and
+     * `general_error` anything else including a result code this version does
+     * not recognize.
+     *
+     * Requires the message's media key, so it only works for media you received
+     * or sent, never for a bare message id. Newsletter messages are rejected -
+     * channel media has no per-message key to seal the request with. Pass an
+     * explicit `WaMediaRetryRequest` instead of an event when you hold the
+     * message id, chat jid, and media key but not the decoded message.
+     *
+     * @throws when the message carries no downloadable media, is a newsletter
+     * message, the session is not paired, the stanza cannot be sent, or no
+     * notification arrives before `options.timeoutMs`. It does **not** throw on
+     * a `not_found` / `general_error` answer - check `result`.
+     * @example
+     * ```ts
+     * const image = event.message?.imageMessage
+     * try {
+     *     return await client.message.downloadBytes(event)
+     * } catch {
+     *     const retry = await client.message.requestMediaReupload(event)
+     *     if (retry.result !== 'success') throw new Error(`reupload ${retry.result}`)
+     *     return await client.message.downloadBytes({
+     *         imageMessage: { ...image, directPath: retry.directPath }
+     *     })
+     * }
+     * ```
+     */
+    public requestMediaReupload(
+        event: WaIncomingMessageEvent,
+        options?: { readonly timeoutMs?: number }
+    ): Promise<WaMediaRetryResult>
+    public requestMediaReupload(request: WaMediaRetryRequest): Promise<WaMediaRetryResult>
+    public requestMediaReupload(
+        source: WaIncomingMessageEvent | WaMediaRetryRequest,
+        options?: { readonly timeoutMs?: number }
+    ): Promise<WaMediaRetryResult> {
+        if (!('key' in source)) {
+            return this.mediaRetry.request(source)
+        }
+        const key = source.key
+        if (!key.id || !key.remoteJid) {
+            throw new Error('requestMediaReupload event is missing key.remoteJid or key.id')
+        }
+        if (key.isNewsletter) {
+            throw new Error('requestMediaReupload is not supported on newsletter messages')
+        }
+        const payload = resolveMediaPayload(source.message)
+        if (!payload) {
+            throw new Error('message has no downloadable media')
+        }
+        return this.mediaRetry.request({
+            messageId: key.id,
+            chatJid: key.remoteJid,
+            mediaKey: payload.mediaKey,
+            fromMe: key.fromMe,
+            participant: key.participant,
+            timeoutMs: options?.timeoutMs
+        })
     }
 
     /**
@@ -466,20 +934,40 @@ export class WaMessageCoordinator {
             return
         }
 
-        const parentMsgOriginalSender = parentEntry.senderJid
-        const modificationSender = event.key.participant ?? event.key.remoteJid
+        const modificationSenderRaw = event.key.participant ?? event.key.remoteJid
+        if (!modificationSenderRaw) return
 
-        const plaintext = await decryptAddonPayload({
+        const modificationSenderCandidates = collectUniqueUserJids(
+            event.key.fromMe ? event.rawNode.attrs.from : undefined,
+            modificationSenderRaw,
+            event.key.participantAlt,
+            event.key.remoteJidAlt,
+            event.rawNode.attrs.participant_pn,
+            event.rawNode.attrs.sender_pn,
+            event.rawNode.attrs.participant,
+            event.key.isGroup ? undefined : event.rawNode.attrs.from
+        )
+
+        const keyParentSender = resolveAddonParentSenderFromKey(
+            addon.targetMessageKey,
+            event.key.isGroup
+        )
+        const parentMsgOriginalSenderCandidates = collectUniqueUserJids(
+            keyParentSender,
+            parentEntry.senderJid
+        )
+        const senderPairs = buildAddonSenderPairs({
+            parentCandidates: parentMsgOriginalSenderCandidates,
+            modificationCandidates: modificationSenderCandidates
+        })
+
+        const plaintext = await decryptAddonPayloadWithSenderFallback({
             messageSecret: parentEntry.secret,
             stanzaId: targetMessageId,
-            parentMsgOriginalSender,
-            modificationSender,
+            senderPairs,
             modificationType: addon.modificationType,
             ciphertext: addon.encPayload,
-            iv: addon.encIv,
-            additionalData: shouldUseAddonAdditionalData(addon.modificationType)
-                ? buildAddonAdditionalData(targetMessageId, modificationSender)
-                : undefined
+            iv: addon.encIv
         })
 
         let decrypted = decodeAddonPlaintext(addon.kind, plaintext)

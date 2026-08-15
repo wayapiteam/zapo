@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { resolveAbPropNameByCode, WA_ABPROPS } from '@abprops-spec'
 import { WA_APPSTATE_SCHEMAS } from '@appstate-spec'
-import { AB_PROP_CONFIGS, resolveAbPropNameByCode } from '@protocol/abprops'
+import { AB_PROP_CONFIGS } from '@protocol/abprops'
 import { WA_BOT_KNOWN_JIDS, WA_BOT_MSG_EDIT_TYPES, WA_BOT_NODE_ATTRS } from '@protocol/bot'
 import {
     getWaCompanionPlatformId,
@@ -10,6 +11,7 @@ import {
     WA_COMPANION_PLATFORM_IDS,
     WA_DEFAULTS,
     WA_MEDIA_HKDF_INFO,
+    WA_PRIVACY_ACCOUNT_SYNC_DISALLOWED_LISTS,
     WA_PRIVACY_CATEGORIES,
     WA_PRIVACY_CATEGORY_TO_SETTING,
     WA_PRIVACY_DISALLOWED_LIST_CATEGORIES,
@@ -44,6 +46,7 @@ import type {
     WaPrivacyDisallowedListSettingName,
     WaPrivacySettingValueMap
 } from '@protocol/privacy'
+import { TEXT_DECODER } from '@util/bytes'
 
 test('canonicalizeOwnAccountJid maps own PN device JIDs to LID', () => {
     const meJid = '5512988950329:15@s.whatsapp.net'
@@ -90,6 +93,38 @@ test('jid split and normalization helpers', () => {
     assert.throws(() => parsePhoneJid('()'), /phone number is empty/)
 })
 
+test('jid parsing interns known servers and passes unknown ones through', () => {
+    assert.strictEqual(splitJid('123@s.whatsapp.net').server, WA_DEFAULTS.HOST_DOMAIN)
+    assert.strictEqual(splitJid('123@lid').server, WA_DEFAULTS.LID_SERVER)
+    assert.strictEqual(parseSignalAddressFromJid('120@g.us').server, WA_DEFAULTS.GROUP_SERVER)
+    assert.strictEqual(
+        parseSignalAddressFromJid('123:4@hosted.lid').server,
+        WA_DEFAULTS.HOSTED_LID_SERVER
+    )
+
+    assert.equal(splitJid('123@lid.example').server, 'lid.example')
+    assert.equal(splitJid('123@li').server, 'li')
+    assert.equal(parseSignalAddressFromJid('123:2@custom').server, 'custom')
+})
+
+test('toUserJid returns the input verbatim only when the rewrite is a no-op', () => {
+    const canonical = { canonicalizeSignalServer: true }
+
+    const lid = '5511900000123@lid'
+    const pn = '5511900000123@s.whatsapp.net'
+    assert.strictEqual(toUserJid(lid, canonical), lid)
+    assert.strictEqual(toUserJid(pn, canonical), pn)
+    assert.strictEqual(toUserJid(lid), lid)
+
+    assert.equal(toUserJid('5511900000123:0@lid', canonical), '5511900000123@lid')
+    assert.equal(toUserJid('5511900000123:0@lid'), '5511900000123@lid')
+
+    assert.equal(toUserJid('5511900000123:4@lid', canonical), '5511900000123@lid')
+    assert.equal(toUserJid('5511900000123@hosted', canonical), '5511900000123@s.whatsapp.net')
+    assert.equal(toUserJid('5511900000123@hosted.lid', canonical), '5511900000123@lid')
+    assert.equal(toUserJid('5511900000123:2@hosted', canonical), '5511900000123@s.whatsapp.net')
+})
+
 test('jid type detection and device handling', () => {
     assert.equal(isGroupJid('123@g.us'), true)
     assert.equal(isBroadcastJid('abc@broadcast'), true)
@@ -119,6 +154,13 @@ test('jid type detection and device handling', () => {
     assert.equal(isOwnAccountJid('1330@lid', '5511@s.whatsapp.net', '1330@lid'), true)
     assert.equal(isOwnAccountJid('5599@s.whatsapp.net', '5511@s.whatsapp.net', '1330@lid'), false)
     assert.equal(isOwnAccountJid('5511@s.whatsapp.net', null, null), false)
+
+    // A hosted device of the account is the account (wa-web isSameAccountAndAddressingMode).
+    assert.equal(isOwnAccountJid('1330:99@hosted.lid', '5511@s.whatsapp.net', '1330@lid'), true)
+    assert.equal(isOwnAccountJid('5511:99@hosted', '5511@s.whatsapp.net', '1330@lid'), true)
+    assert.equal(isOwnAccountJid('1330:99@hosted.lid', '5511@s.whatsapp.net', null), false)
+    assert.equal(isOwnAccountJid('9999:99@hosted.lid', '5511@s.whatsapp.net', '1330@lid'), false)
+    assert.equal(isOwnAccountJid('1330@lid', '5511:99@hosted', '1330:99@hosted.lid'), true)
 
     assert.equal(normalizeDeviceJid('5511:0@s.whatsapp.net'), '5511@s.whatsapp.net')
     assert.equal(normalizeDeviceJid('5511:5@s.whatsapp.net'), '5511:5@s.whatsapp.net')
@@ -152,6 +194,13 @@ test('jid type detection and device handling', () => {
     assert.equal(isHostedDeviceJid('5511:99@hosted.lid'), true)
     assert.equal(isHostedDeviceJid('5511:99@lid'), true)
     assert.equal(isHostedDeviceJid('5511:1@lid'), false)
+    // Detected by server alone, and malformed shapes still rejected.
+    assert.equal(isHostedDeviceJid('5511@hosted'), true)
+    assert.equal(isHostedDeviceJid('5511@hosted.lid'), true)
+    assert.equal(isHostedDeviceJid('a@b@hosted'), false)
+    assert.equal(isHostedDeviceJid('@hosted'), false)
+    assert.equal(isHostedDeviceJid('5511@hostedd'), false)
+    assert.equal(isHostedDeviceJid('5511@hosted.li'), false)
 
     assert.equal(
         buildDeviceJid('6116570308623', 'lid', 99, {
@@ -187,6 +236,8 @@ test('login identity parsing and protocol constants', () => {
     )
 
     assert.equal(getWaMediaHkdfInfo('image'), WA_MEDIA_HKDF_INFO.image)
+    assert.equal(TEXT_DECODER.decode(getWaMediaHkdfInfo('group-history')), 'Group History')
+    assert.equal(TEXT_DECODER.decode(getWaMediaHkdfInfo('history')), 'WhatsApp History Keys')
     assert.equal(typeof WA_DEFAULTS.HOST_DOMAIN, 'string')
     assert.equal(WA_APPSTATE_SCHEMAS.Star.name, 'star')
     assert.equal(WA_APPSTATE_SCHEMAS.Mute.name, 'mute')
@@ -199,7 +250,9 @@ test('privacy protocol constants keep mapping invariants', () => {
         about: true,
         groupAdd: true,
         lastSeen: true,
-        profilePicture: true
+        profilePicture: true,
+        linkedProfiles: true,
+        pix: true
     }
     const validGroupAddValue: WaPrivacySettingValueMap['groupAdd'] = 'contact_blacklist'
     void disallowedSettingsTypeCheck
@@ -212,32 +265,59 @@ test('privacy protocol constants keep mapping invariants', () => {
     const disallowedSettings = Object.values(WA_PRIVACY_DISALLOWED_LIST_CATEGORIES).map(
         (category) => WA_PRIVACY_CATEGORY_TO_SETTING[category]
     )
-    assert.deepEqual(disallowedSettings.sort(), ['about', 'groupAdd', 'lastSeen', 'profilePicture'])
+    assert.deepEqual(disallowedSettings.sort(), [
+        'about',
+        'groupAdd',
+        'lastSeen',
+        'linkedProfiles',
+        'pix',
+        'profilePicture'
+    ])
+    assert.deepEqual(WA_PRIVACY_ACCOUNT_SYNC_DISALLOWED_LISTS, [
+        'about',
+        'groupAdd',
+        'lastSeen',
+        'profilePicture'
+    ])
 })
 
-test('ab props keep protocol-specific group and trusted-contact mappings', () => {
+test('ab props expose the group and trusted-contact configs the client reads', () => {
+    assert.equal(WA_ABPROPS.group_size_limit.code, 1304)
+    assert.equal(WA_ABPROPS.group_size_limit.type, 'int')
+    assert.equal(WA_ABPROPS.community_announcement_group_size_limit.code, 2774)
+    assert.equal(WA_ABPROPS.tctoken_duration.code, 865)
+    assert.equal(WA_ABPROPS.tctoken_duration_sender.code, 996)
+
+    assert.equal(resolveAbPropNameByCode(1304), 'group_size_limit')
+    assert.equal(resolveAbPropNameByCode(2774), 'community_announcement_group_size_limit')
+    assert.equal(resolveAbPropNameByCode(865), 'tctoken_duration')
+    assert.equal(resolveAbPropNameByCode(996), 'tctoken_duration_sender')
+})
+
+test('ab props reverse map drops codes this bundle does not know', () => {
+    assert.equal(resolveAbPropNameByCode(0), undefined)
+    assert.equal(resolveAbPropNameByCode(Number.MAX_SAFE_INTEGER), undefined)
+})
+
+test('deprecated AB_PROP_CONFIGS view still exposes configCode over the spec table', () => {
     assert.deepEqual(AB_PROP_CONFIGS.group_size_limit, {
         configCode: 1304,
         type: 'int',
         defaultValue: 257
     })
-    assert.deepEqual(AB_PROP_CONFIGS.community_announcement_group_size_limit, {
-        configCode: 2774,
-        type: 'int',
-        defaultValue: 5000
-    })
     assert.deepEqual(AB_PROP_CONFIGS.tctoken_duration, {
         configCode: 865,
         type: 'int',
-        defaultValue: 604800
+        defaultValue: 604_800
     })
-    assert.deepEqual(AB_PROP_CONFIGS.tctoken_duration_sender, {
-        configCode: 996,
-        type: 'int',
-        defaultValue: 604800
+    assert.deepEqual(AB_PROP_CONFIGS.wa_web_contact_and_chat_fuzzy_search_distance_threshold, {
+        configCode: 26731,
+        type: 'float',
+        defaultValue: 0.30000001192092896
     })
-    assert.equal(resolveAbPropNameByCode(1304), 'group_size_limit')
-    assert.equal(resolveAbPropNameByCode(2774), 'community_announcement_group_size_limit')
-    assert.equal(resolveAbPropNameByCode(865), 'tctoken_duration')
-    assert.equal(resolveAbPropNameByCode(996), 'tctoken_duration_sender')
+    assert.deepEqual(
+        Object.keys(AB_PROP_CONFIGS).sort(),
+        Object.keys(WA_ABPROPS).sort(),
+        'the compatibility view must cover the whole catalogue'
+    )
 })

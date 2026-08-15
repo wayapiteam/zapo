@@ -1,0 +1,65 @@
+{
+    "name": "@zapo-js/native",
+    "version": "0.1.0",
+    "description": "Native accelerators for zapo-js (Rust NAPI addon + WASM fallback)",
+    "license": "MIT",
+    "author": "vinikjkkj <contact@vinicius.email> (https://github.com/vinikjkkj)",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/vinikjkkj/zapo.git",
+        "directory": "packages/native"
+    },
+    "keywords": [
+        "zapo",
+        "napi",
+        "wasm",
+        "x25519",
+        "xeddsa",
+        "curve25519",
+        "crypto"
+    ],
+    "types": "binding.d.ts",
+    "exports": {
+        ".": {
+            "types": "./binding.d.ts",
+            "default": "./binding.js"
+        },
+        "./wasm/*": "./wasm/*"
+    },
+    "files": [
+        "wasm/pkg"
+    ],
+    "publishConfig": {
+        "access": "public"
+    },
+    "peerDependencies": {
+        "zapo-js": "^1.7.0"
+    },
+    "peerDependenciesMeta": {
+        "zapo-js": {
+            "optional": true
+        }
+    },
+    "engines": {
+        "node": ">=20.19.0"
+    },
+    "napi": {
+        "binaryName": "zapo-native",
+        "targets": [
+            "x86_64-pc-windows-msvc",
+            "x86_64-unknown-linux-gnu",
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin"
+        ]
+    },
+    "scripts": {
+        "build:napi": "napi build --platform --release --js binding.js --dts binding.d.ts",
+        "build:napi:debug": "napi build --platform --js binding.js --dts binding.d.ts",
+        "build:wasm": "cargo build -p zapo-native-wasm --release --target wasm32-unknown-unknown --target-dir target && wasm-bindgen --target web --out-dir wasm/pkg target/wasm32-unknown-unknown/release/zapo_native_wasm.wasm && node -e \"require('node:fs').writeFileSync('wasm/pkg/package.json', JSON.stringify({ type: 'module' }) + '\\n')\""
+    },
+    "devDependencies": {
+        "@napi-rs/cli": "^3.0.0"
+    }
+}

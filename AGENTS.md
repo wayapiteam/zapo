@@ -52,6 +52,7 @@ zapo/
 ├── src/                # Core library source (zapo-js)
 │   ├── index.ts        # public API barrel
 │   ├── proto.ts        # bridge to ../spec/proto (only ../ import allowed)
+│   ├── abprops-spec.ts # bridge to ../spec/abprops (AB prop catalogue + code reverse map)
 │   ├── appstate-spec.ts # bridge to ../spec/appstate (app-state schema descriptors)
 │   ├── mex.ts          # bridge to ../spec/mex (MEX GraphQL operation types)
 │   ├── __tests__/      # structural test coverage checks
@@ -77,6 +78,7 @@ zapo/
 │       ├── tsconfig.build.cjs.json
 │       └── tsconfig.build.esm.json
 ├── spec/               # Vendored protocol spec from vinikjkkj/wa-spec
+│   ├── abprops/        # AB prop catalogue (imported by src/abprops-spec.ts)
 │   ├── proto/          # WAProto.proto + compiled output (imported by src/proto.ts)
 │   ├── appstate/       # app-state schema descriptors (imported by src/appstate-spec.ts)
 │   ├── mex/            # MEX GraphQL operation types (imported by src/mex.ts)
@@ -138,6 +140,7 @@ Use aliases for cross-domain imports:
 - `@appstate`, `@auth`, `@client`, `@crypto`, `@media`, `@message`, `@protocol`, `@retry`, `@signal`, `@store`, `@transport`
 - deep imports are available via `@module/*`
 - `@proto` maps to `src/proto.ts` (re-exports `../spec/proto`)
+- `@abprops-spec` maps to `src/abprops-spec.ts` (re-exports `../spec/abprops` – the full `WA_ABPROPS` / `WA_GROUP_ABPROPS` catalogue plus `resolveAbPropNameByCode`)
 - `@appstate-spec` maps to `src/appstate-spec.ts` (re-exports `../spec/appstate` + adds typed helpers)
 - `@mex` maps to `src/mex.ts` (re-exports `../spec/mex` operation types)
 - `@version-spec` maps to `src/version-spec.ts` (re-exports `../spec/version` – `WA_VERSION` is the WA Web version string used by the noise payload builders)
@@ -166,9 +169,9 @@ Coordinators, types, helpers, and other internal symbols should always be import
 Relative imports are allowed only for explicit local bridging patterns already used in the codebase:
 
 - same-folder internal helpers (example: `src/util/coercion.ts` importing `./bytes`)
-- `src/proto.ts`, `src/appstate-spec.ts`, `src/mex.ts`, and
-  `src/version-spec.ts` bridging to the vendored `../spec/` folder (the
-  only `../` imports allowed in `src/`)
+- `src/proto.ts`, `src/abprops-spec.ts`, `src/appstate-spec.ts`,
+  `src/mex.ts`, and `src/version-spec.ts` bridging to the vendored
+  `../spec/` folder (the only `../` imports allowed in `src/`)
 
 Do not add new cross-module `../` import chains.
 
@@ -475,6 +478,25 @@ Default providers (when no `providers` entry is set):
 - mailbox domains (`messages`, `threads`, `contacts`) → `'none'`
 - cache domains (`retry`, `groupMetadata`, `deviceList`, `messageSecret`)
   → `'memory'`
+
+A backend does not have to cover the whole matrix. `WaStoreBackend<S, C>`
+defaults both parameters to "every domain" (what the in-tree `store-*`
+packages ship), and a partial backend names its own:
+
+```ts
+const vault = {
+    stores: { auth: (sessionId: string) => new MyAuthStore(sessionId) },
+    caches: {}
+} satisfies WaStoreBackend<'auth', never>
+```
+
+`createStore()` infers the backend map, so each domain only accepts the
+backends that declare it – naming `vault` on `signal` is a compile error
+instead of the `does not provide stores.signal` throw on first `session()`.
+Coverage of `providers` itself is unchanged: with any backend registered,
+all 11 persistence domains stay mandatory. Use `WaAnyStoreBackend` only as
+a constraint for an unknown backend; as an annotation it vouches for no
+domain, so nothing can name it.
 
 SQLite provider rules (live in [`@zapo-js/store-sqlite`](packages/store-sqlite)):
 
@@ -837,18 +859,18 @@ The full description, schema, and examples are inlined on each tool – agents s
 
 ### Dev loop
 
-**Recommended (HTTP + `node --watch`, zero manual reconnect):**
+**Recommended (HTTP + watch runner, zero manual reconnect):**
 
 ```bash
 claude mcp add zapo --scope user --transport http http://127.0.0.1:3737/mcp
 npm run dev --workspace @zapo-js/mcp-server
 ```
 
-The `dev` script runs the server under `node --watch --import tsx` on HTTP (port 3737). `tsx` resolves `zapo-js` directly from `<root>/src/` via `packages/tsconfig.paths.json`, so iterating on the core lib needs no rebuild. Edit any `.ts` in `src/` (root or mcp-server) → `node --watch` restarts the process → the next tool call from Claude Code re-establishes the HTTP session automatically. No `/mcp` manual reconnect.
+The `dev` script runs the server under `scripts/dev-watch.cjs`, which spawns `node --import tsx src/bin.ts` on HTTP (port 3737) and respawns it when a watched source actually changes. `tsx` resolves `zapo-js` directly from `<root>/src/` via `packages/tsconfig.paths.json`, so iterating on the core lib needs no rebuild. Edit any `.ts` under the watched trees (`<root>/src`, `<root>/packages` and `<root>/spec`, so the core, every optional package and the vendored spec bridges) → the runner restarts the process and names the file that triggered it → the next tool call from Claude Code re-establishes the HTTP session automatically. No `/mcp` manual reconnect. Generated and non-runtime folders are ignored: `node_modules`, `dist`, `target`, `__tests__`, `__test__`, `bench`, `.turbo` and `coverage`.
 
 The script also sets `MCP_AUTH_PATH=../../.auth/state.sqlite`, so the MCP shares the credential store with `test/example.cjs` (no re-pairing).
 
-> Why `node --watch` and not `tsx watch`: `tsx watch` has known issues detecting changes in nested imports on Windows. `node --watch` (Node 20+) tracks the import graph reliably across platforms while `tsx` continues to handle TS transpilation as a loader.
+> Why a custom runner and not `node --watch`: on Windows libuv subscribes `fs.watch` to `FILE_NOTIFY_CHANGE_LAST_ACCESS`, so merely **reading** a file emits a change event once NTFS flushes a new last-access time (module load, test run, editor indexing, grep). `node --watch` restarts on any event for a file in its module graph without checking whether the file was written at all, which makes the server restart on the first lazy import - `better-sqlite3`, loaded on the first `connect()` - and whenever another tool walks the tree. `scripts/dev-watch.cjs` keeps the same event source and compares mtime + size before restarting, so last-access-only events are dropped. `tsx watch` is not the answer either: it has known issues detecting changes in nested imports on Windows. `tsx` stays as the transpilation loader in every case.
 
 **Stdio fallback (manual reconnect):**
 
@@ -872,6 +894,7 @@ After editing source: rebuild → call `restart` with `mode: "process_exit"` →
 | `MCP_EVENT_BUFFER_SIZE`                                                        | `1000`                        | in-memory event ring size                             |
 | `MCP_CAPTURE_TRANSPORT`                                                        | `0`                           | also buffer noisy `transport_*` events                |
 | `MCP_HISTORY_DISABLED`                                                         | `0`                           | disable history sync on connect                       |
+| `MCP_GROUP_BUNDLES`                                                            | `0`                           | download group-history bundles shared by members      |
 | `MCP_TRANSPORT`                                                                | `stdio`                       | `stdio` or `http` (StreamableHTTPServerTransport)     |
 | `MCP_HTTP_HOST` / `MCP_HTTP_PORT` / `MCP_HTTP_PATH`                            | `127.0.0.1` / `3737` / `/mcp` | HTTP listener config                                  |
 | `MCP_FAKE_NOISE_PUBKEY_HEX` + `MCP_FAKE_NOISE_SERIAL` + `MCP_CHAT_SOCKET_URLS` | unset                         | point at `@zapo-js/fake-server` for tests             |
@@ -882,7 +905,7 @@ After editing source: rebuild → call `restart` with `mode: "process_exit"` →
 - One process can run many sessions over one shared store: pass `session` to any tool (default `MCP_SESSION_ID`), bounded by `MCP_MAX_SESSIONS`. All sessions share the one `MCP_AUTH_PATH` backend. Running separate processes is only needed when you want isolated stores/auth files.
 - `WaClient` has no auto-reconnect. On `connection: close`, call `connect` again manually (per session).
 - `restart` (soft) does NOT pick up code changes; `process_exit` + reconnect does.
-- `node --watch` is not a full supervisor: it restarts on file changes only. `process_exit` from the `restart` tool kills the watcher too – under HTTP+watch, just edit a file to reload instead.
+- The watch runner is not a full supervisor: it restarts on file changes only, and waits for the next change if the child exits on its own. `process_exit` from the `restart` tool kills the child, and the runner will not respawn it until something changes – under HTTP+watch, just edit a file to reload instead.
 
 ---
 

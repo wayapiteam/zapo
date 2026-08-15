@@ -179,7 +179,9 @@ function buildPlaceholderContext(
     }
 }
 
-function createPlaceholderHarness(): PlaceholderHarness {
+function createPlaceholderHarness(
+    options: { readonly maxAgeDays?: number; readonly meJid?: string } = {}
+): PlaceholderHarness {
     const captured: PlaceholderHarness['captured'] = []
     const emitted: WaIncomingMessageEvent[] = []
     const pendingResolvers: Array<
@@ -209,9 +211,11 @@ function createPlaceholderHarness(): PlaceholderHarness {
         signalMissingPreKeysSync: {} as never,
         messageClient: {} as never,
         sendNode: async () => undefined,
-        getCurrentCredentials: () => null,
+        getCurrentCredentials: () =>
+            options.meJid === undefined ? null : ({ meJid: options.meJid } as never),
         peerDataOperation,
-        emitIncomingMessage: (event) => emitted.push(event)
+        emitIncomingMessage: (event) => emitted.push(event),
+        getAbPropNumber: options.maxAgeDays === undefined ? undefined : () => options.maxAgeDays!
     })
     const internals = coordinator as unknown as {
         enqueuePlaceholderResend: (context: WaRetryDecryptFailureContext) => boolean
@@ -304,6 +308,135 @@ test('placeholder resend: drops items older than the max age window', async () =
     await flushPromise
     assert.equal(harness.captured.length, 1)
     assert.equal(harness.captured[0].length, 1)
+})
+
+test('placeholder resend: honours the ab-prop age window', async () => {
+    const harness = createPlaceholderHarness({ maxAgeDays: 1 })
+    const twoDaysAgoSeconds = Math.trunc(Date.now() / 1000) - 2 * 24 * 60 * 60
+    harness.enqueue(
+        buildPlaceholderContext({
+            stanzaId: 'past-window',
+            t: String(twoDaysAgoSeconds)
+        })
+    )
+    harness.enqueue(buildPlaceholderContext({ stanzaId: 'within-window' }))
+    const flushPromise = harness.flush()
+    harness.resolveNext([])
+    await flushPromise
+    assert.equal(harness.captured.length, 1)
+    assert.equal(harness.captured[0].length, 1)
+    assert.equal(
+        (harness.captured[0][0] as { messageKey?: { id?: string } }).messageKey?.id,
+        'within-window'
+    )
+})
+
+test('placeholder resend: keys a self-sent 1:1 message by the recipient chat', async () => {
+    const harness = createPlaceholderHarness({ meJid: '5511999999999@s.whatsapp.net' })
+    harness.enqueue(
+        buildPlaceholderContext({
+            stanzaId: 'self-1',
+            from: '5511999999999:12@s.whatsapp.net',
+            messageNode: {
+                tag: 'message',
+                attrs: { recipient: '5511777777777@s.whatsapp.net' }
+            }
+        })
+    )
+    const flushPromise = harness.flush()
+    harness.resolveNext([])
+    await flushPromise
+    const key = (harness.captured[0][0] as { messageKey?: Record<string, unknown> }).messageKey
+    assert.equal(key?.remoteJid, '5511777777777@s.whatsapp.net')
+    assert.equal(key?.fromMe, true)
+})
+
+test('placeholder resend: strips device segments from group keys', async () => {
+    const harness = createPlaceholderHarness({ meJid: '5511999999999@s.whatsapp.net' })
+    harness.enqueue(
+        buildPlaceholderContext({
+            stanzaId: 'grp-1',
+            from: '120363000000000000@g.us',
+            participant: '5511777777777:5@s.whatsapp.net'
+        })
+    )
+    harness.enqueue(
+        buildPlaceholderContext({
+            stanzaId: 'grp-2',
+            from: '120363000000000000@g.us',
+            participant: '5511999999999:5@s.whatsapp.net'
+        })
+    )
+    const flushPromise = harness.flush()
+    harness.resolveNext([])
+    await flushPromise
+    const [incoming, own] = harness.captured[0] as Array<{
+        messageKey?: Record<string, unknown>
+    }>
+    assert.equal(incoming.messageKey?.remoteJid, '120363000000000000@g.us')
+    assert.equal(incoming.messageKey?.participant, '5511777777777@s.whatsapp.net')
+    // wa-web omits the participant once the key is from-me.
+    assert.equal(own.messageKey?.fromMe, true)
+    assert.equal(own.messageKey?.participant, undefined)
+})
+
+test('unavailable message: requests a resend for a plain fanout placeholder', async () => {
+    const harness = createPlaceholderHarness()
+    const queued = harness.coordinator.onUnavailableMessage(
+        buildPlaceholderContext({
+            stanzaId: 'fanout-1',
+            from: '551122223333@s.whatsapp.net',
+            messageNode: {
+                tag: 'message',
+                attrs: { id: 'fanout-1' },
+                content: [{ tag: 'unavailable', attrs: {} }]
+            }
+        })
+    )
+    assert.equal(queued, true)
+    const flushPromise = harness.flush()
+    harness.resolveNext([
+        {
+            placeholderMessageResendResponse: {
+                webMessageInfoBytes: makeWebMessageInfoBytes(
+                    'fanout-1',
+                    '551122223333@s.whatsapp.net'
+                )
+            }
+        }
+    ])
+    await flushPromise
+    assert.equal(harness.captured.length, 1)
+    assert.equal(harness.emitted.length, 1)
+    assert.equal(harness.emitted[0].key.id, 'fanout-1')
+    assert.equal(harness.emitted[0].message?.conversation, 'recovered')
+})
+
+test('unavailable message: skips bot, hosted and view-once placeholders', () => {
+    const harness = createPlaceholderHarness()
+    const buildUnavailable = (unavailableAttrs: Record<string, string>, bot = false) =>
+        buildPlaceholderContext({
+            stanzaId: `skip-${JSON.stringify(unavailableAttrs)}-${String(bot)}`,
+            messageNode: {
+                tag: 'message',
+                attrs: {},
+                content: [
+                    { tag: 'unavailable', attrs: unavailableAttrs },
+                    ...(bot ? [{ tag: 'bot', attrs: { biz_bot: '1' } }] : [])
+                ]
+            }
+        })
+
+    assert.equal(harness.coordinator.onUnavailableMessage(buildUnavailable({}, true)), false)
+    assert.equal(
+        harness.coordinator.onUnavailableMessage(buildUnavailable({ hosted: 'true' })),
+        false
+    )
+    assert.equal(
+        harness.coordinator.onUnavailableMessage(buildUnavailable({ type: 'view_once' })),
+        false
+    )
+    assert.equal(harness.captured.length, 0)
 })
 
 test('placeholder resend: splits queue into batches of 32', async () => {

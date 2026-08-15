@@ -1,16 +1,20 @@
-import { promisify } from 'node:util'
-import { unzip } from 'node:zlib'
-
+import { flushPendingWrites, openHistoryBlobStream } from '@client/persistence/history-blob'
 import type { WriteBehindPersistence } from '@client/persistence/WriteBehindPersistence'
 import type { WaClientEventMap, WaHistorySyncChunkEvent } from '@client/types'
 import type { Logger } from '@infra/log/types'
 import type { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
 import { proto, type Proto } from '@proto'
 import { isUserJid } from '@protocol/jid'
-import { decodeProtoBytes, toBytesView } from '@util/bytes'
+import { normalizeEphemeralSettingSeconds } from '@protocol/message'
+import type { WaChatMetadataStore } from '@store/contracts/chat-metadata.store'
+import { concatBytes, TEXT_DECODER } from '@util/bytes'
 import { longToNumber, toError } from '@util/primitives'
-
-const unzipAsync = promisify(unzip)
+import {
+    PROTO_STREAM_EVENT_KINDS,
+    type ProtoStreamEvent,
+    streamProtoFields
+} from '@util/proto-stream'
+import { PROTO_WIRE_TYPES } from '@util/protoscan'
 
 const HANDLED_SYNC_TYPES = new Set([
     proto.Message.HistorySyncType.INITIAL_BOOTSTRAP,
@@ -21,32 +25,75 @@ const HANDLED_SYNC_TYPES = new Set([
     proto.Message.HistorySyncType.NON_BLOCKING_DATA
 ])
 const HISTORY_SYNC_MAX_PENDING_WRITES = 1_024
+const HISTORY_SYNC_MAX_RECORD_BYTES = 16 * 1024 * 1024
+/**
+ * Ceiling on messages held while waiting for their `Conversation.id`. Field order
+ * puts the id first, so this only fills if a serializer reverses it, and letting
+ * it grow would rebuild the very peak the streaming pass removes. Exceeding it
+ * fails the chunk rather than dropping records: an aborted chunk stays unacked
+ * and gets resent, while a dropped one would be acked and lost for good.
+ */
+const HISTORY_SYNC_MAX_PARKED_MESSAGES = 1_024
+
+export const HISTORY_SYNC_FIELDS = Object.freeze({
+    CONVERSATIONS: 2,
+    CHUNK_ORDER: 5,
+    PROGRESS: 6,
+    PUSHNAMES: 7,
+    PHONE_NUMBER_TO_LID_MAPPINGS: 15,
+    NCT_SALT: 19,
+    INLINE_CONTACTS: 20
+} as const)
+
+export const CONVERSATION_FIELDS = Object.freeze({
+    ID: 1,
+    MESSAGES: 2
+} as const)
+
+interface WaHistorySyncPrivacyTokenConversation {
+    readonly jid: string
+    readonly tcToken?: Uint8Array | null
+    readonly tcTokenTimestamp?: number | null
+    readonly tcTokenSenderTimestamp?: number | null
+}
 
 interface WaHistorySyncDeps {
     readonly logger: Logger
     readonly mediaTransfer: WaMediaTransferClient
     readonly writeBehind: WriteBehindPersistence
+    readonly chatMetadataStore?: WaChatMetadataStore
     readonly emitEvent: <K extends keyof WaClientEventMap>(
         event: K,
         ...args: Parameters<WaClientEventMap[K]>
     ) => void
     readonly onPrivacyTokens?: (
-        conversations: readonly {
-            readonly jid: string
-            readonly tcToken?: Uint8Array | null
-            readonly tcTokenTimestamp?: number | null
-            readonly tcTokenSenderTimestamp?: number | null
-        }[]
+        conversations: readonly WaHistorySyncPrivacyTokenConversation[]
     ) => Promise<void>
     readonly onNctSalt?: (salt: Uint8Array) => Promise<void>
-    /**
-     * Invoked once per recognized chunk after it has been fully processed (or
-     * after the early-return for `INITIAL_STATUS_V3` and other recognized-but-
-     * unhandled types). The WaClient wires this to the `hist_sync` receipt
-     * stanza required by wa-web so the primary device does not keep resending
-     * the same chunk.
-     */
+    /** Acks the chunk via the `hist_sync` receipt so the primary stops resending it. */
     readonly onProcessed?: (syncType: Proto.Message.HistorySyncType) => Promise<void>
+}
+
+interface ParkedHistoryMessage {
+    readonly id: string
+    readonly senderJid: string | undefined
+    readonly fromMe: boolean
+    readonly timestampMs: number | undefined
+    readonly messageBytes: Uint8Array
+}
+
+interface HistorySyncChunkState {
+    readonly nowMs: number
+    readonly pendingWrites: Promise<void>[]
+    readonly pushnames: Proto.IPushname[]
+    readonly inlineContacts: Proto.IInlineContact[]
+    readonly pnToLid: Map<string, string>
+    readonly tokenConversations: WaHistorySyncPrivacyTokenConversation[]
+    nctSalt: Uint8Array | null
+    chunkOrder: number | null
+    progress: number | null
+    conversationsCount: number
+    messagesCount: number
 }
 
 export async function runHistorySyncNotification(
@@ -64,6 +111,11 @@ export async function runHistorySyncNotification(
     }
 }
 
+/**
+ * Applies one history sync chunk while it downloads, descending into
+ * `conversations` so peak memory tracks the largest single message and not the
+ * chunk. Chunk-wide records settle after the stream, once every LID mapping is in.
+ */
 export async function processHistorySyncNotification(
     deps: WaHistorySyncDeps,
     notification: Proto.Message.IHistorySyncNotification
@@ -75,252 +127,394 @@ export async function processHistorySyncNotification(
     }
     if (!HANDLED_SYNC_TYPES.has(syncType)) {
         deps.logger.debug('skipping unhandled history sync type', { syncType })
-        // INITIAL_STATUS_V3 is the only recognized syncType we do not process today;
-        // still ack it so the primary device does not keep resending the same chunk.
         if (syncType === proto.Message.HistorySyncType.INITIAL_STATUS_V3 && deps.onProcessed) {
             await deps.onProcessed(syncType)
         }
         return
     }
 
-    const blob = await downloadHistorySyncBlob(deps, notification)
-    const decompressed = toBytesView(await unzipAsync(blob))
-    const historySync = proto.HistorySync.decode(decompressed)
+    const blob = await openHistoryBlobStream(
+        deps.mediaTransfer,
+        notification,
+        'history',
+        'history sync',
+        notification.initialHistBootstrapInlinePayload
+    )
+
+    const state: HistorySyncChunkState = {
+        nowMs: Date.now(),
+        pendingWrites: [],
+        pushnames: [],
+        inlineContacts: [],
+        pnToLid: new Map<string, string>(),
+        tokenConversations: [],
+        nctSalt: null,
+        chunkOrder: null,
+        progress: null,
+        conversationsCount: 0,
+        messagesCount: 0
+    }
+
+    try {
+        await consumeHistorySyncStream(deps, blob.inflated, state)
+    } catch (error) {
+        blob.inflated.destroy(toError(error))
+        await Promise.allSettled(state.pendingWrites)
+        await blob.verified.catch(() => undefined)
+        throw toError(error)
+    }
+
+    await blob.verified
+
+    await settleHistorySyncChunk(deps, state)
 
     deps.logger.info('decoded history sync chunk', {
         syncType,
-        chunkOrder: historySync.chunkOrder,
-        progress: historySync.progress,
-        conversations: historySync.conversations.length,
-        pushnames: historySync.pushnames.length,
-        inlineContacts: historySync.inlineContacts?.length ?? 0
+        chunkOrder: state.chunkOrder,
+        progress: state.progress,
+        conversations: state.conversationsCount,
+        messages: state.messagesCount,
+        pushnames: state.pushnames.length,
+        inlineContacts: state.inlineContacts.length
     })
-
-    const nowMs = Date.now()
-    const pendingWrites: Promise<void>[] = []
-
-    // Build PN -> LID lookup from this chunk's mappings (and inline contacts
-    // and conversation-level pn/lid pairs, which carry the same pair) so
-    // pushnames and mappings land on a single canonical (LID-form) contact
-    // row instead of two mirror rows (one keyed by PN, one keyed by LID).
-    const pnToLid = new Map<string, string>()
-    for (const map of historySync.phoneNumberToLidMappings ?? []) {
-        if (map.pnJid && map.lidJid) {
-            pnToLid.set(map.pnJid, map.lidJid)
-        }
-    }
-    for (const c of historySync.inlineContacts ?? []) {
-        if (c.pnJid && c.lidJid) {
-            pnToLid.set(c.pnJid, c.lidJid)
-        }
-    }
-    for (const conversation of historySync.conversations) {
-        const pnJid = conversation.pnJid
-        const lidJid = conversation.lidJid ?? conversation.accountLid
-        if (pnJid && lidJid) {
-            pnToLid.set(pnJid, lidJid)
-        }
-    }
-
-    for (const pn of historySync.pushnames) {
-        if (!pn.id) {
-            continue
-        }
-        const lidJid = pnToLid.get(pn.id)
-        pendingWrites[pendingWrites.length] = deps.writeBehind.persistContactAsync(
-            lidJid
-                ? {
-                      jid: lidJid,
-                      pushName: pn.pushname ?? undefined,
-                      phoneNumber: pn.id,
-                      lastUpdatedMs: nowMs
-                  }
-                : {
-                      jid: pn.id,
-                      pushName: pn.pushname ?? undefined,
-                      lastUpdatedMs: nowMs
-                  }
-        )
-        if (pendingWrites.length >= HISTORY_SYNC_MAX_PENDING_WRITES) {
-            await flushPendingWrites(pendingWrites)
-        }
-    }
-
-    for (const c of historySync.inlineContacts ?? []) {
-        const jid = c.lidJid ?? c.pnJid
-        if (!jid) {
-            continue
-        }
-        const displayName = c.fullName || c.firstName || undefined
-        if (!displayName && !c.pnJid) {
-            continue
-        }
-        pendingWrites[pendingWrites.length] = deps.writeBehind.persistContactAsync({
-            jid,
-            displayName,
-            phoneNumber: c.pnJid ?? undefined,
-            lastUpdatedMs: nowMs
-        })
-        if (pendingWrites.length >= HISTORY_SYNC_MAX_PENDING_WRITES) {
-            await flushPendingWrites(pendingWrites)
-        }
-    }
-
-    let messagesCount = 0
-    for (const conversation of historySync.conversations) {
-        const threadJid = conversation.id
-        if (!threadJid) {
-            deps.logger.debug('skipping history sync conversation without thread jid')
-            continue
-        }
-
-        pendingWrites[pendingWrites.length] = deps.writeBehind.persistThreadAsync({
-            jid: threadJid,
-            name: conversation.name ?? undefined,
-            unreadCount: conversation.unreadCount ?? undefined,
-            archived: conversation.archived ?? undefined,
-            pinned: conversation.pinned ?? undefined,
-            muteEndMs: longToNumber(conversation.muteEndTime) || undefined,
-            markedAsUnread: conversation.markedAsUnread ?? undefined,
-            ephemeralExpiration: conversation.ephemeralExpiration ?? undefined
-        })
-        if (pendingWrites.length >= HISTORY_SYNC_MAX_PENDING_WRITES) {
-            await flushPendingWrites(pendingWrites)
-        }
-
-        if (isUserJid(threadJid) || (conversation.lidJid ?? conversation.accountLid)) {
-            const contactDisplay = conversation.displayName || conversation.username || undefined
-            const contactPn = conversation.pnJid ?? undefined
-            const contactLid = conversation.lidJid ?? conversation.accountLid ?? undefined
-            if (contactDisplay || contactPn || contactLid) {
-                const contactJid = contactLid ?? threadJid
-                pendingWrites[pendingWrites.length] = deps.writeBehind.persistContactAsync({
-                    jid: contactJid,
-                    displayName: contactDisplay,
-                    phoneNumber: contactPn,
-                    lastUpdatedMs: nowMs
-                })
-                if (pendingWrites.length >= HISTORY_SYNC_MAX_PENDING_WRITES) {
-                    await flushPendingWrites(pendingWrites)
-                }
-            }
-        }
-        for (const histMsg of conversation.messages ?? []) {
-            const webMsg = histMsg.message
-            if (!webMsg?.key?.id || !webMsg.message) {
-                // Stubs (group system events: add/remove/promote, revokes, ephemeral toggles)
-                // arrive as WebMessageInfo with a key + messageStubType but no `.message`. They
-                // duplicate live `notification` stanzas that the client already processes, and
-                // storing them as content-less rows produces "ghost" entries — skip them here.
-                continue
-            }
-            const timestampMs = longToNumber(webMsg.messageTimestamp) * 1000
-            pendingWrites[pendingWrites.length] = deps.writeBehind.persistMessageAsync({
-                id: webMsg.key.id,
-                threadJid,
-                senderJid: webMsg.key.participant ?? undefined,
-                fromMe: webMsg.key.fromMe === true,
-                timestampMs: timestampMs || undefined,
-                messageBytes: proto.Message.encode(webMsg.message).finish()
-            })
-            if (pendingWrites.length >= HISTORY_SYNC_MAX_PENDING_WRITES) {
-                await flushPendingWrites(pendingWrites)
-            }
-            messagesCount += 1
-        }
-    }
-
-    // Persist LID<->PN mappings as a single LID-canonical row per contact.
-    // Lookups by PN form fall through to `getByPhoneNumber` via the secondary
-    // index, so the mirror PN row is no longer needed.
-    for (const [pnJid, lidJid] of pnToLid) {
-        pendingWrites[pendingWrites.length] = deps.writeBehind.persistContactAsync({
-            jid: lidJid,
-            phoneNumber: pnJid,
-            lastUpdatedMs: nowMs
-        })
-        if (pendingWrites.length >= HISTORY_SYNC_MAX_PENDING_WRITES) {
-            await flushPendingWrites(pendingWrites)
-        }
-    }
-
-    if (deps.onPrivacyTokens) {
-        const tokenConversations: {
-            readonly jid: string
-            readonly tcToken?: Uint8Array | null
-            readonly tcTokenTimestamp?: number | null
-            readonly tcTokenSenderTimestamp?: number | null
-        }[] = []
-        for (const conversation of historySync.conversations) {
-            if (!conversation.id) continue
-            if (
-                conversation.tcToken ||
-                conversation.tcTokenTimestamp ||
-                conversation.tcTokenSenderTimestamp
-            ) {
-                tokenConversations[tokenConversations.length] = {
-                    jid: conversation.id,
-                    tcToken: conversation.tcToken,
-                    tcTokenTimestamp: longToNumber(conversation.tcTokenTimestamp) || undefined,
-                    tcTokenSenderTimestamp:
-                        longToNumber(conversation.tcTokenSenderTimestamp) || undefined
-                }
-            }
-        }
-        if (tokenConversations.length > 0) {
-            pendingWrites[pendingWrites.length] = deps.onPrivacyTokens(tokenConversations)
-        }
-    }
-    if (deps.onNctSalt && historySync.nctSalt) {
-        pendingWrites[pendingWrites.length] = deps.onNctSalt(historySync.nctSalt)
-    }
 
     const event: WaHistorySyncChunkEvent = {
         syncType,
-        messagesCount,
-        conversationsCount: historySync.conversations.length,
-        pushnamesCount: historySync.pushnames.length,
-        inlineContactsCount: historySync.inlineContacts?.length ?? 0,
-        chunkOrder: historySync.chunkOrder ?? undefined,
-        progress: historySync.progress ?? undefined
+        messagesCount: state.messagesCount,
+        conversationsCount: state.conversationsCount,
+        pushnamesCount: state.pushnames.length,
+        inlineContactsCount: state.inlineContacts.length,
+        chunkOrder: state.chunkOrder ?? undefined,
+        progress: state.progress ?? undefined
     }
-    await flushPendingWrites(pendingWrites)
+    await flushPendingWrites(state.pendingWrites)
     deps.emitEvent('history_sync_chunk', event)
     if (deps.onProcessed) {
         await deps.onProcessed(syncType)
     }
 }
 
-async function flushPendingWrites(pendingWrites: Promise<void>[]): Promise<void> {
-    if (pendingWrites.length === 0) {
-        return
+async function consumeHistorySyncStream(
+    deps: WaHistorySyncDeps,
+    inflated: Parameters<typeof streamProtoFields>[0],
+    state: HistorySyncChunkState
+): Promise<void> {
+    let headerParts: Uint8Array[] | null = null
+    let threadJid: string | null = null
+    let parked: ParkedHistoryMessage[] | null = null
+
+    const onEvent = (event: ProtoStreamEvent): void | Promise<void> => {
+        if (event.kind === PROTO_STREAM_EVENT_KINDS.ENTER) {
+            headerParts = []
+            threadJid = null
+            parked = null
+            state.conversationsCount += 1
+            return undefined
+        }
+
+        if (event.kind === PROTO_STREAM_EVENT_KINDS.LEAVE) {
+            const parts = headerParts
+            const jid = threadJid
+            const pending = parked
+            headerParts = null
+            threadJid = null
+            parked = null
+            return parts ? closeConversation(deps, state, parts, jid, pending) : undefined
+        }
+
+        if (event.depth === 1) {
+            if (
+                event.fieldNumber === CONVERSATION_FIELDS.MESSAGES &&
+                event.wireType === PROTO_WIRE_TYPES.LEN
+            ) {
+                const message = readHistoryMessage(event.value)
+                if (!message) {
+                    return undefined
+                }
+                if (!threadJid) {
+                    parked ??= []
+                    if (parked.length >= HISTORY_SYNC_MAX_PARKED_MESSAGES) {
+                        throw new Error(
+                            `history sync parked ${parked.length} messages with no thread jid, exceeding the ${HISTORY_SYNC_MAX_PARKED_MESSAGES} limit`
+                        )
+                    }
+                    parked[parked.length] = message
+                    return undefined
+                }
+                state.messagesCount += 1
+                pushWrite(
+                    state,
+                    deps.writeBehind.persistMessageAsync({
+                        id: message.id,
+                        threadJid,
+                        senderJid: message.senderJid,
+                        fromMe: message.fromMe,
+                        timestampMs: message.timestampMs,
+                        messageBytes: message.messageBytes
+                    })
+                )
+                return maybeFlush(state)
+            }
+
+            if (headerParts) {
+                if (
+                    event.fieldNumber === CONVERSATION_FIELDS.ID &&
+                    event.wireType === PROTO_WIRE_TYPES.LEN
+                ) {
+                    threadJid = TEXT_DECODER.decode(event.value)
+                }
+                headerParts[headerParts.length] = event.raw.slice()
+            }
+            return undefined
+        }
+
+        if (event.depth !== 0) {
+            return undefined
+        }
+
+        if (event.wireType === PROTO_WIRE_TYPES.VARINT) {
+            if (event.fieldNumber === HISTORY_SYNC_FIELDS.CHUNK_ORDER) {
+                state.chunkOrder = event.varintValue
+            } else if (event.fieldNumber === HISTORY_SYNC_FIELDS.PROGRESS) {
+                state.progress = event.varintValue
+            }
+            return undefined
+        }
+
+        if (event.wireType !== PROTO_WIRE_TYPES.LEN) {
+            return undefined
+        }
+
+        if (event.fieldNumber === HISTORY_SYNC_FIELDS.PUSHNAMES) {
+            state.pushnames[state.pushnames.length] = proto.Pushname.decode(event.value)
+        } else if (event.fieldNumber === HISTORY_SYNC_FIELDS.PHONE_NUMBER_TO_LID_MAPPINGS) {
+            const map = proto.PhoneNumberToLIDMapping.decode(event.value)
+            if (map.pnJid && map.lidJid) {
+                state.pnToLid.set(map.pnJid, map.lidJid)
+            }
+        } else if (event.fieldNumber === HISTORY_SYNC_FIELDS.INLINE_CONTACTS) {
+            const contact = proto.InlineContact.decode(event.value)
+            state.inlineContacts[state.inlineContacts.length] = contact
+            if (contact.pnJid && contact.lidJid) {
+                state.pnToLid.set(contact.pnJid, contact.lidJid)
+            }
+        } else if (event.fieldNumber === HISTORY_SYNC_FIELDS.NCT_SALT) {
+            state.nctSalt = event.value.slice()
+        }
+        return undefined
     }
-    const settled = Promise.all(pendingWrites)
-    pendingWrites.length = 0
-    await settled
+
+    await streamProtoFields(inflated, onEvent, {
+        shouldDescend: (fieldNumber, depth) =>
+            depth === 0 && fieldNumber === HISTORY_SYNC_FIELDS.CONVERSATIONS,
+        maxFieldBytes: HISTORY_SYNC_MAX_RECORD_BYTES
+    })
 }
 
-async function downloadHistorySyncBlob(
+async function closeConversation(
     deps: WaHistorySyncDeps,
-    notification: Proto.Message.IHistorySyncNotification
-): Promise<Uint8Array> {
-    if (notification.initialHistBootstrapInlinePayload) {
-        return decodeProtoBytes(
-            notification.initialHistBootstrapInlinePayload,
-            'initialHistBootstrapInlinePayload'
+    state: HistorySyncChunkState,
+    headerParts: readonly Uint8Array[],
+    threadJid: string | null,
+    parked: readonly ParkedHistoryMessage[] | null
+): Promise<void> {
+    const conversation = proto.Conversation.decode(concatBytes(headerParts))
+    const resolvedJid = threadJid ?? conversation.id
+    if (!resolvedJid) {
+        deps.logger.debug('skipping history sync conversation without thread jid')
+        return
+    }
+
+    if (conversation.pnJid) {
+        const lidJid = conversation.lidJid ?? conversation.accountLid
+        if (lidJid) {
+            state.pnToLid.set(conversation.pnJid, lidJid)
+        }
+    }
+
+    if (
+        deps.onPrivacyTokens &&
+        (conversation.tcToken ||
+            conversation.tcTokenTimestamp ||
+            conversation.tcTokenSenderTimestamp)
+    ) {
+        state.tokenConversations[state.tokenConversations.length] = {
+            jid: resolvedJid,
+            tcToken: conversation.tcToken ? new Uint8Array(conversation.tcToken) : undefined,
+            tcTokenTimestamp: longToNumber(conversation.tcTokenTimestamp) || undefined,
+            tcTokenSenderTimestamp: longToNumber(conversation.tcTokenSenderTimestamp) || undefined
+        }
+    }
+
+    const ephemeralExpiration = conversation.ephemeralExpiration ?? undefined
+    const ephemeralSettingTimestamp =
+        normalizeEphemeralSettingSeconds(longToNumber(conversation.ephemeralSettingTimestamp)) ||
+        undefined
+    if (deps.chatMetadataStore && ephemeralExpiration !== undefined) {
+        pushWrite(
+            state,
+            deps.chatMetadataStore
+                .upsertChatMetadata({
+                    chatJid: resolvedJid,
+                    ephemeralExpiration,
+                    ...(ephemeralSettingTimestamp !== undefined
+                        ? { ephemeralSettingTimestamp }
+                        : {}),
+                    updatedAtMs: state.nowMs
+                })
+                .catch((error: unknown) => {
+                    deps.logger.debug('failed to cache history sync chat metadata', {
+                        jid: resolvedJid,
+                        message: toError(error).message
+                    })
+                })
         )
     }
-    if (!notification.directPath) {
-        throw new Error('history sync notification missing directPath')
+    pushWrite(
+        state,
+        deps.writeBehind.persistThreadAsync({
+            jid: resolvedJid,
+            name: conversation.name ?? undefined,
+            unreadCount: conversation.unreadCount ?? undefined,
+            archived: conversation.archived ?? undefined,
+            pinned: conversation.pinned ?? undefined,
+            muteEndMs: longToNumber(conversation.muteEndTime) || undefined,
+            markedAsUnread: conversation.markedAsUnread ?? undefined,
+            ephemeralExpiration,
+            ephemeralSettingTimestamp
+        })
+    )
+
+    if (isUserJid(resolvedJid) || (conversation.lidJid ?? conversation.accountLid)) {
+        const contactDisplay = conversation.displayName || conversation.username || undefined
+        const contactPn = conversation.pnJid ?? undefined
+        const contactLid = conversation.lidJid ?? conversation.accountLid ?? undefined
+        if (contactDisplay || contactPn || contactLid) {
+            pushWrite(
+                state,
+                deps.writeBehind.persistContactAsync({
+                    jid: contactLid ?? resolvedJid,
+                    displayName: contactDisplay,
+                    phoneNumber: contactPn,
+                    lastUpdatedMs: state.nowMs
+                })
+            )
+        }
     }
-    const mediaKey = decodeProtoBytes(notification.mediaKey, 'history sync mediaKey')
-    const fileSha256 = decodeProtoBytes(notification.fileSha256, 'history sync fileSha256')
-    const fileEncSha256 = decodeProtoBytes(notification.fileEncSha256, 'history sync fileEncSha256')
-    return deps.mediaTransfer.downloadAndDecrypt({
-        directPath: notification.directPath,
-        mediaType: 'history',
-        mediaKey,
-        fileSha256,
-        fileEncSha256
-    })
+
+    for (const message of parked ?? []) {
+        state.messagesCount += 1
+        pushWrite(
+            state,
+            deps.writeBehind.persistMessageAsync({
+                id: message.id,
+                threadJid: resolvedJid,
+                senderJid: message.senderJid,
+                fromMe: message.fromMe,
+                timestampMs: message.timestampMs,
+                messageBytes: message.messageBytes
+            })
+        )
+    }
+
+    await maybeFlush(state)
+}
+
+async function settleHistorySyncChunk(
+    deps: WaHistorySyncDeps,
+    state: HistorySyncChunkState
+): Promise<void> {
+    for (const pushname of state.pushnames) {
+        if (!pushname.id) {
+            continue
+        }
+        const lidJid = state.pnToLid.get(pushname.id)
+        pushWrite(
+            state,
+            deps.writeBehind.persistContactAsync(
+                lidJid
+                    ? {
+                          jid: lidJid,
+                          pushName: pushname.pushname ?? undefined,
+                          phoneNumber: pushname.id,
+                          lastUpdatedMs: state.nowMs
+                      }
+                    : {
+                          jid: pushname.id,
+                          pushName: pushname.pushname ?? undefined,
+                          lastUpdatedMs: state.nowMs
+                      }
+            )
+        )
+        await maybeFlush(state)
+    }
+
+    for (const contact of state.inlineContacts) {
+        const jid = contact.lidJid ?? contact.pnJid
+        if (!jid) {
+            continue
+        }
+        const displayName = contact.fullName || contact.firstName || undefined
+        if (!displayName && !contact.pnJid) {
+            continue
+        }
+        pushWrite(
+            state,
+            deps.writeBehind.persistContactAsync({
+                jid,
+                displayName,
+                phoneNumber: contact.pnJid ?? undefined,
+                lastUpdatedMs: state.nowMs
+            })
+        )
+        await maybeFlush(state)
+    }
+
+    for (const [pnJid, lidJid] of state.pnToLid) {
+        pushWrite(
+            state,
+            deps.writeBehind.persistContactAsync({
+                jid: lidJid,
+                phoneNumber: pnJid,
+                lastUpdatedMs: state.nowMs
+            })
+        )
+        await maybeFlush(state)
+    }
+
+    if (deps.onPrivacyTokens && state.tokenConversations.length > 0) {
+        pushWrite(state, deps.onPrivacyTokens(state.tokenConversations))
+    }
+    if (deps.onNctSalt && state.nctSalt) {
+        pushWrite(state, deps.onNctSalt(state.nctSalt))
+    }
+}
+
+/** `null` for content-less stubs, which duplicate live notification stanzas. */
+function readHistoryMessage(record: Uint8Array): ParkedHistoryMessage | null {
+    const webMsg = proto.HistorySyncMsg.decode(record).message
+    if (!webMsg?.key?.id || !webMsg.message) {
+        return null
+    }
+    const timestampMs = longToNumber(webMsg.messageTimestamp) * 1000
+    return {
+        id: webMsg.key.id,
+        senderJid: webMsg.key.participant ?? undefined,
+        fromMe: webMsg.key.fromMe === true,
+        timestampMs: timestampMs || undefined,
+        messageBytes: proto.Message.encode(webMsg.message).finish()
+    }
+}
+
+/** The no-op handler keeps a queued rejection observed until the flush rejects on it. */
+function pushWrite(state: HistorySyncChunkState, write: Promise<void>): void {
+    write.catch(() => undefined)
+    state.pendingWrites[state.pendingWrites.length] = write
+}
+
+function maybeFlush(state: HistorySyncChunkState): Promise<void> | undefined {
+    if (state.pendingWrites.length >= HISTORY_SYNC_MAX_PENDING_WRITES) {
+        return flushPendingWrites(state.pendingWrites)
+    }
+    return undefined
 }

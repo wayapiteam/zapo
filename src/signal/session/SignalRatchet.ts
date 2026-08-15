@@ -36,7 +36,7 @@ import type {
     SignalRecvChain,
     SignalSessionRecord
 } from '@signal/types'
-import { concatBytes, removeAt, uint8Equal, uint8TimingSafeEqual } from '@util/bytes'
+import { removeAt, uint8Equal, uint8TimingSafeEqual } from '@util/bytes'
 import { toError } from '@util/primitives'
 
 const MAX_TRACKED_RECV_CHAINS = 4
@@ -70,11 +70,10 @@ export function deriveMsgKey(
     return deriveMsgKeyFromChainKey(index, chainKey)
 }
 
-// eslint-disable-next-line @typescript-eslint/require-await
-export async function selectMessageKey(
+export function selectMessageKey(
     chain: SignalRecvChain,
     targetCounter: number
-): Promise<{ readonly messageKey: SignalMessageKey; readonly updatedChain: SignalRecvChain }> {
+): { readonly messageKey: SignalMessageKey; readonly updatedChain: SignalRecvChain } {
     const delta = targetCounter - chain.nextMsgIndex
     if (delta > FUTURE_MESSAGES_MAX) {
         throw new Error('message too far in future')
@@ -161,11 +160,10 @@ function deriveMsgKeyFromChainKey(
     }
 }
 
-// eslint-disable-next-line @typescript-eslint/require-await
-export async function encryptMsg(
+export function encryptMsg(
     session: SignalSessionRecord,
     plaintext: Uint8Array
-): Promise<readonly [SignalSessionRecord, { type: 'msg' | 'pkmsg'; ciphertext: Uint8Array }]> {
+): readonly [SignalSessionRecord, { type: 'msg' | 'pkmsg'; ciphertext: Uint8Array }] {
     const { nextChainKey, messageKey } = deriveMsgKey(
         session.sendChain.nextMsgIndex,
         session.sendChain.chainKey
@@ -178,16 +176,19 @@ export async function encryptMsg(
         previousCounter: session.prevSendChainHighestIndex,
         ciphertext
     }).finish()
-    const versionedSignalPayload = prependVersion(signalPayload, SIGNAL_VERSION)
+    const versionedLength = 1 + signalPayload.length
+    const signalMessage = new Uint8Array(versionedLength + SIGNAL_MAC_SIZE)
+    signalMessage[0] = ((SIGNAL_VERSION << 4) | SIGNAL_VERSION) & 0xff
+    signalMessage.set(signalPayload, 1)
     const mac = hmacSha256Sign(messageKey.macKey, [
         session.local.pubKey,
         session.remote.pubKey,
-        versionedSignalPayload
+        signalMessage.subarray(0, versionedLength)
     ])
-    const signalMessage = concatBytes([versionedSignalPayload, mac.subarray(0, SIGNAL_MAC_SIZE)])
+    signalMessage.set(mac.subarray(0, SIGNAL_MAC_SIZE), versionedLength)
 
     let type: 'msg' | 'pkmsg' = 'msg'
-    let output = signalMessage
+    let output: Uint8Array = signalMessage
     if (session.initialExchangeInfo) {
         const preKeyPayload = proto.PreKeySignalMessage.encode({
             registrationId: session.local.regId,
@@ -270,10 +271,14 @@ export async function decryptMsgFromSession(
     message: ParsedSignalMessage | ParsedPreKeySignalMessage
 ): Promise<readonly [SignalSessionRecord, Uint8Array]> {
     const ratchetPubKey = toSerializedPubKey(message.ratchetPubKey)
-    const recvChainIndex = session.recvChains.findIndex((raw) => {
-        const key = raw.senderRatchetKey
-        return key !== null && key !== undefined && uint8Equal(key, ratchetPubKey)
-    })
+    let recvChainIndex = -1
+    for (let index = 0; index < session.recvChains.length; index += 1) {
+        const key = session.recvChains[index].senderRatchetKey
+        if (key !== null && key !== undefined && uint8Equal(key, ratchetPubKey)) {
+            recvChainIndex = index
+            break
+        }
+    }
     let selectedMessageKey: SignalMessageKey
     let updatedSession: SignalSessionRecord
 
@@ -289,10 +294,8 @@ export async function decryptMsgFromSession(
             chainKey: recvRatchet.chainKey,
             unusedMsgKeys: []
         }
-        const [selected, newSendRatchet] = await Promise.all([
-            selectMessageKey(freshRecvChain, message.counter),
-            generateSerializedKeyPair()
-        ])
+        const selected = selectMessageKey(freshRecvChain, message.counter)
+        const newSendRatchet = await generateSerializedKeyPair()
         selectedMessageKey = selected.messageKey
 
         const sendRatchet = await calculateRatchet(
@@ -320,7 +323,7 @@ export async function decryptMsgFromSession(
             session.recvChains[recvChainIndex],
             `recvChains[${recvChainIndex}]`
         )
-        const selected = await selectMessageKey(decoded, message.counter)
+        const selected = selectMessageKey(decoded, message.counter)
         selectedMessageKey = selected.messageKey
         const nextRecvChains: RawSignalRecvChain[] = session.recvChains.slice()
         nextRecvChains[recvChainIndex] = encodeSignalRecvChain(selected.updatedChain)
