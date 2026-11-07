@@ -2,6 +2,9 @@ import { sha256 } from '@crypto/core'
 import { WA_DEFAULTS } from '@protocol/constants'
 import { bytesToBase64 } from '@util/bytes'
 
+export const WA_DEFAULT_PHASH_MAX_PARTICIPANTS = 4_096
+export const WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS = 16_384
+
 const PHASH_DIGEST_PREFIX = 6
 
 const CHAR_DOT = 0x2e
@@ -12,16 +15,45 @@ const CHAR_C = 0x63
 const CHAR_U = 0x75
 const CHAR_S = 0x73
 
-export const WA_DEFAULT_PHASH_MAX_PARTICIPANTS = 4_096
-export const WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS = 16_384
+/**
+ * Upper bound on the bytes the canonical rewrite can add to a single jid: the
+ * `.0:` agent marker plus a device digit when the input carries neither, plus
+ * the `c.us` server substitution.
+ */
+const CANONICAL_GROWTH_BYTES = 4 + WA_DEFAULTS.HOST_DOMAIN.length
 
-const INITIAL_PARTICIPANT_CAPACITY = 2_048
-const PER_WID_BYTES = 96
+/**
+ * Largest canonical buffer kept alive between calls (the index arrays scale
+ * with it). Lists above this bound are rare enough that a throwaway allocation
+ * beats holding the memory for the life of the process.
+ */
+const RETAINED_SCRATCH_BYTES = 1024 * 1024
 
-let scratch = new Uint8Array(INITIAL_PARTICIPANT_CAPACITY * PER_WID_BYTES)
-let offsets = new Uint32Array(INITIAL_PARTICIPANT_CAPACITY + 1)
-let order = new Uint32Array(INITIAL_PARTICIPANT_CAPACITY)
+interface PhashBuffers {
+    scratch: Uint8Array
+    offsets: Uint32Array
+    order: Uint32Array
+}
 
+const RETAINED: PhashBuffers = {
+    scratch: new Uint8Array(0),
+    offsets: new Uint32Array(0),
+    order: new Uint32Array(0)
+}
+
+/**
+ * Computes the v2 participant hash (`2:<base64>`) attached to group and
+ * broadcast-list fanouts.
+ *
+ * Every participant is canonicalized to `<user>.0:<device>@<server>`, the set
+ * is sorted bytewise and hashed as a single SHA-256 stream. There is no
+ * implicit allocation ceiling inside the canonical buffer; the fork enforces
+ * the caller's participant limit before allocating.
+ *
+ * @param participants device jids, in any order
+ * @param maxParticipants maximum allowed participant count (default 4096)
+ * @returns the `2:`-prefixed phash, or `'2:'` when the list is empty
+ */
 export function computePhashV2(
     participants: readonly string[],
     maxParticipants: number = WA_DEFAULT_PHASH_MAX_PARTICIPANTS
@@ -35,47 +67,61 @@ export function computePhashV2(
             `phash maxParticipants must be an integer between 1 and ${WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS}`
         )
     }
-    if (participants.length === 0) return '2:'
-    const n = participants.length
-    if (n > maxParticipants) {
-        throw new Error(`phash participant count ${n} exceeds maxParticipants ${maxParticipants}`)
+    if (participants.length > maxParticipants) {
+        throw new Error(`phash participant count ${participants.length} exceeds maxParticipants ${maxParticipants}`)
     }
-    ensurePhashCapacity(n)
+    const n = participants.length
+    if (n === 0) return '2:'
+
+    let requiredBytes = 0
+    for (let i = 0; i < n; i += 1) {
+        requiredBytes += participants[i].length + CANONICAL_GROWTH_BYTES
+    }
+    const { scratch, offsets, order } = acquireBuffers(n, requiredBytes)
 
     let off = 0
     for (let i = 0; i < n; i += 1) {
         offsets[i] = off
-        const nextOff = writeCanonicalUtf8(scratch, off, participants[i])
-        if (nextOff > scratch.length) {
-            throw new Error(
-                `phash canonical buffer overflow at participant ${i}: needs ${nextOff} bytes, scratch is ${scratch.length}`
-            )
-        }
-        off = nextOff
+        off = writeCanonicalUtf8(scratch, off, participants[i])
     }
     offsets[n] = off
+    if (off > scratch.length) {
+        throw new Error(
+            `phash canonical buffer overflow: needs ${off} bytes, scratch is ${scratch.length}`
+        )
+    }
 
     for (let i = 0; i < n; i += 1) order[i] = i
-    order.subarray(0, n).sort((a, b) => compareScratchSlice(scratch, offsets, a, b))
+    const ranked = order.subarray(0, n)
+    ranked.sort((a, b) => compareScratchSlice(scratch, offsets, a, b))
 
     const parts = new Array<Uint8Array>(n)
     for (let i = 0; i < n; i += 1) {
-        const idx = order[i]
+        const idx = ranked[i]
         parts[i] = scratch.subarray(offsets[idx], offsets[idx + 1])
     }
     const digest = sha256(parts)
     return `2:${bytesToBase64(digest.subarray(0, PHASH_DIGEST_PREFIX))}`
 }
 
-function ensurePhashCapacity(required: number): void {
-    if (required <= order.length) return
-
-    let capacity = order.length
-    while (capacity < required) capacity *= 2
-
-    scratch = new Uint8Array(capacity * PER_WID_BYTES)
-    offsets = new Uint32Array(capacity + 1)
-    order = new Uint32Array(capacity)
+function acquireBuffers(participantCount: number, requiredBytes: number): PhashBuffers {
+    if (requiredBytes > RETAINED_SCRATCH_BYTES) {
+        return {
+            scratch: new Uint8Array(requiredBytes),
+            offsets: new Uint32Array(participantCount + 1),
+            order: new Uint32Array(participantCount)
+        }
+    }
+    if (RETAINED.scratch.length < requiredBytes) {
+        const nextBytes = Math.max(requiredBytes, RETAINED.scratch.length * 2)
+        RETAINED.scratch = new Uint8Array(Math.min(RETAINED_SCRATCH_BYTES, nextBytes))
+    }
+    if (RETAINED.order.length < participantCount) {
+        const capacity = Math.max(participantCount, RETAINED.order.length * 2)
+        RETAINED.offsets = new Uint32Array(capacity + 1)
+        RETAINED.order = new Uint32Array(capacity)
+    }
+    return RETAINED
 }
 
 function writeCanonicalUtf8(out: Uint8Array, start: number, jid: string): number {

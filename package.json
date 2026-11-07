@@ -1,6 +1,6 @@
 {
     "name": "@wayapiteam/zapo",
-    "version": "1.7.1",
+    "version": "1.11.0",
     "description": "High-performance WhatsApp Web TypeScript library",
     "license": "MIT",
     "author": "vinikjkkj <contact@vinicius.email> (https://github.com/vinikjkkj)",
@@ -163,7 +163,9 @@
         "lint": "eslint . --ext .ts,.js,.cjs",
         "lint:fix": "eslint . --ext .ts,.js,.cjs --fix",
         "format": "prettier . --write",
-        "format:check": "prettier . --check"
+        "format:check": "prettier . --check",
+        "test:upgrade:persistence": "node --test scripts/upgrade/credential-upgrade.test.cjs",
+        "test:upgrade:queue": "node --test scripts/upgrade/frame-queue.test.cjs"
     },
     "peerDependencies": {
         "argo-codec": "^0.2.1",

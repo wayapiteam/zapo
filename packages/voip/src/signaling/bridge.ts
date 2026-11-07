@@ -61,31 +61,42 @@ export async function routeCallStanza(
             await manager.handleCallAccept(node, normalizedPeerJid)
             break
         case 'transport':
-            await manager.handleCallTransport(node, normalizedPeerJid)
+            await manager.handleCallTransport(node)
             break
         case 'terminate':
-            await manager.handleCallTerminate(node)
+            await manager.handleCallTerminate(node, normalizedPeerJid)
             break
         case 'relaylatency':
-            await manager.handleCallRelaylatency(node, normalizedPeerJid)
+            manager.handleCallRelaylatency(node, normalizedPeerJid)
             break
         case 'mute_v2':
-            await manager.handleCallMuteV2(node, normalizedPeerJid)
+            manager.handleCallMuteV2(node, normalizedPeerJid)
+            break
+        case 'user_action':
+            manager.handleCallUserAction(node, normalizedPeerJid)
+            break
+        case 'raise_hand':
+            manager.handleCallRaiseHand(node, normalizedPeerJid)
+            break
+        case 'screen_share':
+        case 'screen':
+            manager.handleCallScreenShare(node, normalizedPeerJid)
+            break
+        case 'video':
+            manager.handleCallVideoState(node, normalizedPeerJid)
+            break
+        case 'group_update':
+            await manager.handleCallGroupUpdate(node)
+            break
+        case 'enc_rekey':
+            await manager.handleCallEncRekey(node, normalizedPeerJid)
             break
         case 'relay_election':
             manager.handleRelayElection(node)
             break
-        case 'reject':
-            break
-        default:
-            break
     }
 
     return tag
-}
-
-export async function routeCallAck(manager: WaCallManager, node: BinaryNode): Promise<void> {
-    await manager.handleCallAck(node)
 }
 
 export async function routeCallReceipt(deps: WaVoipDeps, node: BinaryNode): Promise<boolean> {

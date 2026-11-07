@@ -1,5 +1,6 @@
 import type { WaAppStateSyncKey } from '@appstate/types'
 import type { WaAuthCredentials } from '@auth/types'
+import type { WaSyncSignalSessionOptions } from '@client/coordinators/WaMessageCoordinator'
 import type { DeviceFanoutResolver } from '@client/messaging/fanout'
 import type { GroupMetadataCache } from '@client/messaging/group-metadata'
 import type { AppStateSyncKeyProtocol } from '@client/messaging/key-protocol'
@@ -32,6 +33,7 @@ import {
     needsSecretPersistence,
     resolveOutboundMessageAttrs,
     unwrapMessage,
+    type WaOutboundMessageAttrs,
     wrapAsViewOnce
 } from '@message/encode/content'
 import { wrapDeviceSentMessage } from '@message/encode/device-sent'
@@ -229,6 +231,24 @@ export function restrictGroupHistoryTargets(
         throw new Error('group history bundle resolved no receivers in the group')
     }
     return targets
+}
+
+/**
+ * Resolves the stanza `type` and `enc.mediatype` of an outbound message. A
+ * `<biz>` companion rides a type=text stanza with no mediatype, except on a
+ * group list: there the server nacks with 479 (SMAX_INVALID) unless
+ * type=media, mediatype=list and `<biz><list>` travel together.
+ */
+export function resolveOutboundStanzaShape(
+    attrs: Pick<WaOutboundMessageAttrs, 'buttonAddonKind' | 'typeAttr' | 'mediatype'>,
+    isGroup: boolean
+): { readonly type: string; readonly mediatype: string | undefined } {
+    const flattensForAddon =
+        attrs.buttonAddonKind !== null && !(isGroup && attrs.buttonAddonKind === 'list')
+    if (flattensForAddon) {
+        return { type: 'text', mediatype: undefined }
+    }
+    return { type: attrs.typeAttr, mediatype: attrs.mediatype ?? undefined }
 }
 
 interface WaOutboundEnvelope {
@@ -641,12 +661,8 @@ export class WaMessageDispatchCoordinator {
         const outboundAttrs = resolveOutboundMessageAttrs(messageWithIcdc)
         const buttonAddonKind = outboundAttrs.buttonAddonKind
         const buttonAddonNode = buttonAddonKind ? buildButtonAddonNode(buttonAddonKind) : undefined
-        // when a <biz> companion is attached the stanza must advertise type=text and
-        // omit enc.mediatype; sending type=media + mediatype=list/button alongside the
-        // companion is rejected by the server as SMAX_INVALID (479).
-        const type = buttonAddonKind ? 'text' : outboundAttrs.typeAttr
+        const { type, mediatype } = resolveOutboundStanzaShape(outboundAttrs, isGroup)
         const edit = outboundAttrs.edit ?? undefined
-        const mediatype = buttonAddonKind ? undefined : (outboundAttrs.mediatype ?? undefined)
         const metaAttrs = outboundAttrs.metaAttrs
         const metaNode = metaAttrs ? buildMetaNode(metaAttrs as Record<string, string>) : undefined
         const customNodes: BinaryNode[] = []
@@ -718,10 +734,16 @@ export class WaMessageDispatchCoordinator {
         return pair.pnJid ?? undefined
     }
 
-    public async syncSignalSession(jid: string, reasonIdentity = false): Promise<void> {
+    public async syncSignalSession(
+        jid: string,
+        { force = false, reasonIdentity = false }: WaSyncSignalSessionOptions = {}
+    ): Promise<void> {
         const address = parseSignalAddressFromJid(jid)
         if (address.server === WA_DEFAULTS.GROUP_SERVER) {
             throw new Error('syncSignalSession supports only direct chats')
+        }
+        if (force || reasonIdentity) {
+            await this.deps.sessionStore.deleteSession(address)
         }
         await this.deps.sessionResolver.ensureSession(address, jid, undefined, reasonIdentity)
     }

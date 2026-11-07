@@ -29,6 +29,62 @@ test('content helpers detect media payload and resolve message type', () => {
     assert.equal(resolveMessageTypeAttr({ pollCreationMessage: {} }), 'poll')
 })
 
+test('group status wrappers resolve the stanza attrs of the message they carry', () => {
+    // An opaque wrapper resolves to `media` with no `mediatype`, a pairing no
+    // client sends: the type has to come from the message inside the wrapper.
+    assert.equal(
+        resolveMessageTypeAttr({ groupStatusMessageV2: { message: { imageMessage: {} } } }),
+        'media'
+    )
+    assert.equal(
+        resolveEncMediaType({ groupStatusMessageV2: { message: { imageMessage: {} } } }),
+        'image'
+    )
+
+    assert.equal(
+        resolveMessageTypeAttr({ groupStatusMessageV2: { message: { conversation: 'hi' } } }),
+        'text'
+    )
+    assert.equal(
+        resolveEncMediaType({ groupStatusMessageV2: { message: { conversation: 'hi' } } }),
+        null
+    )
+
+    assert.equal(
+        resolveMessageTypeAttr({ groupStatusMessage: { message: { videoMessage: {} } } }),
+        'media'
+    )
+    assert.equal(
+        resolveEncMediaType({ groupStatusMessage: { message: { videoMessage: {} } } }),
+        'video'
+    )
+})
+
+test('AI rich-response family resolves to text so the stanza is not dropped', () => {
+    // A `media` stanza with no `mediatype` is discarded by the server, so the
+    // rich-response and bot-forwarded-wrapper family has to go out as `text`.
+    assert.equal(resolveMessageTypeAttr({ richResponseMessage: {} }), 'text')
+    assert.equal(
+        resolveMessageTypeAttr({ botForwardedMessage: { message: { richResponseMessage: {} } } }),
+        'text'
+    )
+    assert.equal(
+        resolveEncMediaType({ botForwardedMessage: { message: { richResponseMessage: {} } } }),
+        null
+    )
+
+    // The wrapper is unwrapped, so a bot-forwarded media message keeps `media`
+    // and its `mediatype`: the inner message decides.
+    assert.equal(
+        resolveMessageTypeAttr({ botForwardedMessage: { message: { imageMessage: {} } } }),
+        'media'
+    )
+    assert.equal(
+        resolveEncMediaType({ botForwardedMessage: { message: { imageMessage: {} } } }),
+        'image'
+    )
+})
+
 test('getContentType picks the payload key, including the unsuffixed ones', () => {
     assert.equal(getContentType(undefined), undefined)
     assert.equal(getContentType({}), undefined)
@@ -79,6 +135,29 @@ test('resolveButtonAddonKind classifies list/interactive incl. documentWithCapti
         }),
         'order_details'
     )
+    assert.equal(
+        resolveButtonAddonKind({
+            interactiveMessage: {
+                nativeFlowMessage: {
+                    buttons: [{ name: 'form_message', buttonParamsJson: '{}' }]
+                }
+            }
+        }),
+        'form_message'
+    )
+    assert.equal(
+        resolveButtonAddonKind({
+            interactiveMessage: {
+                nativeFlowMessage: {
+                    buttons: [
+                        { name: 'cta_url', buttonParamsJson: '{}' },
+                        { name: 'form_message', buttonParamsJson: '{}' }
+                    ]
+                }
+            }
+        }),
+        'interactive'
+    )
     assert.equal(resolveButtonAddonKind({ interactiveMessage: {} }), null)
     assert.equal(resolveButtonAddonKind({ conversation: 'hi' }), null)
     assert.equal(
@@ -107,6 +186,27 @@ test('resolveEncMediaType maps protobuf to correct media type string', () => {
     assert.equal(resolveEncMediaType({ videoMessage: { gifPlayback: true } }), 'gif')
     assert.equal(resolveEncMediaType({ audioMessage: { ptt: true } }), 'ptt')
     assert.equal(resolveEncMediaType({ documentMessage: {} }), 'document')
+})
+
+test('resolveEncMediaType tags an album as a collection, also through wrappers', () => {
+    assert.equal(resolveEncMediaType({ albumMessage: { expectedImageCount: 2 } }), 'collection')
+    assert.equal(
+        resolveEncMediaType({ ephemeralMessage: { message: { albumMessage: {} } } }),
+        'collection'
+    )
+    assert.equal(resolveMessageTypeAttr({ albumMessage: {} }), 'media')
+})
+
+test('resolveEncMediaType leaves non-album messages untouched', () => {
+    assert.equal(resolveEncMediaType({ conversation: 'hi' }), null)
+    assert.equal(resolveEncMediaType({ imageMessage: {} }), 'image')
+    assert.equal(
+        resolveEncMediaType({
+            extendedTextMessage: { text: 'link', matchedText: 'https://x.com' }
+        }),
+        'url'
+    )
+    assert.equal(resolveEncMediaType({ messageHistoryBundle: {} }), 'group_history')
 })
 
 test('resolveMetaAttrs returns attrs for polls events and view-once', () => {
@@ -168,7 +268,9 @@ test('resolveOutboundMessageAttrs matches the individual resolvers', () => {
         { ephemeralMessage: { message: { conversation: 'efemera' } } },
         { viewOnceMessage: { message: { imageMessage: { url: 'x' } } } },
         { ephemeralMessage: { message: { viewOnceMessageV2: { message: { videoMessage: {} } } } } },
-        { deviceSentMessage: { message: { extendedTextMessage: { text: 'ds' } } } }
+        { deviceSentMessage: { message: { extendedTextMessage: { text: 'ds' } } } },
+        { groupStatusMessageV2: { message: { imageMessage: { url: 'x' } } } },
+        { albumMessage: { expectedImageCount: 2 } }
     ]
     for (const message of corpus) {
         const combined = resolveOutboundMessageAttrs(message)

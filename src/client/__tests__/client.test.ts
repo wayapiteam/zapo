@@ -10,7 +10,11 @@ import { WaClient } from '@client/WaClient'
 import { buildWaClientDependencies, resolveWaClientBase } from '@client/WaClientFactory'
 import { createNoopLogger } from '@infra/log/types'
 import { proto } from '@proto'
+import { WaAuthMemoryStore } from '@store/memory/auth.store'
+import { WaPreKeyMemoryStore } from '@store/memory/pre-key.store'
 import { WaPrivacyTokenMemoryStore } from '@store/memory/privacy-token.store'
+import { WaSignalMemoryStore } from '@store/memory/signal.store'
+import { buildRegistrationPayload } from '@transport/noise/WaClientPayload'
 import type { BinaryNode } from '@transport/types'
 
 test('parseDirtyBits filters invalid entries and preserves protocols', () => {
@@ -837,6 +841,82 @@ test('buildWaClientDependencies wires trusted contact token AB prop overrides', 
     assert.equal(config.senderNumBuckets, 4)
 })
 
+async function pairingDeviceProps(
+    options: Pick<WaClientOptions, 'requireFullSync' | 'history'>
+): Promise<proto.IDeviceProps> {
+    const sessionStore = {
+        auth: new WaAuthMemoryStore(),
+        signal: new WaSignalMemoryStore(),
+        preKey: new WaPreKeyMemoryStore(),
+        senderKey: {} as never,
+        appState: {} as never,
+        messages: {} as never,
+        threads: {} as never,
+        contacts: {} as never,
+        retry: {} as never,
+        groupMetadata: {} as never,
+        deviceList: {} as never,
+        privacyToken: {} as never
+    }
+    const base = resolveWaClientBase(
+        {
+            ...options,
+            store: { session: () => sessionStore },
+            sessionId: 'session'
+        } as unknown as WaClientOptions,
+        createNoopLogger()
+    )
+    const runtime = {
+        sendNode: async (_node: BinaryNode) => undefined,
+        query: async (_node: BinaryNode) =>
+            ({ tag: 'iq', attrs: { type: 'result' } }) as BinaryNode,
+        queryWithContext: async (_context: string, _node: BinaryNode) =>
+            ({ tag: 'iq', attrs: { type: 'result' } }) as BinaryNode,
+        syncAppState: async () => undefined,
+        syncAppStateWithOptions: async () => ({ collections: [] }) as never,
+        emitEvent: (() => undefined) as never,
+        handleIncomingMessageEvent: async () => undefined,
+        handleError: (_error: Error) => undefined,
+        handleIncomingFrame: async (_frame: Uint8Array) => undefined,
+        clearStoredState: async () => undefined,
+        resumeIncomingEvents: () => undefined,
+        subscribeProtocolMessage: () => () => undefined,
+        hasEventListener: () => false,
+        persistContact: () => undefined
+    }
+    const { authClient } = buildWaClientDependencies({ base, runtime })
+    await authClient.loadOrCreateCredentials()
+    const config = await authClient.buildCommsConfig({ url: 'wss://web.whatsapp.com/ws/chat' })
+    const registration = config.noise.registrationPayloadConfig
+    assert.ok(registration)
+    const payload = proto.ClientPayload.decode(buildRegistrationPayload(registration))
+    return proto.DeviceProps.decode(payload.devicePairingData!.deviceProps!)
+}
+
+test('pairing requests a full history sync when history.requireFullSync is set', async () => {
+    const deviceProps = await pairingDeviceProps({ history: { requireFullSync: true } })
+    assert.equal(deviceProps.requireFullSync, true)
+})
+
+test('history.requireFullSync overrides the top-level requireFullSync in both directions', async () => {
+    const optedOut = await pairingDeviceProps({
+        requireFullSync: true,
+        history: { requireFullSync: false }
+    })
+    assert.equal(optedOut.requireFullSync, false)
+
+    const optedIn = await pairingDeviceProps({
+        requireFullSync: false,
+        history: { requireFullSync: true }
+    })
+    assert.equal(optedIn.requireFullSync, true)
+})
+
+test('pairing falls back to the top-level requireFullSync when history sets none', async () => {
+    const deviceProps = await pairingDeviceProps({ requireFullSync: true, history: {} })
+    assert.equal(deviceProps.requireFullSync, true)
+})
+
 test('default option resolution: autoDecrypt on, history on, markOnlineOnConnect off', () => {
     const opts: WaClientOptions = { store: {} as never, sessionId: 's' }
 
@@ -1227,4 +1307,113 @@ test('newsletter send publishes a link preview as type=media with mediatype=url'
     assert.equal(plaintext.tag, 'plaintext')
     assert.equal(plaintext.attrs.mediatype, 'url')
     assert.ok(plaintext.content instanceof Uint8Array)
+})
+
+async function deliverHistoryNotification(options: WaClientOptions['history']) {
+    const timeline: string[] = []
+    const emitted: { readonly name: string; readonly payload: unknown }[] = []
+    const receipts: { readonly to: string; readonly id: string }[] = []
+    const noop = async () => undefined
+    const fakeClient = {
+        options: { addons: { autoDecrypt: false }, history: options },
+        logger: createNoopLogger(),
+        stores: { messageSecret: {} },
+        writeBehind: {
+            persistMessage: () => undefined,
+            persistContact: () => undefined,
+            persistMessageAsync: noop,
+            persistThreadAsync: noop,
+            persistContactAsync: noop
+        },
+        mediaTransfer: {},
+        message: {
+            sendReceipt: async (to: string, id: string) => {
+                timeline.push('receipt')
+                receipts.push({ to, id })
+            }
+        },
+        deps: {
+            botCoordinator: { tryDecryptChunk: noop },
+            messageCoordinator: { tryDecryptAddon: noop },
+            trustedContactToken: {
+                hydrateFromHistorySync: noop,
+                hydrateNctSaltFromHistorySync: noop
+            },
+            authClient: { getCurrentCredentials: () => null }
+        },
+        tryEnterIncomingHandler: () => true,
+        leaveIncomingHandler: () => undefined,
+        observeEphemeralSetting: () => undefined,
+        emit: (name: string, payload: unknown) => {
+            if (name === 'history_sync_chunk') {
+                timeline.push('event')
+            }
+            emitted.push({ name, payload })
+            return true
+        }
+    }
+    const handleIncomingMessageEvent = (
+        WaClient.prototype as unknown as {
+            readonly handleIncomingMessageEvent: (this: unknown, event: unknown) => Promise<void>
+        }
+    ).handleIncomingMessageEvent
+    await handleIncomingMessageEvent.call(fakeClient, {
+        key: { remoteJid: '5511888888888@s.whatsapp.net', id: 'CARRIER-77', fromMe: false },
+        rawNode: { tag: 'message', attrs: {} },
+        message: {
+            protocolMessage: {
+                type: proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION,
+                historySyncNotification: {
+                    syncType: proto.Message.HistorySyncType.RECENT,
+                    initialHistBootstrapInlinePayload: gzipSync(
+                        proto.HistorySync.encode({
+                            pushnames: [{ id: '5511777777777@s.whatsapp.net', pushname: 'Friend' }]
+                        }).finish()
+                    )
+                }
+            }
+        }
+    })
+    return { timeline, emitted, receipts }
+}
+
+test('history.sink receives the chunk id of the carrier message and commits before the receipt', async () => {
+    const items: { readonly kind: string; readonly chunk: unknown }[] = []
+    const commits: unknown[] = []
+    const result = await deliverHistoryNotification({
+        sink: {
+            item: (item, chunk) => {
+                items.push({ kind: item.kind, chunk })
+            },
+            commit: (chunk) => {
+                commits.push(chunk)
+            }
+        }
+    })
+
+    assert.deepEqual(items, [
+        {
+            kind: 'pushnames',
+            chunk: { id: 'CARRIER-77', syncType: proto.Message.HistorySyncType.RECENT }
+        }
+    ])
+    assert.equal((commits[0] as { id: string }).id, 'CARRIER-77')
+    const chunkEvent = result.emitted.find((entry) => entry.name === 'history_sync_chunk')
+    assert.equal((chunkEvent?.payload as { id: string }).id, 'CARRIER-77')
+    assert.deepEqual(result.receipts, [{ to: '5511888888888@s.whatsapp.net', id: 'CARRIER-77' }])
+    assert.deepEqual(result.timeline, ['event', 'receipt'])
+})
+
+test('history.sink is skipped when history.enabled is false, and the primary is still acked', async () => {
+    let calls = 0
+    const bump = () => {
+        calls += 1
+    }
+    const result = await deliverHistoryNotification({
+        enabled: false,
+        sink: { item: bump, commit: bump, abort: bump }
+    })
+
+    assert.equal(calls, 0)
+    assert.deepEqual(result.timeline, ['receipt'])
 })

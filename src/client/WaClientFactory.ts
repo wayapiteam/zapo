@@ -63,6 +63,7 @@ import { DEVICE_NOTIFICATION_ACTIONS, parseDeviceNotification } from '@client/ev
 import { handleDirtyBits, parseDirtyBits } from '@client/events/dirty'
 import { parseIdentityChangeNotification } from '@client/events/identity'
 import { parsePrivacyTokenNotification } from '@client/events/privacy-token'
+import { parseOwnUsernameNotification } from '@client/events/username'
 import { createDeviceFanoutResolver } from '@client/messaging/fanout'
 import { createGroupMetadataCache } from '@client/messaging/group-metadata'
 import { createAppStateSyncKeyProtocol } from '@client/messaging/key-protocol'
@@ -490,7 +491,7 @@ export function buildWaClientDependencies(input: {
     let connectionManager: WaConnectionManager | null = null
     let passiveTasks: WaPassiveTasksCoordinator | null = null
     let mediaConnCacheFallback: WaMediaConn | null = null
-    let scheduleReconnectAfterPairing: () => void = () => undefined
+    let awaitServerRestartAfterPairing: () => void = () => undefined
 
     const serverClock = createServerClock(() => connectionManager?.getClockSkewMs() ?? null)
 
@@ -633,7 +634,7 @@ export function buildWaClientDependencies(input: {
             deviceOsDisplayName: options.deviceOsDisplayName,
             deviceOsVersion: options.deviceOsVersion,
             devicePlatform: options.devicePlatform,
-            requireFullSync: options.requireFullSync,
+            requireFullSync: options.history?.requireFullSync ?? options.requireFullSync,
             version: options.version,
             dangerous: options.dangerous,
             mobileTransport: options.mobileTransport
@@ -655,7 +656,7 @@ export function buildWaClientDependencies(input: {
                     runtime.emitEvent('auth_pairing_required', { forceManual }),
                 onPaired: (credentials) => {
                     runtime.emitEvent('auth_paired', { credentials })
-                    scheduleReconnectAfterPairing()
+                    awaitServerRestartAfterPairing()
                 },
                 onError: (error) => runtime.handleError(error),
                 onPasskeyRequired: (hasSigner) =>
@@ -690,6 +691,11 @@ export function buildWaClientDependencies(input: {
 
     const privacyCoordinator = createPrivacyCoordinator({
         logger,
+        contactStore: sessionStore.contacts,
+        isUsernamePrivacyListIdentifierEnabled: () =>
+            abPropsCoordinator.getConfigValue<boolean>(
+                'username_contact_privacy_setting_allow_uncontact_set_enable'
+            ),
         queryWithContext: runtime.queryWithContext,
         resolveUserJidPair: (userJid) => signalDeviceSync.resolveUserJidPair(userJid),
         getSelfLid: () => getCurrentCredentials()?.meLid ?? null,
@@ -1018,7 +1024,7 @@ export function buildWaClientDependencies(input: {
     if (mediaConnCacheFallback !== null) {
         connectionManager.setMediaConnCache(mediaConnCacheFallback)
     }
-    scheduleReconnectAfterPairing = () => connectionManager?.scheduleReconnectAfterPairing()
+    awaitServerRestartAfterPairing = () => connectionManager?.awaitServerRestartAfterPairing()
 
     const disconnectWithClientSideEffects = async (
         reason: WaDisconnectReason,
@@ -1067,7 +1073,8 @@ export function buildWaClientDependencies(input: {
         },
         disconnect: disconnectWithClientSideEffects,
         clearStoredCredentials: clearStoredCredentialsWithClientSideEffects,
-        connect: connectWithClientSideEffects
+        connect: connectWithClientSideEffects,
+        handlePairingRestart: () => connectionManager?.handleServerRestartRequest() ?? false
     })
 
     const incomingMessageAckOptions: Parameters<typeof handleIncomingMessageAck>[1] = {
@@ -1339,6 +1346,10 @@ export function buildWaClientDependencies(input: {
         handler: async (node) => {
             if (findNodeChild(node, WA_NODE_TAGS.PRIVACY)) {
                 privacyCoordinator.scheduleAccountSyncRefresh()
+            }
+            const usernameEvent = parseOwnUsernameNotification(node)
+            if (usernameEvent) {
+                runtime.emitEvent('own_username', usernameEvent)
             }
             return false
         }

@@ -128,7 +128,16 @@ type UserMediaFields<T> = {
     readonly [K in keyof Omit<T, MediaFieldsFilledByBuilder>]?: T[K]
 }
 
-interface WaSendMediaBase {
+interface WaSendMessageContextInfo {
+    /**
+     * The `Message`-level `messageContextInfo` (not the media's `contextInfo`), e.g.
+     * `messageAssociation`, whose `parentMessageKey.remoteJid` must be the resolved
+     * chat JID (the LID for a LID chat).
+     */
+    readonly messageContextInfo?: Proto.IMessageContextInfo
+}
+
+interface WaSendMediaBase extends WaSendMessageContextInfo {
     readonly media: MediaInput
     /**
      * Mime type of the media. Optional when a {@link WaMediaProcessor} with
@@ -141,7 +150,7 @@ interface WaSendMediaBase {
     readonly contextInfo?: WaSendContextInfo
 }
 
-export interface WaSendTextMessage {
+export interface WaSendTextMessage extends WaSendMessageContextInfo {
     readonly type: 'text'
     readonly text: string
     readonly contextInfo?: WaSendContextInfo
@@ -183,7 +192,7 @@ export interface WaMessageRef {
 /** An explicit {@link WaMessageKey}, or a received `message` event ({@link WaMessageRef}). */
 export type WaMessageTargetInput = WaMessageKey | WaMessageRef
 
-export interface WaSendReactionMessage {
+export interface WaSendReactionMessage extends WaSendMessageContextInfo {
     readonly type: 'reaction'
     /** Emoji to attach. Pass an empty string to revoke an existing reaction. */
     readonly emoji: string
@@ -193,13 +202,13 @@ export interface WaSendReactionMessage {
     readonly senderTimestampMs?: number
 }
 
-export interface WaSendRevokeMessage {
+export interface WaSendRevokeMessage extends WaSendMessageContextInfo {
     readonly type: 'revoke'
     /** An explicit {@link WaMessageKey} or a received `message` event passed verbatim. */
     readonly target: WaMessageTargetInput
 }
 
-export interface WaSendPinMessage {
+export interface WaSendPinMessage extends WaSendMessageContextInfo {
     readonly type: 'pin' | 'unpin'
     /** An explicit {@link WaMessageKey} or a received `message` event passed verbatim. */
     readonly target: WaMessageTargetInput
@@ -222,7 +231,7 @@ export interface WaSendEditKey {
     readonly timestampMs?: number
 }
 
-export interface WaSendKeepMessage {
+export interface WaSendKeepMessage extends WaSendMessageContextInfo {
     readonly type: 'keep' | 'unkeep'
     /** An explicit {@link WaMessageKey} or a received `message` event passed verbatim. */
     readonly target: WaMessageTargetInput
@@ -242,7 +251,7 @@ export interface WaSendPollOptionInput {
  * `pollCreationMessage`. Both flags are only serialized when `true`; sending
  * them as `false` makes receivers render the poll as an unsupported message.
  */
-export interface WaSendPollMessage {
+export interface WaSendPollMessage extends WaSendMessageContextInfo {
     readonly type: 'poll'
     readonly name: string
     /** Option names (strings) or `{ name }` objects. Order matters for vote hashing. */
@@ -268,7 +277,7 @@ export interface WaSendPollParent {
     readonly messageSecret: Uint8Array
 }
 
-export interface WaSendPollVoteMessage {
+export interface WaSendPollVoteMessage extends WaSendMessageContextInfo {
     readonly type: 'poll-vote'
     readonly poll: WaSendPollParent
     /** Option names exactly as they appeared in the poll. Hashed with SHA-256 internally. */
@@ -284,7 +293,7 @@ export interface WaSendEventLocation {
     readonly address?: string
 }
 
-export interface WaSendEventMessage {
+export interface WaSendEventMessage extends WaSendMessageContextInfo {
     readonly type: 'event'
     readonly name: string
     readonly description?: string
@@ -316,7 +325,7 @@ export interface WaSendEventParent {
     readonly messageSecret: Uint8Array
 }
 
-export interface WaSendEventResponseMessage {
+export interface WaSendEventResponseMessage extends WaSendMessageContextInfo {
     readonly type: 'event-response'
     readonly event: WaSendEventParent
     readonly response: WaSendEventResponseType
@@ -375,12 +384,15 @@ type StickerPackBuilderFilled =
     | 'imageDataHash'
     | 'stickerPackOrigin'
 
-export interface WaSendStickerPackMessage extends UserMediaFields<
-    Omit<
-        Proto.Message.IStickerPackMessage,
-        StickerPackBuilderFilled | 'stickerPackId' | 'name' | 'publisher'
-    >
-> {
+export interface WaSendStickerPackMessage
+    extends
+        WaSendMessageContextInfo,
+        UserMediaFields<
+            Omit<
+                Proto.Message.IStickerPackMessage,
+                StickerPackBuilderFilled | 'stickerPackId' | 'name' | 'publisher'
+            >
+        > {
     readonly type: 'sticker-pack'
     readonly stickerPackId: string
     readonly name: string
@@ -400,8 +412,7 @@ export type WaSendMediaMessage =
     | WaSendStickerMessage
     | WaSendStickerPackMessage
 
-export type WaSendMessageContent =
-    | string
+export type WaSendTypedMessage =
     | WaSendTextMessage
     | WaSendReactionMessage
     | WaSendRevokeMessage
@@ -411,8 +422,9 @@ export type WaSendMessageContent =
     | WaSendPollVoteMessage
     | WaSendEventMessage
     | WaSendEventResponseMessage
-    | Proto.IMessage
     | WaSendMediaMessage
+
+export type WaSendMessageContent = string | WaSendTypedMessage | Proto.IMessage
 
 export interface WaEncryptedMessageInput {
     readonly to: string

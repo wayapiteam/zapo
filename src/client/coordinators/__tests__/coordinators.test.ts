@@ -13,6 +13,7 @@ import { WaMessageDispatchCoordinator } from '@client/coordinators/WaMessageDisp
 import { WaPassiveTasksCoordinator } from '@client/coordinators/WaPassiveTasksCoordinator'
 import { createStreamControlHandler } from '@client/coordinators/WaStreamControlCoordinator'
 import { createGroupMetadataCache } from '@client/messaging/group-metadata'
+import { buildMediaMessageContent, type WaMediaMessageOptions } from '@client/messaging/messages'
 import type {
     WaAppStateMutationEvent,
     WaGroupEvent,
@@ -20,20 +21,40 @@ import type {
     WaOfflineThreadMetadataEvent,
     WaOutgoingMessageEvent
 } from '@client/types'
+import { toSerializedPubKey } from '@crypto/core/keys'
 import { createNoopLogger } from '@infra/log/types'
 import type { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
 import { getContextInfo } from '@message/context-info'
+import { unpadPkcs7 } from '@message/encode/padding'
+import type { WaSendMessageContent } from '@message/types'
+import { proto, type Proto } from '@proto'
 import {
     WA_APP_STATE_COLLECTION_STATES,
     WA_CONNECTION_REASONS,
     WA_DISCONNECT_REASONS,
+    WA_IQ_TYPES,
+    WA_NODE_TAGS,
     WA_STREAM_SIGNALING
 } from '@protocol/constants'
+import { parseSignalAddressFromJid } from '@protocol/jid'
+import {
+    SIGNAL_KEY_DATA_LENGTH,
+    SIGNAL_KEY_ID_LENGTH,
+    SIGNAL_REGISTRATION_ID_LENGTH,
+    SIGNAL_SIGNATURE_LENGTH
+} from '@signal/api/constants'
+import { SignalSessionSyncApi } from '@signal/api/SignalSessionSyncApi'
+import { createSignalSessionResolver } from '@signal/session/resolver'
+import type { SignalAddress, SignalSessionRecord } from '@signal/types'
 import type { WaStoredThreadRecord, WaThreadStore } from '@store/contracts/thread.store'
 import { WaChatMetadataMemoryStore } from '@store/memory/chat-metadata.store'
 import { WaGroupMetadataMemoryStore } from '@store/memory/group-metadata.store'
+import { WaIdentityMemoryStore } from '@store/memory/identity.store'
 import { WaMessageMemoryStore } from '@store/memory/message.store'
+import { WaSessionMemoryStore } from '@store/memory/session.store'
 import type { BinaryNode } from '@transport/types'
+import { delay } from '@util/async'
+import { intToBytes } from '@util/bytes'
 import type { ServerClock } from '@util/clock'
 
 function createStubThreadStore(
@@ -146,6 +167,18 @@ function createMessageDispatchCoordinator(
         readonly emitMessageSend?: (event: WaOutgoingMessageEvent) => void
         readonly threadStore?: WaThreadStore
         readonly chatMetadataStore?: WaChatMetadataMemoryStore
+        readonly buildMessageContent?: (
+            content: WaSendMessageContent
+        ) => Promise<{ readonly message: Proto.IMessage }>
+        readonly senderKeyManager?: unknown
+        readonly messageClient?: unknown
+        readonly retryTracker?: unknown
+        readonly fanoutResolver?: unknown
+        readonly signalStore?: unknown
+        readonly identityStore?: unknown
+        readonly deviceListStore?: unknown
+        readonly sessionResolver?: unknown
+        readonly sessionStore?: unknown
     }
 ): WaMessageDispatchCoordinator {
     const groupMetadataCache = createGroupMetadataCache({
@@ -157,19 +190,19 @@ function createMessageDispatchCoordinator(
     return new WaMessageDispatchCoordinator({
         logger: createNoopLogger(),
         emitMessageSend: overrides?.emitMessageSend,
-        messageClient: {} as never,
-        retryTracker: {} as never,
-        sessionResolver: {} as never,
-        fanoutResolver: {} as never,
+        messageClient: (overrides?.messageClient ?? {}) as never,
+        retryTracker: (overrides?.retryTracker ?? {}) as never,
+        sessionResolver: (overrides?.sessionResolver ?? {}) as never,
+        fanoutResolver: (overrides?.fanoutResolver ?? {}) as never,
         groupMetadataCache,
         appStateSyncKeyProtocol: {} as never,
-        buildMessageContent: async () => ({ message: {} }),
-        senderKeyManager: {} as never,
+        buildMessageContent: overrides?.buildMessageContent ?? (async () => ({ message: {} })),
+        senderKeyManager: (overrides?.senderKeyManager ?? {}) as never,
         signalProtocol: {} as never,
-        signalStore: {} as never,
-        sessionStore: {} as never,
-        identityStore: {} as never,
-        deviceListStore: {} as never,
+        signalStore: (overrides?.signalStore ?? {}) as never,
+        sessionStore: (overrides?.sessionStore ?? {}) as never,
+        identityStore: (overrides?.identityStore ?? {}) as never,
+        deviceListStore: (overrides?.deviceListStore ?? {}) as never,
         threadStore: overrides?.threadStore ?? createStubThreadStore(),
         chatMetadataStore: overrides?.chatMetadataStore ?? new WaChatMetadataMemoryStore(60_000),
         signalDeviceSync: (overrides?.signalDeviceSync ?? {
@@ -239,6 +272,162 @@ test('message dispatch emits message_send with the outbound proto and destinatio
     assert.equal(events.length, 1)
     assert.equal(events[0]?.to, '5511999999999@s.whatsapp.net')
     assert.ok(events[0]?.message)
+})
+
+test('message dispatch keeps a user messageAssociation next to the injected secret and icdc', async () => {
+    const messageAssociation: Proto.IMessageAssociation = {
+        associationType: proto.MessageAssociation.AssociationType.MEDIA_ALBUM,
+        parentMessageKey: {
+            remoteJid: '120363000000000000@g.us',
+            fromMe: true,
+            id: 'ALBUM-PARENT'
+        }
+    }
+    let sentPlaintext: Uint8Array | undefined
+    const stop = new Error('stop after encode')
+    const coordinator = createMessageDispatchCoordinator(new WaGroupMetadataMemoryStore(), {
+        meJid: '5511000000000@s.whatsapp.net',
+        buildMessageContent: async () => ({
+            message: { messageContextInfo: { messageAssociation }, imageMessage: { caption: 'c' } }
+        }),
+        signalStore: { getRegistrationInfo: async () => null },
+        deviceListStore: {
+            getUserDevicesBatch: async () => [
+                { deviceJids: ['5511000000000:0@s.whatsapp.net'], updatedAtMs: Date.now() }
+            ]
+        },
+        identityStore: { getRemoteIdentities: async () => [new Uint8Array(32).fill(7)] },
+        senderKeyManager: {
+            prepareGroupEncryption: async (
+                _groupJid: string,
+                _sender: unknown,
+                plaintext: Uint8Array
+            ) => {
+                sentPlaintext = plaintext
+                throw stop
+            }
+        }
+    })
+
+    await assert.rejects(
+        () =>
+            coordinator.sendMessage(
+                '120363000000000001@g.us',
+                { type: 'image', media: new Uint8Array(1) },
+                { expirationSeconds: 60 }
+            ),
+        stop
+    )
+
+    const decoded = proto.Message.decode(unpadPkcs7(sentPlaintext!))
+    const context = decoded.messageContextInfo
+    assert.equal(
+        context?.messageAssociation?.associationType,
+        proto.MessageAssociation.AssociationType.MEDIA_ALBUM
+    )
+    assert.equal(context?.messageAssociation?.parentMessageKey?.id, 'ALBUM-PARENT')
+    assert.equal(context?.messageSecret?.byteLength, 32)
+    assert.ok(context?.deviceListMetadata?.senderKeyHash?.byteLength)
+    assert.equal(decoded.imageMessage?.contextInfo?.expiration, 60)
+})
+
+test('message dispatch keeps the user messageContextInfo on a quoted typed text send', async () => {
+    const messageAssociation: Proto.IMessageAssociation = {
+        associationType: proto.MessageAssociation.AssociationType.MEDIA_ALBUM,
+        parentMessageKey: { remoteJid: '120363000000000001@g.us', fromMe: true, id: 'PARENT' }
+    }
+    let sentPlaintext: Uint8Array | undefined
+    const stop = new Error('stop after encode')
+    const coordinator = createMessageDispatchCoordinator(new WaGroupMetadataMemoryStore(), {
+        meJid: '5511000000000@s.whatsapp.net',
+        buildMessageContent: (content) =>
+            buildMediaMessageContent(
+                { logger: createNoopLogger() } as unknown as WaMediaMessageOptions,
+                content
+            ),
+        signalStore: { getRegistrationInfo: async () => null },
+        senderKeyManager: {
+            prepareGroupEncryption: async (
+                _groupJid: string,
+                _sender: unknown,
+                plaintext: Uint8Array
+            ) => {
+                sentPlaintext = plaintext
+                throw stop
+            }
+        }
+    })
+
+    await assert.rejects(
+        () =>
+            coordinator.sendMessage(
+                '120363000000000001@g.us',
+                { type: 'text', text: 'hi', messageContextInfo: { messageAssociation } },
+                {
+                    expirationSeconds: 60,
+                    quote: {
+                        remoteJid: '120363000000000001@g.us',
+                        id: 'QUOTED',
+                        fromMe: false,
+                        participant: '5511888888888@s.whatsapp.net'
+                    }
+                }
+            ),
+        stop
+    )
+
+    const decoded = proto.Message.decode(unpadPkcs7(sentPlaintext!))
+    assert.equal(decoded.extendedTextMessage?.text, 'hi')
+    assert.equal(decoded.extendedTextMessage?.contextInfo?.stanzaId, 'QUOTED')
+    assert.equal(decoded.extendedTextMessage?.contextInfo?.expiration, 60)
+    assert.equal(decoded.messageContextInfo?.messageAssociation?.parentMessageKey?.id, 'PARENT')
+    assert.equal(decoded.messageContextInfo?.messageSecret?.byteLength, 32)
+})
+
+test('message dispatch publishes a form_message flow with a bare native_flow name', async () => {
+    let published: BinaryNode | undefined
+    const stop = new Error('stop after publish')
+    const coordinator = createMessageDispatchCoordinator(new WaGroupMetadataMemoryStore(), {
+        meJid: '5511000000000@s.whatsapp.net',
+        buildMessageContent: async () => ({
+            message: {
+                interactiveMessage: {
+                    nativeFlowMessage: {
+                        buttons: [{ name: 'form_message', buttonParamsJson: '{}' }]
+                    }
+                }
+            }
+        }),
+        signalStore: { getRegistrationInfo: async () => null },
+        fanoutResolver: { resolveGroupParticipantDeviceJids: async () => [] },
+        retryTracker: {
+            track: async (_meta: unknown, publish: () => Promise<unknown>) => publish()
+        },
+        messageClient: {
+            publishNode: async (node: BinaryNode) => {
+                published = node
+                throw stop
+            }
+        },
+        senderKeyManager: {
+            prepareGroupEncryption: async () => ({
+                distributionMessage: {},
+                ciphertext: { ciphertext: new Uint8Array(1) },
+                keyId: 1
+            })
+        }
+    })
+
+    await assert.rejects(
+        () => coordinator.sendMessage('120363000000000001@g.us', { text: 'x' } as never, {}),
+        stop
+    )
+
+    assert.equal(published?.attrs.type, 'text')
+    const biz = (published?.content as BinaryNode[]).find((child) => child.tag === 'biz')
+    const interactive = (biz?.content as BinaryNode[])[0]
+    assert.deepEqual(interactive.attrs, { type: 'native_flow', v: '1' })
+    assert.deepEqual((interactive.content as BinaryNode[])[0].attrs, { name: 'form_message' })
 })
 
 test('outgoing secret sender prefers meLid and recedes to meJid when lid is malformed', () => {
@@ -652,7 +841,8 @@ test('stream control handler runs force-login and resume flows', async () => {
         connect: async (reason) => {
             calls.push('connect')
             connectCalls.push(reason)
-        }
+        },
+        handlePairingRestart: () => false
     })
 
     await handler.handleStreamControlResult({
@@ -681,6 +871,60 @@ test('stream control handler runs force-login and resume flows', async () => {
     assert.deepEqual(calls, ['clear_pending', 'clear_media', 'resume'])
     assert.deepEqual(disconnectCalls, [])
     assert.deepEqual(connectCalls, [])
+})
+
+test('stream control handler leaves the force-login stream error to a pairing restart that claims it', async () => {
+    const calls: string[] = []
+    let claim = true
+    const handler = createStreamControlHandler({
+        logger: createNoopLogger(),
+        getComms: () =>
+            ({
+                stopComms: async () => {
+                    calls.push('stopComms')
+                },
+                closeSocketAndResume: async () => {
+                    calls.push('resume')
+                }
+            }) as never,
+        clearPendingQueries: () => {
+            calls.push('clear_pending')
+        },
+        clearMediaConnCache: () => {
+            calls.push('clear_media')
+        },
+        disconnect: async () => {
+            calls.push('disconnect')
+        },
+        clearStoredCredentials: async () => {
+            calls.push('clear_credentials')
+        },
+        connect: async () => {
+            calls.push('connect')
+        },
+        handlePairingRestart: () => {
+            calls.push('pairing_restart')
+            return claim
+        }
+    })
+
+    await handler.handleStreamControlResult({
+        kind: 'stream_error_code',
+        code: WA_STREAM_SIGNALING.FORCE_LOGIN_CODE
+    })
+    assert.deepEqual(calls, ['pairing_restart'])
+
+    calls.length = 0
+    await handler.handleStreamControlResult({ kind: 'stream_error_code', code: 500 })
+    assert.deepEqual(calls, ['clear_pending', 'clear_media', 'resume'])
+
+    calls.length = 0
+    claim = false
+    await handler.handleStreamControlResult({
+        kind: 'stream_error_code',
+        code: WA_STREAM_SIGNALING.FORCE_LOGIN_CODE
+    })
+    assert.deepEqual(calls, ['pairing_restart', 'stopComms', 'disconnect', 'connect'])
 })
 
 test('stream control handler handles force-logout, replaced and device-removed flows', async () => {
@@ -720,7 +964,8 @@ test('stream control handler handles force-logout, replaced and device-removed f
         connect: async (reason) => {
             calls.push('connect')
             connectCalls.push(reason)
-        }
+        },
+        handlePairingRestart: () => false
     })
 
     await handler.handleStreamControlResult({
@@ -1548,14 +1793,26 @@ test('app-state mutation coordinator routes applied SettingPushName to pushNameS
     assert.deepEqual(names, ['Maria'])
 })
 
+interface WaPassiveTasksHarness {
+    readonly coordinator: WaPassiveTasksCoordinator
+    /**
+     * True once the coordinator has sent its closing `passive.active` IQ – the
+     * last step of the post-connect run, so the receipt flush is finished.
+     * Waiting on the pipeline's own end marker keeps assertions off a fixed
+     * sleep a loaded machine can outrun.
+     */
+    isSettled(): boolean
+}
+
 function createPassiveTasksCoordinator(overrides: {
     readonly takeDanglingReceipts: () => BinaryNode[]
     readonly sendNodeDirect: (node: BinaryNode) => Promise<void>
     readonly shouldQueueDanglingReceipt?: (node: BinaryNode, error: Error) => boolean
     readonly requeueDanglingReceipt?: (node: BinaryNode) => void
-}): WaPassiveTasksCoordinator {
+}): WaPassiveTasksHarness {
     const requeued: BinaryNode[] = []
-    return new WaPassiveTasksCoordinator({
+    let settled = false
+    const coordinator = new WaPassiveTasksCoordinator({
         logger: createNoopLogger(),
         signalStore: {
             getSignedPreKeyRotationTs: async () => Date.now(),
@@ -1586,7 +1843,12 @@ function createPassiveTasksCoordinator(overrides: {
             rotateSignedPreKey: async () => undefined
         } as never,
         runtime: {
-            queryWithContext: async () => ({ tag: 'iq', attrs: {} }),
+            queryWithContext: async (context: string) => {
+                if (context === 'passive.active') {
+                    settled = true
+                }
+                return { tag: 'iq', attrs: {} }
+            },
             getCurrentCredentials: () => ({ meJid: '551100000000@s.whatsapp.net' }) as never,
             persistServerHasPreKeys: async () => undefined,
             sendNodeDirect: overrides.sendNodeDirect,
@@ -1598,6 +1860,26 @@ function createPassiveTasksCoordinator(overrides: {
             sendInitialPresence: async () => undefined
         }
     })
+    return { coordinator, isSettled: () => settled }
+}
+
+/**
+ * Waits for a fire-and-forget pipeline to reach a checkpoint. Polling beats a
+ * fixed sleep: the sleep either flakes when a loaded machine misses the window
+ * or pads every run to cover the worst case.
+ */
+async function waitFor(
+    predicate: () => boolean,
+    message: string,
+    timeoutMs = 5_000
+): Promise<void> {
+    const deadline = Date.now() + timeoutMs
+    while (!predicate()) {
+        if (Date.now() > deadline) {
+            throw new Error(message)
+        }
+        await delay(1)
+    }
 }
 
 function makeReceiptNode(id: string): BinaryNode {
@@ -1611,7 +1893,7 @@ test('passive tasks coordinator flushes dangling receipts concurrently in batche
 
     const nodes = Array.from({ length: 6 }, (_, i) => makeReceiptNode(`r${i}`))
 
-    const coordinator = createPassiveTasksCoordinator({
+    const passiveTasks = createPassiveTasksCoordinator({
         takeDanglingReceipts: () => nodes,
         sendNodeDirect: async (node) => {
             concurrency += 1
@@ -1622,8 +1904,8 @@ test('passive tasks coordinator flushes dangling receipts concurrently in batche
         }
     })
 
-    coordinator.startPassiveTasksAfterConnect()
-    await new Promise<void>((resolve) => setTimeout(resolve, 100))
+    passiveTasks.coordinator.startPassiveTasksAfterConnect()
+    await waitFor(() => passiveTasks.isSettled(), 'passive tasks never finished')
 
     assert.equal(sent.length, 6)
     assert.ok(
@@ -1637,7 +1919,7 @@ test('passive tasks coordinator requeues remaining receipts on transient error',
     const requeued: BinaryNode[] = []
     const nodes = Array.from({ length: 6 }, (_, i) => makeReceiptNode(`r${i}`))
 
-    const coordinator = createPassiveTasksCoordinator({
+    const passiveTasks = createPassiveTasksCoordinator({
         takeDanglingReceipts: () => nodes,
         sendNodeDirect: async (node) => {
             if (node.attrs.id === 'r1') {
@@ -1648,8 +1930,8 @@ test('passive tasks coordinator requeues remaining receipts on transient error',
         requeueDanglingReceipt: (node) => requeued.push(node)
     })
 
-    coordinator.startPassiveTasksAfterConnect()
-    await new Promise<void>((resolve) => setTimeout(resolve, 100))
+    passiveTasks.coordinator.startPassiveTasksAfterConnect()
+    await waitFor(() => passiveTasks.isSettled(), 'passive tasks never finished')
 
     const requeuedIds = requeued.map((node) => node.attrs.id)
     assert.ok(requeuedIds.includes('r1'), 'transient-failed receipt should be requeued')
@@ -2072,7 +2354,7 @@ test('passive tasks coordinator drops non-retryable receipt errors without stopp
     const sent: string[] = []
     const nodes = Array.from({ length: 3 }, (_, i) => makeReceiptNode(`r${i}`))
 
-    const coordinator = createPassiveTasksCoordinator({
+    const passiveTasks = createPassiveTasksCoordinator({
         takeDanglingReceipts: () => nodes,
         sendNodeDirect: async (node) => {
             if (node.attrs.id === 'r1') {
@@ -2083,8 +2365,8 @@ test('passive tasks coordinator drops non-retryable receipt errors without stopp
         shouldQueueDanglingReceipt: () => false
     })
 
-    coordinator.startPassiveTasksAfterConnect()
-    await new Promise<void>((resolve) => setTimeout(resolve, 100))
+    passiveTasks.coordinator.startPassiveTasksAfterConnect()
+    await waitFor(() => passiveTasks.isSettled(), 'passive tasks never finished')
 
     assert.deepEqual(sent, ['r0', 'r2'])
 })
@@ -2137,4 +2419,217 @@ test('incoming node coordinator emits the offline thread manifest alongside the 
         { jid: '120363078720039631@g.us', timestampSeconds: 1_784_595_546 }
     ])
     assert.equal(notifications.length, 1)
+})
+
+const SYNC_SESSION_JID = '5511999999999@s.whatsapp.net'
+
+function createSyncSessionHarness() {
+    const address = parseSignalAddressFromJid(SYNC_SESSION_JID)
+    const oldIdentity = toSerializedPubKey(new Uint8Array(SIGNAL_KEY_DATA_LENGTH).fill(1))
+    const serverIdentity = new Uint8Array(SIGNAL_KEY_DATA_LENGTH).fill(1)
+    const oldSession = { remote: { pubKey: oldIdentity } } as unknown as SignalSessionRecord
+    const calls: string[] = []
+    const requests: BinaryNode[] = []
+    const sessions = new WaSessionMemoryStore()
+    const identities = new WaIdentityMemoryStore()
+    const state = { failFetch: false }
+
+    const sessionStore = Object.assign(Object.create(sessions) as WaSessionMemoryStore, {
+        deleteSession: async (target: SignalAddress) => {
+            calls.push('delete')
+            await sessions.deleteSession(target)
+        }
+    })
+    const signalSessionSync = new SignalSessionSyncApi({
+        logger: createNoopLogger(),
+        query: async (node) => {
+            calls.push('fetch')
+            requests.push(node)
+            const userContent: BinaryNode[] = state.failFetch
+                ? [{ tag: WA_NODE_TAGS.ERROR, attrs: { code: '500', text: 'boom' } }]
+                : [
+                      {
+                          tag: WA_NODE_TAGS.REGISTRATION,
+                          attrs: {},
+                          content: intToBytes(SIGNAL_REGISTRATION_ID_LENGTH, 7)
+                      },
+                      { tag: WA_NODE_TAGS.IDENTITY, attrs: {}, content: serverIdentity },
+                      {
+                          tag: WA_NODE_TAGS.SKEY,
+                          attrs: {},
+                          content: [
+                              {
+                                  tag: WA_NODE_TAGS.ID,
+                                  attrs: {},
+                                  content: intToBytes(SIGNAL_KEY_ID_LENGTH, 8)
+                              },
+                              {
+                                  tag: WA_NODE_TAGS.VALUE,
+                                  attrs: {},
+                                  content: new Uint8Array(SIGNAL_KEY_DATA_LENGTH).fill(2)
+                              },
+                              {
+                                  tag: WA_NODE_TAGS.SIGNATURE,
+                                  attrs: {},
+                                  content: new Uint8Array(SIGNAL_SIGNATURE_LENGTH).fill(3)
+                              }
+                          ]
+                      }
+                  ]
+            return {
+                tag: WA_NODE_TAGS.IQ,
+                attrs: { type: WA_IQ_TYPES.RESULT },
+                content: [
+                    {
+                        tag: WA_NODE_TAGS.LIST,
+                        attrs: {},
+                        content: [
+                            {
+                                tag: WA_NODE_TAGS.USER,
+                                attrs: { jid: SYNC_SESSION_JID },
+                                content: userContent
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    })
+    const sessionResolver = createSignalSessionResolver({
+        signalProtocol: {
+            establishOutgoingSession: async (target: SignalAddress) => {
+                calls.push('establish')
+                const session = {
+                    remote: { pubKey: toSerializedPubKey(serverIdentity) }
+                } as unknown as SignalSessionRecord
+                await identities.setRemoteIdentity(target, session.remote.pubKey)
+                await sessions.setSession(target, session)
+                return session
+            }
+        } as never,
+        sessionStore,
+        identityStore: identities,
+        signalIdentitySync: {
+            syncIdentityKeys: async () => {
+                calls.push('identity-sync')
+            }
+        } as never,
+        signalSessionSync,
+        logger: createNoopLogger()
+    })
+    const coordinator = createMessageDispatchCoordinator(new WaGroupMetadataMemoryStore(), {
+        sessionResolver,
+        sessionStore
+    })
+
+    return {
+        address,
+        oldIdentity,
+        oldSession,
+        calls,
+        sessions,
+        identities,
+        state,
+        coordinator,
+        async seed(): Promise<void> {
+            await sessions.setSession(address, oldSession)
+            await identities.setRemoteIdentity(address, oldIdentity)
+        },
+        requestedUsers(): readonly Record<string, string>[] {
+            return requests.flatMap((request) =>
+                ((request.content as BinaryNode[])[0].content as BinaryNode[]).map(
+                    (user) => user.attrs
+                )
+            )
+        }
+    }
+}
+
+test('syncSignalSession with only a jid keeps an existing session and fetches nothing', async () => {
+    const harness = createSyncSessionHarness()
+    await harness.seed()
+
+    await harness.coordinator.syncSignalSession(SYNC_SESSION_JID)
+
+    assert.deepEqual(harness.calls, [])
+    assert.equal(await harness.sessions.getSession(harness.address), harness.oldSession)
+})
+
+test('syncSignalSession with no session fetches a bundle without a reason', async () => {
+    const harness = createSyncSessionHarness()
+
+    await harness.coordinator.syncSignalSession(SYNC_SESSION_JID)
+
+    assert.deepEqual(harness.calls, ['fetch', 'establish'])
+    assert.deepEqual(harness.requestedUsers(), [{ jid: SYNC_SESSION_JID }])
+    assert.ok(await harness.sessions.getSession(harness.address))
+})
+
+test('syncSignalSession force drops the session, then fetches without a reason', async () => {
+    const harness = createSyncSessionHarness()
+    await harness.seed()
+
+    await harness.coordinator.syncSignalSession(SYNC_SESSION_JID, { force: true })
+
+    assert.deepEqual(harness.calls, ['delete', 'fetch', 'establish'])
+    assert.deepEqual(harness.requestedUsers(), [{ jid: SYNC_SESSION_JID }])
+    const session = await harness.sessions.getSession(harness.address)
+    assert.ok(session)
+    assert.notEqual(session, harness.oldSession)
+    assert.deepEqual(
+        await harness.identities.getRemoteIdentity(harness.address),
+        harness.oldIdentity
+    )
+})
+
+test('syncSignalSession reasonIdentity drops the session, syncs the identity and fetches with reason identity', async () => {
+    const harness = createSyncSessionHarness()
+    await harness.seed()
+
+    await harness.coordinator.syncSignalSession(SYNC_SESSION_JID, { reasonIdentity: true })
+
+    assert.deepEqual(harness.calls, ['delete', 'identity-sync', 'fetch', 'establish'])
+    assert.deepEqual(harness.requestedUsers(), [{ jid: SYNC_SESSION_JID, reason: 'identity' }])
+    const session = await harness.sessions.getSession(harness.address)
+    assert.ok(session)
+    assert.notEqual(session, harness.oldSession)
+})
+
+test('syncSignalSession with force and reasonIdentity takes the identity path', async () => {
+    const harness = createSyncSessionHarness()
+    await harness.seed()
+
+    await harness.coordinator.syncSignalSession(SYNC_SESSION_JID, {
+        force: true,
+        reasonIdentity: true
+    })
+
+    assert.deepEqual(harness.calls, ['delete', 'identity-sync', 'fetch', 'establish'])
+    assert.deepEqual(harness.requestedUsers(), [{ jid: SYNC_SESSION_JID, reason: 'identity' }])
+})
+
+test('syncSignalSession force propagates a failed fetch after the session was dropped', async () => {
+    const harness = createSyncSessionHarness()
+    await harness.seed()
+    harness.state.failFetch = true
+
+    await assert.rejects(
+        harness.coordinator.syncSignalSession(SYNC_SESSION_JID, { force: true }),
+        /key bundle user error/
+    )
+
+    assert.deepEqual(harness.calls, ['delete', 'fetch'])
+    assert.equal(await harness.sessions.hasSession(harness.address), false)
+})
+
+test('syncSignalSession rejects group jids before touching the session', async () => {
+    const harness = createSyncSessionHarness()
+    await harness.seed()
+
+    await assert.rejects(
+        harness.coordinator.syncSignalSession('120363000000000001@g.us', { force: true }),
+        /supports only direct chats/
+    )
+
+    assert.deepEqual(harness.calls, [])
 })
