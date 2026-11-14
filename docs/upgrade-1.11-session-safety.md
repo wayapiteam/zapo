@@ -2,8 +2,10 @@
 
 > Atualização de 14/11/2026: o algoritmo upstream foi preservado com limite local
 > opcional, e as quatro falhas do core descritas nesta auditoria foram resolvidas.
-> Os gates de fila e `loginCounter` continuam abertos. Consulte a
-> [atualização de phash e TDD](./upgrade-1.11-phash-tdd.md) para o estado atual.
+> O `loginCounter` foi corrigido nos cinco providers, e o gate de persistência
+> ampliado passou com 17 casos. O gate de fila continua aberto. Consulte as
+> evidências de [phash e TDD](./upgrade-1.11-phash-tdd.md) e de
+> [preservação de credenciais na migração](./upgrade-1.11-login-counter.md).
 
 Avaliação de 07/11/2026. Branch local: `chore/upgrade-zapo-1.11-session-safety`.
 
@@ -90,6 +92,7 @@ npm ci --ignore-scripts
 npm rebuild better-sqlite3
 npm run build
 npm run build -w packages/store-sqlite
+npm run build -w packages/fake-server
 ```
 
 A referência precisa continuar resolvendo o fork 1.7.1 e o SQLite 1.0.1, por exemplo em um checkout isolado do WayAPI anterior à troca da dependência:

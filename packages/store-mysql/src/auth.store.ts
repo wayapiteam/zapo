@@ -23,7 +23,7 @@ export class WaAuthMysqlStore extends BaseMysqlStore implements WaAuthStore {
                     platform, server_static_key, server_has_prekeys, routing_info,
                     last_success_ts, props_version, ab_props_version,
                     connection_location, account_creation_ts,
-                    device_info, push_name, year_class, mem_class
+                    device_info, push_name, year_class, mem_class, login_counter
              FROM ${this.t('auth_credentials')}
              WHERE session_id = ?`,
                 [this.sessionId]
@@ -68,6 +68,7 @@ export class WaAuthMysqlStore extends BaseMysqlStore implements WaAuthStore {
                 row.server_has_prekeys === null ? undefined : Number(row.server_has_prekeys) === 1,
             routingInfo: toBytesOrNull(row.routing_info) ?? undefined,
             lastSuccessTs: row.last_success_ts !== null ? Number(row.last_success_ts) : undefined,
+            loginCounter: row.login_counter !== null ? Number(row.login_counter) : undefined,
             propsVersion: row.props_version !== null ? Number(row.props_version) : undefined,
             abPropsVersion:
                 row.ab_props_version !== null ? Number(row.ab_props_version) : undefined,
@@ -96,8 +97,8 @@ export class WaAuthMysqlStore extends BaseMysqlStore implements WaAuthStore {
                 platform, server_static_key, server_has_prekeys, routing_info,
                 last_success_ts, props_version, ab_props_version,
                 connection_location, account_creation_ts,
-                device_info, push_name, year_class, mem_class
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                device_info, push_name, year_class, mem_class, login_counter
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE
                 noise_pub_key = VALUES(noise_pub_key),
                 noise_priv_key = VALUES(noise_priv_key),
@@ -126,7 +127,8 @@ export class WaAuthMysqlStore extends BaseMysqlStore implements WaAuthStore {
                 device_info = VALUES(device_info),
                 push_name = VALUES(push_name),
                 year_class = VALUES(year_class),
-                mem_class = VALUES(mem_class)`,
+                mem_class = VALUES(mem_class),
+                login_counter = VALUES(login_counter)`,
             [
                 this.sessionId,
                 credentials.noiseKeyPair.pubKey,
@@ -162,7 +164,8 @@ export class WaAuthMysqlStore extends BaseMysqlStore implements WaAuthStore {
                 credentials.deviceInfo ? JSON.stringify(credentials.deviceInfo) : null,
                 credentials.pushName ?? null,
                 credentials.yearClass ?? null,
-                credentials.memClass ?? null
+                credentials.memClass ?? null,
+                credentials.loginCounter ?? null
             ]
         )
     }

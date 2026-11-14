@@ -88,6 +88,10 @@ export class WaAuthRedisStore extends BaseRedisStore implements WaAuthStore {
                     ? data.server_has_prekeys === '1'
                     : undefined,
             routingInfo: bin.routing_info ?? undefined,
+            loginCounter:
+                toStringOrNull(data.login_counter) !== null
+                    ? Number(data.login_counter)
+                    : undefined,
             lastSuccessTs:
                 toStringOrNull(data.last_success_ts) !== null
                     ? Number(data.last_success_ts)
@@ -137,6 +141,9 @@ export class WaAuthRedisStore extends BaseRedisStore implements WaAuthStore {
         }
         if (credentials.serverHasPreKeys !== undefined) {
             fields.server_has_prekeys = credentials.serverHasPreKeys ? '1' : '0'
+        }
+        if (credentials.loginCounter !== undefined) {
+            fields.login_counter = String(credentials.loginCounter)
         }
         if (credentials.lastSuccessTs !== undefined) {
             fields.last_success_ts = String(credentials.lastSuccessTs)

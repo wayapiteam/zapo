@@ -1,5 +1,10 @@
 # Phash, falhas anteriores e regressão do upgrade
 
+> Atualização posterior nesta mesma data: o `loginCounter` foi corrigido, e os
+> 17 testes de persistência e migração passaram. As referências ao gate vermelho
+> abaixo descrevem o estado anterior à correção. O bloqueio de IQ continua aberto.
+> Consulte as [evidências de preservação de credenciais](./upgrade-1.11-login-counter.md).
+
 Atualização de 14/11/2026 na branch `chore/upgrade-zapo-1.11-session-safety`. Sem mudança da dependência do WayAPI, sem rebase da branch compartilhada e sem ação em produção.
 
 ## Decisão: algoritmo upstream e limite local opcional

@@ -402,6 +402,13 @@ const MIGRATIONS: readonly Migration[] = [
             ALTER TABLE \`__PREFIX__mailbox_contacts\`
                 ADD COLUMN username VARCHAR(255)
         `
+    },
+    {
+        name: '0022_auth_login_counter',
+        domain: 'auth',
+        sql: `
+            ALTER TABLE \`__PREFIX__auth_credentials\` ADD COLUMN login_counter BIGINT NULL
+        `
     }
 ]
 

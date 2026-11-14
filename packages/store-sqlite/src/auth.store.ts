@@ -49,7 +49,8 @@ export class WaAuthSqliteStore extends BaseSqliteStore implements WaAuthStore {
                 device_info,
                 push_name,
                 year_class,
-                mem_class
+                mem_class,
+                login_counter
             FROM auth_credentials
             WHERE session_id = ?`,
             [this.options.sessionId]
@@ -96,6 +97,7 @@ export class WaAuthSqliteStore extends BaseSqliteStore implements WaAuthStore {
             serverHasPreKeys: toBoolOrUndef(row.server_has_prekeys),
             routingInfo: asOptionalBytes(row.routing_info),
             lastSuccessTs: asOptionalNumber(row.last_success_ts),
+            loginCounter: asOptionalNumber(row.login_counter),
             propsVersion: asOptionalNumber(row.props_version),
             abPropsVersion: asOptionalNumber(row.ab_props_version),
             connectionLocation: asOptionalString(row.connection_location),
@@ -141,9 +143,10 @@ export class WaAuthSqliteStore extends BaseSqliteStore implements WaAuthStore {
                     device_info,
                     push_name,
                     year_class,
-                    mem_class
+                    mem_class,
+                    login_counter
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 ON CONFLICT(session_id) DO UPDATE SET
                     noise_pub_key=excluded.noise_pub_key,
@@ -173,7 +176,8 @@ export class WaAuthSqliteStore extends BaseSqliteStore implements WaAuthStore {
                     device_info=excluded.device_info,
                     push_name=excluded.push_name,
                     year_class=excluded.year_class,
-                    mem_class=excluded.mem_class`,
+                    mem_class=excluded.mem_class,
+                    login_counter=excluded.login_counter`,
                 [
                     this.options.sessionId,
                     credentials.noiseKeyPair.pubKey,
@@ -209,7 +213,8 @@ export class WaAuthSqliteStore extends BaseSqliteStore implements WaAuthStore {
                     credentials.deviceInfo ? JSON.stringify(credentials.deviceInfo) : null,
                     credentials.pushName ?? null,
                     credentials.yearClass ?? null,
-                    credentials.memClass ?? null
+                    credentials.memClass ?? null,
+                    credentials.loginCounter ?? null
                 ]
             )
         })

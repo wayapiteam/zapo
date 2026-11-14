@@ -472,6 +472,13 @@ const SQLITE_MIGRATIONS: readonly WaSqliteMigration[] = [
                 ALTER TABLE mailbox_contacts ADD COLUMN username TEXT;
             `)
         }
+    },
+    {
+        id: '0021_auth_login_counter',
+        domain: 'auth',
+        up: (db) => {
+            db.exec('ALTER TABLE auth_credentials ADD COLUMN login_counter INTEGER')
+        }
     }
 ]
 
