@@ -25,6 +25,7 @@ import { toSerializedPubKey } from '@crypto/core/keys'
 import { createNoopLogger } from '@infra/log/types'
 import type { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
 import { getContextInfo } from '@message/context-info'
+import { computePhashV2 } from '@message/crypto/phash'
 import { unpadPkcs7 } from '@message/encode/padding'
 import type { WaSendMessageContent } from '@message/types'
 import { proto, type Proto } from '@proto'
@@ -157,6 +158,7 @@ function createMessageDispatchCoordinator(
     overrides?: {
         readonly meJid?: string
         readonly meLid?: string
+        readonly phashMaxParticipants?: number
         readonly mobileMessageIdFormat?: () => boolean
         readonly serverClock?: ServerClock
         readonly signalDeviceSync?: {
@@ -189,6 +191,7 @@ function createMessageDispatchCoordinator(
 
     return new WaMessageDispatchCoordinator({
         logger: createNoopLogger(),
+        phashMaxParticipants: overrides?.phashMaxParticipants,
         emitMessageSend: overrides?.emitMessageSend,
         messageClient: (overrides?.messageClient ?? {}) as never,
         retryTracker: (overrides?.retryTracker ?? {}) as never,
@@ -236,6 +239,76 @@ function buildAppStateSyncResult(
         })
     )
     return { collections }
+}
+
+for (const mode of ['group', 'broadcast'] as const) {
+    for (const scenario of [
+        { devices: 3, limit: 3, rejected: true },
+        { devices: 3, limit: 4, rejected: false },
+        { devices: 5_000, limit: undefined, rejected: false }
+    ]) {
+        test(`${mode} phash counts devices plus sender with limit ${String(scenario.limit)}`, async () => {
+            const meJid = '5511000000000@s.whatsapp.net'
+            const devices = Array.from(
+                { length: scenario.devices },
+                (_, index) => `5512${index}:1@s.whatsapp.net`
+            )
+            const metadata = new WaGroupMetadataMemoryStore()
+            const stop = new Error('stop after observing publish')
+            let published: BinaryNode | undefined
+            const coordinator = createMessageDispatchCoordinator(metadata, {
+                meJid,
+                phashMaxParticipants: scenario.limit,
+                buildMessageContent: async () => ({ message: { conversation: 'phash policy' } }),
+                signalStore: { getRegistrationInfo: async () => null },
+                fanoutResolver: { resolveGroupParticipantDeviceJids: async () => devices },
+                retryTracker: {
+                    track: async (_meta: unknown, publish: () => Promise<unknown>) => publish()
+                },
+                messageClient: {
+                    publishNode: (node: BinaryNode) => {
+                        published = node
+                        return Promise.reject(stop)
+                    }
+                },
+                senderKeyManager: {
+                    prepareGroupEncryption: async () => ({
+                        distributionMessage: {},
+                        ciphertext: { ciphertext: new Uint8Array(1) },
+                        keyId: 1
+                    }),
+                    filterParticipantsNeedingDistribution: async () => []
+                }
+            })
+            const send = () =>
+                mode === 'group'
+                    ? coordinator.sendMessage(
+                          '120363000000000001@g.us',
+                          { type: 'text', text: 'phash policy' },
+                          { id: 'phash-policy' }
+                      )
+                    : coordinator.publishBroadcastListMessage({
+                          listJid: '123@broadcast',
+                          message: { conversation: 'phash policy' },
+                          recipients: ['5512@s.whatsapp.net'],
+                          options: { id: 'phash-policy' }
+                      })
+            try {
+                if (scenario.rejected) {
+                    await assert.rejects(
+                        send,
+                        /phash participant count 4 exceeds maxParticipants 3/
+                    )
+                    assert.equal(published, undefined)
+                } else {
+                    await assert.rejects(send, stop)
+                    assert.equal(published?.attrs.phash, computePhashV2([...devices, meJid]))
+                }
+            } finally {
+                await metadata.destroy()
+            }
+        })
+    }
 }
 
 function callResolveOutgoingSecretSenderJid(coordinator: WaMessageDispatchCoordinator): string {

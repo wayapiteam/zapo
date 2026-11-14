@@ -644,7 +644,7 @@ test('resolveWaClientBase rejects invalid proxy transport shapes', () => {
     )
 })
 
-test('resolveWaClientBase normalizes and validates the phash participant limit', () => {
+test('resolveWaClientBase keeps phash unbounded unless a limit is explicitly configured', () => {
     const minimalStore = {
         session: () => ({})
     }
@@ -655,7 +655,19 @@ test('resolveWaClientBase normalizes and validates the phash participant limit',
         } as unknown as WaClientOptions,
         createNoopLogger()
     )
-    assert.equal(defaulted.options.phashMaxParticipants, 4_096)
+    assert.equal(defaulted.options.phashMaxParticipants, undefined)
+
+    for (const phashMaxParticipants of [1, 4_096, 16_384]) {
+        const explicit = resolveWaClientBase(
+            {
+                store: minimalStore,
+                sessionId: 'session',
+                phashMaxParticipants
+            } as unknown as WaClientOptions,
+            createNoopLogger()
+        )
+        assert.equal(explicit.options.phashMaxParticipants, phashMaxParticipants)
+    }
 
     assert.throws(
         () =>

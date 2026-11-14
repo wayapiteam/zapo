@@ -340,12 +340,12 @@ test('coordinator fetch sends all variables required by the current mex operatio
         fetch_full_image: true,
         fetch_creation_time: true,
         fetch_wamo_sub: false,
-        fetch_pinned_messages: false,
+        fetch_pinned_messages: true,
         fetch_status_metadata: false
     })
 })
 
-test('coordinator fetchDehydrated disables pinned messages in the mex request', async () => {
+test('coordinator fetchDehydrated requests pinned messages in the mex request', async () => {
     const newsletterJid = '120363025343298869@newsletter'
     const env = createTestCoordinator({
         resultData: {
@@ -368,7 +368,7 @@ test('coordinator fetchDehydrated disables pinned messages in the mex request', 
             view_role: 'SUBSCRIBER'
         },
         fetch_wamo_sub: false,
-        fetch_pinned_messages: false
+        fetch_pinned_messages: true
     })
 })
 
