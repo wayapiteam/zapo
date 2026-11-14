@@ -1,5 +1,10 @@
 # Upgrade 1.11.0: auditoria de sessões e regressões
 
+> Atualização de 14/11/2026: o algoritmo upstream foi preservado com limite local
+> opcional, e as quatro falhas do core descritas nesta auditoria foram resolvidas.
+> Os gates de fila e `loginCounter` continuam abertos. Consulte a
+> [atualização de phash e TDD](./upgrade-1.11-phash-tdd.md) para o estado atual.
+
 Avaliação de 07/11/2026. Branch local: `chore/upgrade-zapo-1.11-session-safety`.
 
 O upgrade continua em rascunho. Não há evidência de apagamento de credenciais no fluxo normal ensaiado, mas os gates de regressão ainda estão vermelhos. Esta branch não está pronta para publicação ou implantação.
@@ -108,7 +113,7 @@ O repositório do WayAPI documenta um incidente anterior com exatamente esse enc
 
 Outro risco confirmado: o WayAPI usa `path.resolve('./db.sqlite')`, e a configuração PM2 não fixa `cwd`. Alterar o diretório efetivo pode apontar para um arquivo novo e provocar novo pareamento sem apagar o arquivo antigo. O teste negativo reproduz esse comportamento.
 
-## Critérios que ainda impedem liberar
+## Pendências identificadas em 07/11/2026 (histórico)
 
 - Resolver o `loginCounter` e a fila; deixar os novos gates verdes.
 - Resolver as quatro falhas conhecidas da suíte core integrada: duas expectativas antigas de newsletter, já presentes no fork, e dois casos phash incompatíveis com os limites preservados. A suíte existente teve 1346 aprovações, quatro falhas e um skip.

@@ -133,9 +133,11 @@ export interface WaClientOptions extends WaAuthClientOptions, WaAuthSocketOption
     /** Delay (ms) between message-send retry attempts. */
     readonly messageRetryDelayMs?: number
     /**
-     * Maximum recipient-device count included in an outgoing message participant hash.
-     * Defaults to `4_096`. Values above `16_384` are rejected to bound CPU and memory
-     * usage while hashing and sorting recipients.
+     * Optional local limit on device entries hashed for group and broadcast fanouts,
+     * including the sender. Unset keeps the upstream behavior without a participant
+     * cap. Set `4_096` to retain the fork's former default restriction. Explicit
+     * limits must be integers from `1` to `16_384` and reject the send when exceeded;
+     * they do not truncate recipients or change the participant hash.
      */
     readonly phashMaxParticipants?: number
     /**

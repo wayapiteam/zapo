@@ -21,7 +21,7 @@ import {
     type WaSendContextInfo
 } from '@message/context-info'
 import { type IcdcMeta, injectDeviceListMetadata, resolveIcdcMeta } from '@message/crypto/icdc'
-import { computePhashV2, WA_DEFAULT_PHASH_MAX_PARTICIPANTS } from '@message/crypto/phash'
+import { computePhashV2 } from '@message/crypto/phash'
 import {
     buildReportingTokenArtifacts,
     type BuildReportingTokenArtifactsResult
@@ -265,7 +265,7 @@ interface WaOutboundEnvelope {
 export class WaMessageDispatchCoordinator {
     private readonly deps: WaMessageDispatchCoordinatorOptions
     private readonly mobileMessageIdFormat: () => boolean
-    private readonly phashMaxParticipants: number
+    private readonly phashMaxParticipants: number | undefined
     private readonly serverClock: ServerClock
     private readonly icdcDedup = new PromiseDedup()
     private readonly privacyTokenDedup = new PromiseDedup()
@@ -274,8 +274,7 @@ export class WaMessageDispatchCoordinator {
     public constructor(options: WaMessageDispatchCoordinatorOptions) {
         this.deps = options
         this.mobileMessageIdFormat = options.mobileMessageIdFormat ?? (() => false)
-        this.phashMaxParticipants =
-            options.phashMaxParticipants ?? WA_DEFAULT_PHASH_MAX_PARTICIPANTS
+        this.phashMaxParticipants = options.phashMaxParticipants
         this.serverClock = options.serverClock
     }
 
@@ -1393,7 +1392,7 @@ export class WaMessageDispatchCoordinator {
         }
         phashTargets[phashTargetCount] = senderJid
         phashTargets.length = phashTargetCount + 1
-        const localPhash = computePhashV2(phashTargets)
+        const localPhash = computePhashV2(phashTargets, this.phashMaxParticipants)
         const reportingArtifacts = this.tryBuildReportingTokenArtifacts({
             message,
             messageBytes: unpadPkcs7(plaintext),

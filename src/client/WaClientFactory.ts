@@ -86,6 +86,7 @@ import type { Logger } from '@infra/log/types'
 import { WaMediaTransferClient } from '@media/transfer/WaMediaTransferClient'
 import type { WaMediaConn } from '@media/types'
 import { createDefaultLinkPreviewFetcher } from '@message/addons/link-preview/fetcher'
+import { WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS } from '@message/crypto/phash'
 import { processNewsletterLiveUpdates } from '@message/kinds/newsletter'
 import { handleIncomingMessageAck } from '@message/primitives/incoming'
 import {
@@ -98,10 +99,6 @@ import {
 } from '@message/primitives/peer-data-operation'
 import type { WaSendTextMessage } from '@message/types'
 import { WaMessageClient } from '@message/WaMessageClient'
-import {
-    WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS,
-    WA_DEFAULT_PHASH_MAX_PARTICIPANTS
-} from '@message/crypto/phash'
 import {
     resolveWaDeviceIdentity,
     WA_DEFAULTS,
@@ -272,11 +269,12 @@ function validateProxyOptions(options: WaClientOptions): void {
 export function resolveWaClientBase(options: WaClientOptions, logger: Logger): WaClientBase {
     validateProxyOptions(options)
 
-    const phashMaxParticipants = options.phashMaxParticipants ?? WA_DEFAULT_PHASH_MAX_PARTICIPANTS
+    const phashMaxParticipants = options.phashMaxParticipants
     if (
-        !Number.isSafeInteger(phashMaxParticipants) ||
-        phashMaxParticipants < 1 ||
-        phashMaxParticipants > WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS
+        phashMaxParticipants !== undefined &&
+        (!Number.isSafeInteger(phashMaxParticipants) ||
+            phashMaxParticipants < 1 ||
+            phashMaxParticipants > WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS)
     ) {
         throw new Error(
             `phashMaxParticipants must be an integer between 1 and ${WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS}`

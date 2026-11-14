@@ -2,7 +2,9 @@ import { sha256 } from '@crypto/core'
 import { WA_DEFAULTS } from '@protocol/constants'
 import { bytesToBase64 } from '@util/bytes'
 
+/** @deprecated Legacy opt-in limit. Hashing has no participant cap by default. */
 export const WA_DEFAULT_PHASH_MAX_PARTICIPANTS = 4_096
+/** Maximum explicit policy value; calls without a limit are not capped. */
 export const WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS = 16_384
 
 const PHASH_DIGEST_PREFIX = 6
@@ -46,29 +48,30 @@ const RETAINED: PhashBuffers = {
  * broadcast-list fanouts.
  *
  * Every participant is canonicalized to `<user>.0:<device>@<server>`, the set
- * is sorted bytewise and hashed as a single SHA-256 stream. There is no
- * implicit allocation ceiling inside the canonical buffer; the fork enforces
- * the caller's participant limit before allocating.
+ * is sorted bytewise and hashed as a single SHA-256 stream. Buffers grow to fit
+ * the list. An optional caller-defined limit is checked before allocation;
+ * without it, large fanouts use the upstream behavior without a participant cap.
  *
  * @param participants device jids, in any order
- * @param maxParticipants maximum allowed participant count (default 4096)
+ * @param maxParticipants optional local limit, from 1 to 16384
  * @returns the `2:`-prefixed phash, or `'2:'` when the list is empty
+ * @throws when an explicit limit is invalid or the list exceeds it
  */
-export function computePhashV2(
-    participants: readonly string[],
-    maxParticipants: number = WA_DEFAULT_PHASH_MAX_PARTICIPANTS
-): string {
+export function computePhashV2(participants: readonly string[], maxParticipants?: number): string {
     if (
-        !Number.isSafeInteger(maxParticipants) ||
-        maxParticipants < 1 ||
-        maxParticipants > WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS
+        maxParticipants !== undefined &&
+        (!Number.isSafeInteger(maxParticipants) ||
+            maxParticipants < 1 ||
+            maxParticipants > WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS)
     ) {
         throw new Error(
             `phash maxParticipants must be an integer between 1 and ${WA_ABSOLUTE_PHASH_MAX_PARTICIPANTS}`
         )
     }
-    if (participants.length > maxParticipants) {
-        throw new Error(`phash participant count ${participants.length} exceeds maxParticipants ${maxParticipants}`)
+    if (maxParticipants !== undefined && participants.length > maxParticipants) {
+        throw new Error(
+            `phash participant count ${participants.length} exceeds maxParticipants ${maxParticipants}`
+        )
     }
     const n = participants.length
     if (n === 0) return '2:'
