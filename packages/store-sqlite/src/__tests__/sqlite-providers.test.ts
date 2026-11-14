@@ -76,6 +76,34 @@ test('sqlite auth store saves, loads and clears credentials', async () => {
     }
 })
 
+test('sqlite auth counter survives reopen without changing credential keys', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'zapo-sqlite-counter-'))
+    const path = join(dir, 'state.sqlite')
+    const options = { path, sessionId: 'counter', driver: TEST_SQLITE_DRIVER }
+    const credentials = createCredentials()
+    try {
+        for (const loginCounter of [undefined, 0, 42, 4_294_967_296]) {
+            const writer = new WaAuthSqliteStore(options)
+            await writer.save({ ...credentials, loginCounter })
+            await writer.destroy()
+            const reader = new WaAuthSqliteStore(options)
+            try {
+                const restored = await reader.load()
+                assert.ok(restored)
+                assert.equal(restored.loginCounter, loginCounter)
+                assert.deepEqual(restored.noiseKeyPair, credentials.noiseKeyPair)
+                assert.deepEqual(restored.registrationInfo, credentials.registrationInfo)
+                assert.deepEqual(restored.signedPreKey, credentials.signedPreKey)
+                assert.deepEqual(restored.advSecretKey, credentials.advSecretKey)
+            } finally {
+                await reader.destroy()
+            }
+        }
+    } finally {
+        await rm(dir, { recursive: true, force: true })
+    }
+})
+
 test('sqlite message/thread stores are session-scoped and preserve coalesced fields', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'zapo-sqlite-mailbox-'))
     const sqlitePath = join(dir, 'state.sqlite')

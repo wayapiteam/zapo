@@ -89,7 +89,8 @@ describe('store-redis integration', { timeout: 60_000 }, () => {
     it('auth: save, load, clear', async (t) => {
         if (!store) return t.skip('ZAPO_TEST_REDIS_* not set')
 
-        const auth = store.stores.auth('test-session')
+        const sessionId = nextSessionId('auth')
+        const auth = store.stores.auth(sessionId)
         assert.ok((await auth.load()) === null)
 
         const creds = {
@@ -104,12 +105,25 @@ describe('store-redis integration', { timeout: 60_000 }, () => {
                 signature: new Uint8Array(64),
                 uploaded: false
             },
-            advSecretKey: new Uint8Array(32)
+            advSecretKey: new Uint8Array(32),
+            loginCounter: 42
         }
         await auth.save(creds)
 
         const loaded = await auth.load()
         assert.ok(loaded)
+        assert.equal(loaded.loginCounter, 42)
+        for (const loginCounter of [0, 4_294_967_296]) {
+            await auth.save({ ...creds, loginCounter })
+            const restored = await store.stores.auth(sessionId).load()
+            assert.equal(restored?.loginCounter, loginCounter)
+            assert.deepEqual(restored?.noiseKeyPair, loaded.noiseKeyPair)
+            assert.deepEqual(restored?.registrationInfo, loaded.registrationInfo)
+            assert.deepEqual(restored?.signedPreKey, loaded.signedPreKey)
+            assert.deepEqual(restored?.advSecretKey, loaded.advSecretKey)
+        }
+        await auth.save({ ...creds, loginCounter: undefined })
+        assert.equal((await auth.load())?.loginCounter, undefined)
         assert.equal(loaded.registrationInfo.registrationId, 12345)
         assert.equal(loaded.noiseKeyPair.pubKey.length, creds.noiseKeyPair.pubKey.length)
         assert.ok(loaded.noiseKeyPair.pubKey.every((b, i) => b === creds.noiseKeyPair.pubKey[i]))

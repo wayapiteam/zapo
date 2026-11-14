@@ -2,7 +2,8 @@ const assert = require('node:assert/strict')
 const { createHash } = require('node:crypto')
 const path = require('node:path')
 
-const [corePath, addonPath, action, database, driver = 'better-sqlite3'] = process.argv.slice(2)
+const [corePath, addonPath, action, database, driver = 'better-sqlite3', migrationAddonPath] =
+    process.argv.slice(2)
 if (!path.basename(path.dirname(database)).startsWith('zapo-upgrade-session-')) {
     throw new Error('upgrade test worker only accepts its synthetic temporary databases')
 }
@@ -162,6 +163,152 @@ async function loadFailure() {
 }
 
 async function main() {
+    if (action === 'reject-migration') {
+        const connection = await addon.openSqliteConnection({
+            path: database,
+            sessionId: ids[0],
+            driver
+        })
+        const exec = connection.exec.bind(connection)
+        connection.exec = (sql) => {
+            exec(sql)
+            if (sql.includes('ADD COLUMN login_counter'))
+                throw new Error('synthetic migration failure after DDL')
+        }
+        try {
+            await assert.rejects(
+                addon.ensureSqliteMigrations(connection, ['auth']),
+                /synthetic migration failure/
+            )
+        } finally {
+            connection.close()
+        }
+        await store.destroy()
+        console.log(JSON.stringify({ rejected: true }))
+        return
+    }
+    if (action === 'connected-migration') {
+        const { FakeWaServer } = require(
+            path.resolve(path.dirname(migrationAddonPath), '../../fake-server/dist/index.js')
+        )
+        const protocol = require(path.join(path.dirname(corePath), 'protocol/index.js'))
+        const server = await FakeWaServer.start({
+            host: '127.0.0.1',
+            sessionKey: ({ clientPayload }) => String(clientPayload.username)
+        })
+        const nextAddon = require(migrationAddonPath)
+        const migrationStore = nextAddon.createSqliteStore({ path: database, driver })
+        const migratedAuth = []
+        const clients = []
+        const events = []
+        let authenticated = 0
+        const unregister = server.onAuthenticatedPipeline(() => {
+            authenticated += 1
+        })
+        const probe = async (client) => {
+            const reply = await client.lowlevel.query(
+                {
+                    tag: protocol.WA_NODE_TAGS.IQ,
+                    attrs: {
+                        to: protocol.WA_DEFAULTS.HOST_DOMAIN,
+                        type: protocol.WA_IQ_TYPES.GET,
+                        xmlns: protocol.WA_XMLNS.WHATSAPP_PING
+                    }
+                },
+                5_000
+            )
+            assert.equal(reply.attrs.type, protocol.WA_IQ_TYPES.RESULT)
+        }
+        try {
+            for (const id of ids) {
+                const auth = store.session(id).auth
+                const credentials = await auth.load()
+                await auth.save({
+                    ...credentials,
+                    serverStaticKey: server.serverStaticKeyPair.pubKey,
+                    serverHasPreKeys: true,
+                    routingInfo: undefined
+                })
+                const client = new core.WaClient(
+                    {
+                        store,
+                        sessionId: id,
+                        chatSocketUrls: [server.url],
+                        history: { enabled: false },
+                        proxy: {
+                            mediaUpload: server.mediaProxyAgent,
+                            mediaDownload: server.mediaProxyAgent
+                        },
+                        testHooks: { noiseRootCa: server.noiseRootCa }
+                    },
+                    logger
+                )
+                client.on('connection', (event) => events.push({ id, status: event.status }))
+                clients.push(client)
+                await client.connect()
+                await probe(client)
+            }
+            const before = await Promise.all(
+                ids.map(async (id) => fingerprint(await store.session(id).auth.load()))
+            )
+            const authenticatedBefore = authenticated
+            for (const id of ids) {
+                const auth = migrationStore.stores.auth(id)
+                migratedAuth.push(auth)
+                const credentials = await auth.load()
+                assert.ok(credentials)
+                await auth.save({ ...credentials, loginCounter: 42 })
+                assert.equal((await auth.load()).loginCounter, 42)
+            }
+            await Promise.all(clients.map(probe))
+            const after = await Promise.all(
+                ids.map(async (id) => fingerprint(await store.session(id).auth.load()))
+            )
+            assert.deepEqual(after, before)
+            assert.ok(clients.every((client) => client.getState().connected))
+            assert.equal(events.filter((event) => event.status === 'close').length, 0)
+            assert.equal(authenticated, authenticatedBefore)
+            console.log(
+                JSON.stringify({
+                    connections: clients.length,
+                    pings: clients.length * 2,
+                    closesDuringMigration: 0,
+                    keysUnchanged: true,
+                    authenticatedBefore,
+                    authenticatedAfter: authenticated
+                })
+            )
+        } finally {
+            unregister()
+            await Promise.all(clients.map((client) => client.disconnect()))
+            await Promise.all(migratedAuth.map((auth) => auth.destroy()))
+            await store.destroy()
+            await server.stop()
+        }
+        return
+    }
+    if (action === 'rewrite-counter') {
+        for (const id of ids) {
+            const auth = store.session(id).auth
+            const credentials = await auth.load()
+            assert.ok(credentials)
+            await auth.save({ ...credentials, loginCounter: 43 })
+        }
+    }
+    if (action === 'migrate-auth-only') {
+        for (const id of ids) assert.ok(await store.session(id).auth.load())
+    }
+    if (action === 'login-success') {
+        const client = new core.WaClient({ store, sessionId: ids[0] }, logger)
+        const credentials = await client.auth.loadOrCreateCredentials()
+        const before = fingerprint(credentials)
+        await client.auth.persistSuccessAttributes({}, { countsAsLogin: true })
+        assert.equal(client.auth.getCurrentCredentials().loginCounter, 44)
+        await client.auth.persistSuccessAttributes({ meDisplayName: 'synthetic renamed device' })
+        assert.equal(client.auth.getCurrentCredentials().loginCounter, 44)
+        assert.equal(fingerprint(client.auth.getCurrentCredentials()), before)
+        await client.disconnect()
+    }
     if (action === 'clear-session-a') {
         const client = new core.WaClient({ store, sessionId: ids[0] }, logger)
         await client.auth.loadOrCreateCredentials()
