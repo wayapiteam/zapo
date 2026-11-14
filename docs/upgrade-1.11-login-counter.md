@@ -1,5 +1,8 @@
 # Login counter: correção e evidências de preservação
 
+> A rodada posterior de [revalidação e revisões independentes](./upgrade-1.11-revalidation.md)
+> repetiu a matriz, corrigiu a recuperação de migração MySQL e manteve o gate de IQ bloqueado.
+
 Verificação de 14/11/2026 na branch `chore/upgrade-zapo-1.11-session-safety`.
 
 O campo existente `WaAuthCredentials.loginCounter` agora é salvo e recuperado nos cinco

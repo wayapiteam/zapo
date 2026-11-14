@@ -471,7 +471,33 @@ export async function ensureMysqlMigrations(
                 .map((s) => s.trim())
                 .filter(Boolean)
             for (const stmt of statements) {
-                await conn.execute(stmt)
+                try {
+                    await conn.execute(stmt)
+                } catch (error) {
+                    if (
+                        migration.name !== '0022_auth_login_counter' ||
+                        !(error instanceof Error) ||
+                        !('code' in error) ||
+                        error.code !== 'ER_DUP_FIELDNAME'
+                    ) {
+                        throw error
+                    }
+                    // MySQL commits DDL before the migration marker. Resume only the
+                    // compatible column left behind by an interrupted or concurrent run.
+                    const column = queryRows(
+                        await conn.execute(
+                            `SELECT 1 AS compatible
+                             FROM information_schema.COLUMNS
+                             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?
+                               AND DATA_TYPE = 'bigint' AND IS_NULLABLE = 'YES'
+                               AND COLUMN_DEFAULT IS NULL AND EXTRA = ''`,
+                            [t('auth_credentials'), 'login_counter']
+                        )
+                    )[0]
+                    if (!column) {
+                        throw error
+                    }
+                }
             }
             await conn.execute(
                 `INSERT IGNORE INTO \`${t('_migrations')}\` (name, applied_at) VALUES (?, ?)`,

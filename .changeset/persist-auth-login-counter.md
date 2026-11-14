@@ -9,3 +9,6 @@
 Persist the existing auth `loginCounter` across store reloads. SQL providers add a nullable
 counter column without rebuilding credential tables or rewriting stored keys. Legacy records
 keep the core's existing fallback until the next successful login.
+
+MySQL can resume the counter migration when its compatible column was committed before
+the migration marker; incompatible preexisting columns still reject initialization.
