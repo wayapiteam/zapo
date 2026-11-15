@@ -165,7 +165,8 @@
         "format": "prettier . --write",
         "format:check": "prettier . --check",
         "test:upgrade:persistence": "node --test scripts/upgrade/credential-upgrade.test.cjs",
-        "test:upgrade:queue": "node --test scripts/upgrade/frame-queue.test.cjs"
+        "test:upgrade:queue": "node --test scripts/upgrade/frame-queue.test.cjs",
+        "test:upgrade:iq-loopback": "node --test --test-concurrency=1 scripts/upgrade/iq-loopback.test.cjs"
     },
     "peerDependencies": {
         "argo-codec": "^0.2.1",

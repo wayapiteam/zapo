@@ -20,12 +20,25 @@ const makeComms = () =>
         },
         logger
     )
-async function blockedQueries() {
+async function flush(turns = 40) {
+    for (let turn = 0; turn < turns; turn++) await tick()
+}
+
+async function blockedQueries(options = {}) {
+    const count = options.count ?? 8
     const comms = makeComms()
     const transport = new WaNodeTransport(logger)
     const outbound = []
+    const responses = []
     let completed = 0
     let timedOut = 0
+    let unmatched = 0
+    let resumes = 0
+    let normalProcessed = 0
+    let releaseNormal
+    const normalGate = new Promise((resolve) => {
+        releaseNormal = resolve
+    })
     const orchestrator = new WaNodeOrchestrator({
         logger,
         sendNode: async (node) => {
@@ -33,41 +46,90 @@ async function blockedQueries() {
         },
         defaultTimeoutMs: 250
     })
+    // Isolate the queue failure from actual network reconnects in this controlled harness.
+    comms.closeSocketAndResume = async () => {
+        resumes++
+    }
     comms.handlingRequests = true
     comms.stanzaHandler = (frame) =>
         transport.dispatchIncomingFrame(frame, async (node) => {
             if (await orchestrator.handleIncomingNode(node)) return
+            if (node.tag !== 'notification') {
+                unmatched++
+                return
+            }
+            if (node.attrs.type === 'work') {
+                await normalGate
+                normalProcessed++
+                return
+            }
             try {
-                await orchestrator.query({
+                const response = await orchestrator.query({
                     tag: 'iq',
                     attrs: { id: 'query-' + node.attrs.id, type: 'get' }
                 })
+                responses.push({ requested: 'query-' + node.attrs.id, ...response.attrs })
                 completed++
             } catch (error) {
                 if (!error.message.includes('query timeout')) throw error
                 timedOut++
             }
         })
-    for (let i = 0; i < 8; i++)
-        comms.scheduleDecodedFrame(
-            encodeBinaryNodeStanza({ tag: 'notification', attrs: { id: String(i), type: 'test' } })
-        )
-    for (let i = 0; i < 30 && outbound.length < 8; i++) await tick()
-    assert.equal(outbound.length, 8)
-    for (const node of outbound)
-        comms.scheduleDecodedFrame(
-            encodeBinaryNodeStanza({ tag: 'iq', attrs: { id: node.attrs.id, type: 'result' } })
-        )
-    await delay(50)
-    const blocked = {
-        inFlight: comms.frameHandlerQueue.inFlight(),
-        pending: comms.frameHandlerQueue.pending(),
-        completed,
-        timedOut
+    const deliver = (node) => comms.scheduleDecodedFrame(encodeBinaryNodeStanza(node))
+    let observed
+    try {
+        for (let i = 0; i < count; i++)
+            deliver({ tag: 'notification', attrs: { id: String(i), type: 'test' } })
+        for (let i = 0; i < 200 && outbound.length < count; i++) await tick()
+        assert.equal(outbound.length, count, 'all handlers must issue their queries first')
+
+        if (options.unrelated) {
+            deliver({ tag: 'iq', attrs: { id: 'unknown', type: 'result' } })
+            deliver({ tag: 'iq', attrs: { type: 'result' } })
+            await flush()
+        }
+        const beforeReplies = { completed, timedOut }
+        for (let i = 0; i < (options.normalBacklog ?? 0); i++)
+            deliver({ tag: 'notification', attrs: { id: 'normal-' + i, type: 'work' } })
+
+        const answers = options.reverse ? [...outbound].reverse() : outbound
+        for (let i = 0; i < answers.length; i++) {
+            const node = answers[i]
+            if (options.omitLast && node === outbound[outbound.length - 1]) continue
+            const type = options.mixedErrors && i % 2 === 0 ? 'error' : 'result'
+            const response = {
+                tag: 'iq',
+                attrs: { id: node.attrs.id, type },
+                ...(type === 'error' ? { content: [{ tag: 'error', attrs: { code: '503' } }] } : {})
+            }
+            deliver(response)
+            if (options.duplicates) deliver(response)
+        }
+        await flush()
+        const beforeTimeout = {
+            inFlight: comms.frameHandlerQueue.inFlight(),
+            pending: comms.frameHandlerQueue.pending(),
+            completed,
+            timedOut,
+            responses: [...responses]
+        }
+        if (options.advanceTime) options.advanceTime(250)
+        else await delay(350)
+        await flush()
+        observed = {
+            beforeReplies,
+            beforeTimeout,
+            afterTimeout: { completed, timedOut },
+            resumes
+        }
+    } finally {
+        releaseNormal()
+        orchestrator.clearPending(new Error('synthetic test cleanup'))
+        await flush()
     }
-    await delay(350)
-    return { beforeTimeout: blocked, afterTimeout: { completed, timedOut } }
+    return { ...observed, unmatched, normalProcessed, hasPending: orchestrator.hasPending() }
 }
+
 async function overflow() {
     const comms = makeComms()
     comms.started = true
