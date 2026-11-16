@@ -54,7 +54,7 @@ import { normalizeDeviceJid } from '@protocol/jid'
 import { WA_DISCONNECT_REASONS, WA_LOGOUT_REASONS, type WaLogoutReason } from '@protocol/stream'
 import { buildRemoveCompanionDeviceIq } from '@transport/node/builders/device'
 import { assertIqResult, queryWithContext as queryNodeWithContext } from '@transport/node/query'
-import type { BinaryNode } from '@transport/types'
+import type { BinaryNode, WaPreparedStanzaHandler } from '@transport/types'
 import { fetchLatestWaMobileVersion, fetchLatestWaWebVersion } from '@transport/wa-version-fetcher'
 import { toError } from '@util/primitives'
 
@@ -123,6 +123,7 @@ class WaClientImpl extends EventEmitter {
                 handleIncomingMessageEvent: this.handleIncomingMessageEvent.bind(this),
                 handleError: this.handleError.bind(this),
                 handleIncomingFrame: this.handleIncomingFrame.bind(this),
+                prepareIncomingFrame: this.prepareIncomingFrame.bind(this),
                 clearStoredState: this.clearStoredState.bind(this),
                 resumeIncomingEvents: () => {
                     this.acceptingIncomingEvents = true
@@ -492,6 +493,30 @@ class WaClientImpl extends EventEmitter {
         }
     }
 
+    /** Decodes once and resolves eligible IQ replies without occupying an ordinary slot. */
+    private async prepareIncomingFrame(
+        frame: Uint8Array,
+        isCurrent: () => boolean,
+        onDecodedByteLength: (byteLength: number) => void
+    ): Promise<WaPreparedStanzaHandler | null> {
+        try {
+            const node = await this.deps.nodeTransport.decodeIncomingFrame(
+                frame,
+                isCurrent,
+                onDecodedByteLength
+            )
+            if (!node || !isCurrent()) return null
+            if (this.deps.incomingNode.tryResolvePendingIqResponse(node)) return null
+            return () =>
+                this.deps.incomingNode.handleIncomingNode(node).catch((error) => {
+                    this.handleError(toError(error))
+                })
+        } catch (error) {
+            if (isCurrent()) this.handleError(toError(error))
+            return null
+        }
+    }
+
     /**
      * Opens the transport and runs the noise/auth handshake. If a connection
      * is already in flight, the in-flight promise is reused. Resolves once the
@@ -612,7 +637,9 @@ class WaClientImpl extends EventEmitter {
         const filter = createIgnoreKeyFilter(input, () =>
             this.deps.authClient.getCurrentCredentials()
         )
-        return this.deps.incomingNode.registerIncomingStanzaFilter(filter)
+        return this.deps.incomingNode.registerIncomingStanzaFilter(filter, {
+            affectsIqResponses: false
+        })
     }
 
     /** Auth client: pairing, credentials, registration state. */

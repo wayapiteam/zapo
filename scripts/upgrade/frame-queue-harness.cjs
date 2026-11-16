@@ -50,47 +50,54 @@ async function blockedQueries(options = {}) {
     comms.closeSocketAndResume = async () => {
         resumes++
     }
+    comms.connected = true
     comms.handlingRequests = true
-    comms.stanzaHandler = (frame) =>
-        transport.dispatchIncomingFrame(frame, async (node) => {
-            if (await orchestrator.handleIncomingNode(node)) return
-            if (node.tag !== 'notification') {
-                unmatched++
-                return
-            }
-            if (node.attrs.type === 'work') {
-                await normalGate
-                normalProcessed++
-                return
-            }
-            try {
-                const response = await orchestrator.query({
-                    tag: 'iq',
-                    attrs: { id: 'query-' + node.attrs.id, type: 'get' }
-                })
-                responses.push({ requested: 'query-' + node.attrs.id, ...response.attrs })
-                completed++
-            } catch (error) {
-                if (!error.message.includes('query timeout')) throw error
-                timedOut++
-            }
-        })
-    const deliver = (node) => comms.scheduleDecodedFrame(encodeBinaryNodeStanza(node))
+    const handleNode = async (node) => {
+        if (await orchestrator.handleIncomingNode(node)) return
+        if (node.tag !== 'notification') {
+            unmatched++
+            return
+        }
+        if (node.attrs.type === 'work') {
+            await normalGate
+            normalProcessed++
+            return
+        }
+        try {
+            const response = await orchestrator.query({
+                tag: 'iq',
+                attrs: { id: 'query-' + node.attrs.id, type: 'get' }
+            })
+            responses.push({ requested: 'query-' + node.attrs.id, ...response.attrs })
+            completed++
+        } catch (error) {
+            if (!error.message.includes('query timeout')) throw error
+            timedOut++
+        }
+    }
+    comms.stanzaHandler = (frame) => transport.dispatchIncomingFrame(frame, handleNode)
+    comms.prepareStanza = async (frame, isCurrent, accountDecodedBytes) => {
+        const node = await transport.decodeIncomingFrame(frame, isCurrent, accountDecodedBytes)
+        if (!node || !isCurrent()) return null
+        if (orchestrator.tryResolvePendingIqResponse(node)) return null
+        return () => handleNode(node)
+    }
+    const deliver = (node) => comms.routeDecodedFrames([encodeBinaryNodeStanza(node)])
     let observed
     try {
         for (let i = 0; i < count; i++)
-            deliver({ tag: 'notification', attrs: { id: String(i), type: 'test' } })
+            await deliver({ tag: 'notification', attrs: { id: String(i), type: 'test' } })
         for (let i = 0; i < 200 && outbound.length < count; i++) await tick()
         assert.equal(outbound.length, count, 'all handlers must issue their queries first')
 
         if (options.unrelated) {
-            deliver({ tag: 'iq', attrs: { id: 'unknown', type: 'result' } })
-            deliver({ tag: 'iq', attrs: { type: 'result' } })
+            await deliver({ tag: 'iq', attrs: { id: 'unknown', type: 'result' } })
+            await deliver({ tag: 'iq', attrs: { type: 'result' } })
             await flush()
         }
         const beforeReplies = { completed, timedOut }
         for (let i = 0; i < (options.normalBacklog ?? 0); i++)
-            deliver({ tag: 'notification', attrs: { id: 'normal-' + i, type: 'work' } })
+            await deliver({ tag: 'notification', attrs: { id: 'normal-' + i, type: 'work' } })
 
         const answers = options.reverse ? [...outbound].reverse() : outbound
         for (let i = 0; i < answers.length; i++) {
@@ -102,8 +109,8 @@ async function blockedQueries(options = {}) {
                 attrs: { id: node.attrs.id, type },
                 ...(type === 'error' ? { content: [{ tag: 'error', attrs: { code: '503' } }] } : {})
             }
-            deliver(response)
-            if (options.duplicates) deliver(response)
+            await deliver(response)
+            if (options.duplicates) await deliver(response)
         }
         await flush()
         const beforeTimeout = {
@@ -133,6 +140,7 @@ async function blockedQueries(options = {}) {
 async function overflow() {
     const comms = makeComms()
     comms.started = true
+    comms.connected = true
     comms.handlingRequests = true
     let releaseTask, releaseClose
     const waitingTask = new Promise((resolve) => {

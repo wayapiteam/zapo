@@ -330,8 +330,16 @@ async function inflateCompressedStanza(data: Uint8Array): Promise<Uint8Array> {
 /**
  * Decodes a framed stanza: reads the 1-byte flag, inflates the body when the
  * `0x02` compression bit is set, then parses the result as a {@link BinaryNode}.
+ * @param stanza Flag-prefixed stanza payload after Noise decryption.
+ * @param onDecodedByteLength Receives the body size after decompression and before
+ * parsing, allowing callers to account for retained decoded data.
+ * @returns The decoded binary node.
+ * @throws When the payload is invalid, stream-end, cannot be inflated, or the callback throws.
  */
-export async function decodeBinaryNodeStanza(stanza: Uint8Array): Promise<BinaryNode> {
+export async function decodeBinaryNodeStanza(
+    stanza: Uint8Array,
+    onDecodedByteLength?: (byteLength: number) => void
+): Promise<BinaryNode> {
     const reader = new ByteReader(stanza)
     const flag = reader.readUint8()
     if (flag === STREAM_END && reader.getRemaining() === 0) {
@@ -341,5 +349,6 @@ export async function decodeBinaryNodeStanza(stanza: Uint8Array): Promise<Binary
     if ((flag & 0x02) !== 0) {
         nodeBytes = await inflateCompressedStanza(nodeBytes)
     }
+    onDecodedByteLength?.(nodeBytes.byteLength)
     return decodeBinaryNode(nodeBytes)
 }

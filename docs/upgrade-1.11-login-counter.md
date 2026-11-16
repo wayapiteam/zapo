@@ -1,5 +1,9 @@
 # Login counter: correção e evidências de preservação
 
+> Atualização posterior de 15/11/2026: a correção IQ foi implementada e os gates locais
+> passaram. Consulte o [relatório atual](./upgrade-1.11-iq-fix.md), incluindo custos,
+> filtros raw e validação real ainda pendente. Os resultados abaixo são históricos.
+
 > A rodada posterior de [revalidação e revisões independentes](./upgrade-1.11-revalidation.md)
 > repetiu a matriz, corrigiu a recuperação de migração MySQL e manteve o gate de IQ bloqueado.
 

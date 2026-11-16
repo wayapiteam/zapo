@@ -3,7 +3,13 @@ import type { Logger } from '@infra/log/types'
 import { BoundedTaskQueue, BoundedTaskQueueFullError } from '@infra/perf/BoundedTaskQueue'
 import { WA_DEFAULTS } from '@protocol/constants'
 import { WaNoiseSession } from '@transport/noise/WaNoiseSession'
-import type { SocketCloseInfo, WaCommsConfig, WaCommsState } from '@transport/types'
+import type {
+    SocketCloseInfo,
+    WaCommsConfig,
+    WaCommsState,
+    WaPreparedStanzaHandler,
+    WaStanzaPreparer
+} from '@transport/types'
 import { WaWebSocket } from '@transport/WaWebSocket'
 import { bytesToBase64UrlSafe, EMPTY_BYTES } from '@util/bytes'
 import { toError } from '@util/primitives'
@@ -12,6 +18,14 @@ const WA_FRAME_HANDLER_QUEUE_MAX_SIZE = 4096
 const WA_FRAME_HANDLER_MAX_CONCURRENCY = 8
 const WA_PENDING_FRAMES_MAX_COUNT = 2048
 const WA_PENDING_FRAMES_MAX_BYTES = 16 * 1024 * 1024
+const WA_WIRE_INPUT_MAX_COUNT = WA_FRAME_HANDLER_QUEUE_MAX_SIZE + WA_FRAME_HANDLER_MAX_CONCURRENCY
+const WA_WIRE_INPUT_MAX_BYTES = 64 * 1024 * 1024
+const WA_PREPARED_HANDLER_MAX_BYTES = 64 * 1024 * 1024
+
+interface WireInputBudget {
+    count: number
+    bytes: number
+}
 
 interface ConnectionWaiter {
     readonly resolve: () => void
@@ -45,6 +59,7 @@ export class WaComms {
     private waiters: ConnectionWaiter[]
     private stanzaHandler: StanzaHandler | null
     private inflateFrame: InflateFrame | null
+    private prepareStanza: WaStanzaPreparer | null
     private pendingFrames: Uint8Array[]
     private pendingFramesByteLength: number
     private readonly pendingFramesMaxCount: number
@@ -59,7 +74,9 @@ export class WaComms {
     private lastServerStaticKey: Uint8Array | null
     private lastInboundAtMs: number
     private frameProcessingQueue: Promise<void>
-    private readonly frameHandlerQueue: BoundedTaskQueue
+    private wireInputBudget: WireInputBudget
+    private handlerByteBudget = { bytes: 0 }
+    private frameHandlerQueue: BoundedTaskQueue
 
     public constructor(config: WaCommsConfig, logger: Logger = new ConsoleLogger('info')) {
         if (!config.noise) {
@@ -116,6 +133,7 @@ export class WaComms {
         this.waiters = []
         this.stanzaHandler = null
         this.inflateFrame = null
+        this.prepareStanza = null
         this.pendingFrames = []
         this.pendingFramesByteLength = 0
         this.pendingFramesMaxCount = WA_PENDING_FRAMES_MAX_COUNT
@@ -129,6 +147,7 @@ export class WaComms {
         this.lastServerStaticKey = null
         this.lastInboundAtMs = 0
         this.frameProcessingQueue = Promise.resolve()
+        this.wireInputBudget = { count: 0, bytes: 0 }
         this.frameHandlerQueue = new BoundedTaskQueue(
             WA_FRAME_HANDLER_QUEUE_MAX_SIZE,
             WA_FRAME_HANDLER_MAX_CONCURRENCY
@@ -169,17 +188,36 @@ export class WaComms {
         }
     }
 
-    public startComms(handleStanza: StanzaHandler, inflateFrame?: InflateFrame): void {
+    /**
+     * Starts raw stanza delivery. Without a preparer, the original bounded callback
+     * path is retained. An optional preparer runs on the ordered input path and returns
+     * ordinary work for the same bounded queue, or `null` for a consumed/dropped frame.
+     * Preparers must check their generation predicate after async work and must not
+     * await business handlers. Wire input in processing or waiting is capped at
+     * 4104 chunks / 64 MiB. Prepared ordinary callbacks retain at most 64 MiB of
+     * accounted decoded body bytes across 8 active / 4096 waiting callbacks.
+     * These limits apply per connection generation, not to process RSS. Running
+     * callbacks from a replaced generation must complete their own bounded I/O.
+     * @param handleStanza Raw callback used when no preparer is supplied.
+     * @param inflateFrame Optional preprocessing applied before the callback/preparer.
+     * @param prepareStanza Optional ordered preparation returning bounded ordinary work.
+     */
+    public startComms(
+        handleStanza: StanzaHandler,
+        inflateFrame?: InflateFrame,
+        prepareStanza?: WaStanzaPreparer
+    ): void {
         this.logger.debug('comms start requested')
         this.stanzaHandler = handleStanza
         this.inflateFrame = inflateFrame ?? null
+        this.prepareStanza = prepareStanza ?? null
         this.clearPendingFrames()
         this.pendingFramesOverflowClosing = false
         this.started = true
         this.preventRetry = false
         this.connected = this.socket.isOpen()
         this.handlingRequests = false
-        this.frameProcessingQueue = Promise.resolve()
+        this.invalidateFrameProcessing()
         this.clearReconnectTimer()
         void this.openSocket(false)
     }
@@ -359,6 +397,7 @@ export class WaComms {
     // eslint-disable-next-line @typescript-eslint/require-await
     private async onSocketClosed(info: SocketCloseInfo): Promise<void> {
         this.connected = false
+        this.invalidateFrameProcessing()
         this.noiseSession?.onSocketClosed(new Error(`socket closed (${info.code}:${info.reason})`))
         this.noiseSession = null
         this.clearPendingFrames()
@@ -395,11 +434,31 @@ export class WaComms {
 
     private onSocketMessage(payload: Uint8Array): void {
         this.lastInboundAtMs = Date.now()
+        if (this.resumeInFlight) return
+        const budget = this.wireInputBudget
+        if (
+            budget.count >= WA_WIRE_INPUT_MAX_COUNT ||
+            budget.bytes + payload.byteLength > WA_WIRE_INPUT_MAX_BYTES
+        ) {
+            this.resumeAfterQueueOverflow('wire_input', {
+                count: budget.count,
+                bytes: budget.bytes,
+                incomingBytes: payload.byteLength
+            })
+            return
+        }
+        budget.count++
+        budget.bytes += payload.byteLength
         const session = this.noiseSession
-        this.frameProcessingQueue = this.frameProcessingQueue.then(
-            () => this.processSocketPayload(session, payload),
-            () => this.processSocketPayload(session, payload)
-        )
+        const process = async (): Promise<void> => {
+            try {
+                await this.processSocketPayload(session, payload)
+            } finally {
+                budget.count--
+                budget.bytes -= payload.byteLength
+            }
+        }
+        this.frameProcessingQueue = this.frameProcessingQueue.then(process, process)
     }
 
     /** `session` is the one current when the payload arrived; a payload never feeds a later session. */
@@ -429,7 +488,8 @@ export class WaComms {
         }
         try {
             const frames = await session.pushWireChunk(payload)
-            this.routeDecodedFrames(frames)
+            if (session !== this.noiseSession) return
+            await this.routeDecodedFrames(frames)
         } catch (error) {
             if (session !== this.noiseSession) {
                 this.logger.trace('noise decode failure ignored: noise session replaced')
@@ -449,7 +509,11 @@ export class WaComms {
         }
     }
 
-    private async onDecodedFrame(payload: Uint8Array): Promise<void> {
+    private async onDecodedFrame(
+        payload: Uint8Array,
+        generation = this.connectionGeneration
+    ): Promise<void> {
+        if (generation !== this.connectionGeneration) return
         if (!this.stanzaHandler) {
             return
         }
@@ -462,6 +526,7 @@ export class WaComms {
         }
         try {
             const frame = this.inflateFrame ? await this.inflateFrame(payload) : payload
+            if (generation !== this.connectionGeneration) return
             await this.stanzaHandler(frame)
         } catch (error) {
             this.logger.error('failed to handle incoming frame', {
@@ -473,7 +538,8 @@ export class WaComms {
     private async onSocketOpened(): Promise<void> {
         this.logger.debug('comms socket opened, starting noise session')
         const { noiseConfig, usedResumeHandshake } = this.buildNoiseConfigForAttempt()
-        const generation = ++this.connectionGeneration
+        this.invalidateFrameProcessing()
+        const generation = this.connectionGeneration
         const session = new WaNoiseSession((wire) => {
             if (generation !== this.connectionGeneration) {
                 return Promise.reject(new Error('noise session replaced'))
@@ -503,21 +569,25 @@ export class WaComms {
             this.noiseSession = null
             throw error
         }
-        const buffered = await session.pushWireChunk(EMPTY_BYTES)
-        if (generation !== this.connectionGeneration) {
-            this.logger.debug('noise session replaced before it was established')
-            return
+        const finishHandshake = async (): Promise<void> => {
+            if (generation !== this.connectionGeneration) return
+            const buffered = await session.pushWireChunk(EMPTY_BYTES)
+            if (generation !== this.connectionGeneration) return
+            this.resumeHandshakeFailures = 0
+            this.lastServerStaticKey = session.getServerStaticKey()
+            this.connected = true
+            this.reconnectAttempts = 0
+            await this.flushPendingFrames()
+            await this.routeDecodedFrames(buffered)
         }
-        this.routeDecodedFrames(buffered)
-        this.resumeHandshakeFailures = 0
-        this.lastServerStaticKey = session.getServerStaticKey()
-        this.connected = true
-        this.reconnectAttempts = 0
+        const finishing = this.frameProcessingQueue.then(finishHandshake, finishHandshake)
+        this.frameProcessingQueue = finishing
+        await finishing
+        if (generation !== this.connectionGeneration) return
         this.logger.debug('comms connected and noise session established')
         this.drainWaiters((waiter) => waiter.resolve())
     }
 
-    // eslint-disable-next-line @typescript-eslint/require-await
     private async flushPendingFrames(): Promise<void> {
         if (!this.handlingRequests || !this.stanzaHandler || this.pendingFrames.length === 0) {
             return
@@ -526,22 +596,58 @@ export class WaComms {
         const buffered = this.pendingFrames
         this.pendingFrames = []
         this.pendingFramesByteLength = 0
-        this.routeDecodedFrames(buffered)
+        await this.routeDecodedFrames(buffered)
     }
 
-    private routeDecodedFrames(frames: readonly Uint8Array[]): void {
+    private async routeDecodedFrames(frames: readonly Uint8Array[]): Promise<void> {
         if (frames.length === 0) {
             return
         }
-        if (!this.handlingRequests || !this.stanzaHandler) {
+        if (!this.connected || !this.handlingRequests || !this.stanzaHandler) {
             this.logger.trace('comms frame queued until request handling starts', {
                 count: frames.length
             })
             this.tryQueuePendingFrames(frames, 'decoded_batch')
             return
         }
+        const generation = this.connectionGeneration
+        const prepare = this.prepareStanza
         for (const frame of frames) {
-            this.scheduleDecodedFrame(frame)
+            if (generation !== this.connectionGeneration) return
+            if (!prepare) {
+                this.scheduleDecodedFrame(frame)
+                continue
+            }
+            await this.prepareDecodedFrame(frame, generation, prepare)
+        }
+    }
+
+    /** Preparation is serialized with wire decoding, never with ordinary handler completion. */
+    private async prepareDecodedFrame(
+        payload: Uint8Array,
+        generation: number,
+        prepare: WaStanzaPreparer
+    ): Promise<void> {
+        const isCurrent = (): boolean => generation === this.connectionGeneration
+        let decodedBytes = payload.byteLength
+        const accountDecodedBytes = (byteLength: number): void => {
+            if (!Number.isSafeInteger(byteLength) || byteLength < 0) {
+                throw new Error('invalid decoded stanza byte length')
+            }
+            decodedBytes = Math.max(decodedBytes, byteLength)
+        }
+        try {
+            const frame = this.inflateFrame ? await this.inflateFrame(payload) : payload
+            if (!isCurrent()) return
+            accountDecodedBytes(frame.byteLength)
+            const handler = await prepare(frame, isCurrent, accountDecodedBytes)
+            if (handler && isCurrent()) this.enqueueFrameHandler(handler, generation, decodedBytes)
+        } catch (error) {
+            if (isCurrent()) {
+                this.logger.error('failed to prepare incoming frame', {
+                    message: toError(error).message
+                })
+            }
         }
     }
 
@@ -599,28 +705,79 @@ export class WaComms {
     }
 
     private scheduleDecodedFrame(frame: Uint8Array): void {
+        const generation = this.connectionGeneration
+        this.enqueueFrameHandler(() => this.onDecodedFrame(frame, generation), generation)
+    }
+
+    /** A reset invalidates queued callbacks; it cannot undo an already-running handler. */
+    private enqueueFrameHandler(
+        handler: WaPreparedStanzaHandler,
+        generation: number,
+        decodedBytes = 0
+    ): void {
+        const budget = this.handlerByteBudget
+        if (budget.bytes + decodedBytes > WA_PREPARED_HANDLER_MAX_BYTES) {
+            this.resumeAfterQueueOverflow('prepared_handler_bytes', {
+                bytes: budget.bytes,
+                incomingBytes: decodedBytes
+            })
+            return
+        }
+        budget.bytes += decodedBytes
+        let started = false
         void this.frameHandlerQueue
-            .enqueue(() => this.onDecodedFrame(frame))
+            .enqueue(async () => {
+                try {
+                    if (generation !== this.connectionGeneration) return
+                    started = true
+                    await handler()
+                } finally {
+                    budget.bytes -= decodedBytes
+                }
+            })
             .catch((error) => {
-                if (error instanceof BoundedTaskQueueFullError) {
-                    if (this.resumeInFlight) {
-                        this.logger.trace('frame handler queue is full, resume already in flight')
-                        return
-                    }
-                    this.logger.warn(
-                        'frame handler queue is full, resuming socket to preserve bounds',
-                        {
-                            pending: this.frameHandlerQueue.pending(),
-                            inFlight: this.frameHandlerQueue.inFlight()
-                        }
-                    )
-                    void this.closeSocketAndResume()
+                if (!started) budget.bytes -= decodedBytes
+                if (!started && generation !== this.connectionGeneration) return
+                if (!started && error instanceof BoundedTaskQueueFullError) {
+                    this.resumeAfterQueueOverflow('frame_handler', {
+                        pending: this.frameHandlerQueue.pending(),
+                        inFlight: this.frameHandlerQueue.inFlight()
+                    })
                     return
                 }
-                this.logger.error('failed to enqueue decoded frame handler', {
-                    message: toError(error).message
+                this.logger.error('failed to handle incoming frame', {
+                    message: toError(error).message,
+                    generation,
+                    currentGeneration: this.connectionGeneration
                 })
             })
+    }
+
+    private resumeAfterQueueOverflow(queue: string, context: Record<string, number>): void {
+        if (this.resumeInFlight) return
+        this.logger.warn('incoming queue limit exceeded, resuming socket', { queue, ...context })
+        void this.closeSocketAndResume().catch((error) => {
+            this.logger.warn('failed to resume socket after queue overflow', {
+                message: toError(error).message
+            })
+        })
+    }
+
+    private invalidateFrameProcessing(): void {
+        this.connectionGeneration++
+        const discarded = this.frameHandlerQueue.clearPending(
+            new Error('incoming connection generation replaced')
+        )
+        this.frameHandlerQueue = new BoundedTaskQueue(
+            WA_FRAME_HANDLER_QUEUE_MAX_SIZE,
+            WA_FRAME_HANDLER_MAX_CONCURRENCY
+        )
+        if (discarded > 0)
+            this.logger.debug('discarded replaced connection callbacks', { discarded })
+        this.frameProcessingQueue = Promise.resolve()
+        // Old async completions release their own budget, never the next connection's.
+        this.wireInputBudget = { count: 0, bytes: 0 }
+        this.handlerByteBudget = { bytes: 0 }
     }
 
     private scheduleReconnect(): void {
@@ -717,7 +874,7 @@ export class WaComms {
         }
         const discardedSession = this.noiseSession
         this.noiseSession = null
-        this.connectionGeneration += 1
+        this.invalidateFrameProcessing()
         discardedSession?.onSocketClosed(new Error('comms connection state reset'))
         this.lastInboundAtMs = 0
         this.clearPendingFrames()
@@ -725,6 +882,7 @@ export class WaComms {
         if (options.clearHandlers) {
             this.stanzaHandler = null
             this.inflateFrame = null
+            this.prepareStanza = null
         }
         this.clearReconnectTimer()
         if (options.rejectWaitersError) {

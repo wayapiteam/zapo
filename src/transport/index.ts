@@ -14,6 +14,7 @@ export type {
     WaSocketConfig,
     WaSocketHandlers
 } from '@transport/types'
+export type { WaPreparedStanzaHandler, WaStanzaPreparer } from '@transport/types'
 export {
     decodeBinaryNode,
     decodeBinaryNodeStanza,

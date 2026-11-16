@@ -1,5 +1,9 @@
 # Revalidação do upgrade após rebase na master do fork
 
+> Atualização posterior de 15/11/2026: a correção IQ foi implementada e os gates locais
+> passaram. Consulte o [relatório atual](./upgrade-1.11-iq-fix.md), incluindo custos,
+> filtros raw e validação real ainda pendente. Os resultados abaixo são históricos.
+
 > Atualização de 15/11/2026: a rodada de [cobertura e TDD de IQ](./upgrade-1.11-iq-tdd.md)
 > acrescentou cenários antes da correção e reproduziu o bloqueio também com WebSocket/Noise
 > local. Os resultados abaixo registram a rodada anterior.

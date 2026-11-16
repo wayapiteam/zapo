@@ -1,5 +1,9 @@
 # IQ: cobertura existente e contratos antes da correção
 
+> Atualização posterior de 15/11/2026: a correção IQ foi implementada e os gates locais
+> passaram. Consulte o [relatório atual](./upgrade-1.11-iq-fix.md), incluindo custos,
+> filtros raw e validação real ainda pendente. Os resultados abaixo são históricos.
+
 O [plano da correção e manutenção futura](./upgrade-1.11-iq-dispatch-plan.md) descreve o fluxo
 proposto, as decisões de compatibilidade, os novos testes necessários e a entrega de JSDoc/docs.
 

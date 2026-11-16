@@ -136,7 +136,7 @@ import { createUsyncSidGenerator } from '@transport/node/usync'
 import { WaNodeOrchestrator } from '@transport/node/WaNodeOrchestrator'
 import { WaNodeTransport } from '@transport/node/WaNodeTransport'
 import { isProxyTransport, toProxyAgent } from '@transport/proxy'
-import type { BinaryNode } from '@transport/types'
+import type { BinaryNode, WaStanzaPreparer } from '@transport/types'
 import { createServerClock } from '@util/clock'
 import { toError } from '@util/primitives'
 
@@ -173,6 +173,7 @@ interface WaClientBuildRuntime {
     readonly handleIncomingMessageEvent: (event: WaIncomingMessageEvent) => Promise<void>
     readonly handleError: (error: Error) => void
     readonly handleIncomingFrame: (frame: Uint8Array) => Promise<void>
+    readonly prepareIncomingFrame?: WaStanzaPreparer
     readonly clearStoredState: () => Promise<void>
     readonly resumeIncomingEvents: () => void
     readonly subscribeProtocolMessage: (
@@ -381,6 +382,7 @@ function createIncomingNodeRuntime(input: {
         },
         persistRoutingInfo: (routingInfo) => authClient.persistRoutingInfo(routingInfo),
         tryResolvePendingNode: (node) => nodeOrchestrator.tryResolvePending(node),
+        isPendingIqResponse: (node) => nodeOrchestrator.isPendingIqResponse(node),
         handleGenericIncomingNode: (node) => nodeOrchestrator.handleIncomingNode(node),
         handleIncomingIqSetNode: (node) => authClient.handleIncomingIqSet(node),
         handleLinkCodeNotificationNode: (node) => authClient.handleLinkCodeNotification(node),
@@ -1000,6 +1002,7 @@ export function buildWaClientDependencies(input: {
     })
 
     connectionManager = new WaConnectionManager({
+        prepareIncomingFrame: runtime.prepareIncomingFrame,
         logger,
         options,
         authClient,

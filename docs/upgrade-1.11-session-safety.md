@@ -1,5 +1,9 @@
 # Upgrade 1.11.0: auditoria de sessões e regressões
 
+> Atualização posterior de 15/11/2026: a correção IQ foi implementada e os gates locais
+> passaram. Consulte o [relatório atual](./upgrade-1.11-iq-fix.md), incluindo custos,
+> filtros raw e validação real ainda pendente. Os resultados abaixo são históricos.
+
 > Atualização de 14/11/2026: o algoritmo upstream foi preservado com limite local
 > opcional, e as quatro falhas do core descritas nesta auditoria foram resolvidas.
 > O `loginCounter` foi corrigido nos cinco providers, e o gate de persistência

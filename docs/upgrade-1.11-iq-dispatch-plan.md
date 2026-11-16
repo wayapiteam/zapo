@@ -1,11 +1,13 @@
 # Plano: progresso de respostas IQ sob saturação da entrada
 
-Status: proposta para implementação. Data: 15/11/2026.
+Status: implementação local concluída; validação de implantação real pendente. Data: 15/11/2026.
 Branch: `chore/upgrade-zapo-1.11-session-safety`. Referência dos testes: `b3b7dd4`.
 
-Este documento explica o problema, a solução proposta, as decisões de compatibilidade e
-os critérios para considerar a correção concluída. Não registra uma correção já implementada.
-Criar este plano não altera a fila, o banco ou o comportamento do cliente.
+Este documento preserva o plano aprovado antes da implementação. O desenho efetivo, os
+limites escolhidos, a medição, os resultados e as ressalvas estão no
+[relatório da implementação](./upgrade-1.11-iq-fix.md). Os checklists abaixo são critérios
+do plano histórico; o relatório registra quais cenários foram efetivamente executados.
+Não houve publicação, deploy ou validação com WhatsApp real.
 
 ## 1. Problema e evidência
 

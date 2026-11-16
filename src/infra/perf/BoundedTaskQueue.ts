@@ -67,6 +67,21 @@ export class BoundedTaskQueue {
         return this.queue.length - this.head
     }
 
+    /**
+     * Rejects queued work with `reason` without executing it.
+     * Already-running tasks are not cancelled and retain their concurrency slots.
+     * @returns The number of queued tasks rejected.
+     */
+    public clearPending(reason: Error): number {
+        const count = this.pending()
+        while (this.head < this.queue.length) {
+            this.queue[this.head++].reject(reason)
+        }
+        this.queue.length = 0
+        this.head = 0
+        return count
+    }
+
     public inFlight(): number {
         return this.running
     }

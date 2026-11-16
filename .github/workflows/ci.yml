@@ -100,6 +100,8 @@ jobs:
                   path: dist/
             - run: npx turbo run build --filter=@zapo-js/fake-server
             - run: npm test -w packages/fake-server
+            - run: npm run test:upgrade:queue
+            - run: npm run test:upgrade:iq-loopback
 
     test-media-utils:
         runs-on: ubuntu-latest

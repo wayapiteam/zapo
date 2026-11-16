@@ -8,6 +8,7 @@ import { WA_DEFAULTS } from '@protocol/constants'
 import type { WaKeepAlive } from '@transport/keepalive/WaKeepAlive'
 import type { WaNodeOrchestrator } from '@transport/node/WaNodeOrchestrator'
 import type { WaNodeTransport } from '@transport/node/WaNodeTransport'
+import type { WaStanzaPreparer } from '@transport/types'
 import { WaComms } from '@transport/WaComms'
 import { toError } from '@util/primitives'
 
@@ -21,6 +22,7 @@ interface WaConnectionManagerOptions {
     readonly getPassiveTasks: () => WaPassiveTasksCoordinator | null
     readonly clearStoredCredentials: () => Promise<void>
     readonly onPostPairReconnected: () => void
+    readonly prepareIncomingFrame?: WaStanzaPreparer
 }
 
 export class WaConnectionManager {
@@ -40,6 +42,7 @@ export class WaConnectionManager {
     private pairingReconnectPromise: Promise<void> | null
     private pairRestartTimer: ReturnType<typeof setTimeout> | null
     private frameHandler: ((frame: Uint8Array) => Promise<void>) | null
+    private readonly framePreparer: WaStanzaPreparer | undefined
     private pendingComms: WaComms | null
     private lifecycleGeneration: number
     private lifecycleQueue: Promise<void>
@@ -54,6 +57,7 @@ export class WaConnectionManager {
         this.getPassiveTasks = options.getPassiveTasks
         this.clearStoredCredentialsCallback = options.clearStoredCredentials
         this.onPostPairReconnected = options.onPostPairReconnected
+        this.framePreparer = options.prepareIncomingFrame
         this.comms = null
         this.clockSkewMs = null
         this.mediaConnCache = null
@@ -66,6 +70,10 @@ export class WaConnectionManager {
         this.lifecycleQueue = Promise.resolve()
     }
 
+    /**
+     * Connects with a compatible raw handler. The constructor's optional input preparer
+     * is retained across routing fallback and the post-pairing registered reconnect.
+     */
     public async connect(frameHandler: (frame: Uint8Array) => Promise<void>): Promise<void> {
         if (this.connectPromise) {
             this.logger.trace('wa client connect already in-flight')
@@ -353,7 +361,7 @@ export class WaConnectionManager {
         this.pendingComms = comms
 
         this.mediaConnCache = null
-        comms.startComms(async (frame) => frameHandler(frame))
+        comms.startComms(async (frame) => frameHandler(frame), undefined, this.framePreparer)
         try {
             await comms.waitForConnection(commsConfig.connectTimeoutMs)
             this.assertLifecycleCurrent(lifecycleGeneration, 'start comms')

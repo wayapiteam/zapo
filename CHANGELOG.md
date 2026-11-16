@@ -1,5 +1,20 @@
 # zapo-js
 
+## Unreleased (fork)
+
+### Patch Changes
+
+- Resolve pending IQ result/error replies before ordinary handler admission. Eight handlers
+  waiting for IQ can now receive their replies without a timeout or reconnect, including
+  compressed replies and built-in `ignoreKey` filters. Preserve receipt/retry handling and
+  query correlation, decode once, and discard obsolete connection work. Wire and prepared
+  input budgets are bounded per connection generation; already-running callbacks complete
+  their own I/O after reconnect. No credential store or migration changes are part of this fix.
+- Compatibility: arbitrary `lowlevel.registerIncomingStanzaFilter` filters retain the
+  filtered ordinary queue, including its eight-handler starvation limitation. Raw `WaComms`
+  callers without the optional preparer retain their callback path. See
+  [implementation and validation](docs/upgrade-1.11-iq-fix.md) for limits and local evidence.
+
 ## 1.11.0
 
 ### Minor Changes
