@@ -611,6 +611,87 @@ test('incoming node coordinator supports dynamic handler registration and unregi
     assert.equal(unhandled.length, 1)
 })
 
+test('early IQ resolution tracks raw filters independently from non-IQ filters', async () => {
+    const { runtime } = createIncomingRuntime()
+    let resolved = 0
+    const coordinator = new WaIncomingNodeCoordinator({
+        logger: createNoopLogger(),
+        runtime: {
+            ...runtime,
+            isPendingIqResponse: () => true,
+            tryResolvePendingNode: () => {
+                resolved++
+                return true
+            }
+        },
+        offlineResume: {
+            trackOfflineStanza() {},
+            handleOfflinePreview() {},
+            handleOfflineComplete() {},
+            reset() {},
+            isComplete: false,
+            isResuming: false
+        } as never
+    })
+    const reply: BinaryNode = { tag: 'iq', attrs: { id: 'pending', type: 'result' } }
+    const filter = () => false
+    const removeSafe = coordinator.registerIncomingStanzaFilter(filter, {
+        affectsIqResponses: false
+    })
+    assert.equal(coordinator.tryResolvePendingIqResponse(reply), true)
+    const removeFirst = coordinator.registerIncomingStanzaFilter(filter)
+    const removeSecond = coordinator.registerIncomingStanzaFilter(filter)
+    assert.equal(coordinator.tryResolvePendingIqResponse(reply), false)
+    removeSecond()
+    removeSecond()
+    assert.equal(coordinator.tryResolvePendingIqResponse(reply), false)
+    removeFirst()
+    assert.equal(coordinator.tryResolvePendingIqResponse(reply), true)
+    removeSafe()
+    assert.equal(coordinator.tryResolvePendingIqResponse(reply), true)
+    assert.equal(resolved, 3)
+})
+
+test('early IQ resolution preserves offline accounting before consuming the pending query', async () => {
+    const { runtime } = createIncomingRuntime()
+    const order: string[] = []
+    const coordinator = new WaIncomingNodeCoordinator({
+        logger: createNoopLogger(),
+        runtime: {
+            ...runtime,
+            isPendingIqResponse: (node) => node.attrs.id === 'expected',
+            tryResolvePendingNode: () => {
+                order.push('resolve')
+                return true
+            }
+        },
+        offlineResume: {
+            trackOfflineStanza: () => order.push('offline'),
+            handleOfflinePreview() {},
+            handleOfflineComplete() {},
+            reset() {},
+            isComplete: false,
+            isResuming: false
+        } as never
+    })
+    assert.equal(
+        coordinator.tryResolvePendingIqResponse({
+            tag: 'iq',
+            attrs: { id: 'unknown', type: 'result', offline: '1' }
+        }),
+        false
+    )
+    assert.deepEqual(order, [])
+    assert.equal(
+        coordinator.tryResolvePendingIqResponse({
+            tag: 'iq',
+            attrs: { id: 'expected', type: 'result', offline: '1' }
+        }),
+        true
+    )
+    assert.deepEqual(order, ['offline', 'resolve'])
+})
+
 test('incoming node coordinator runs stanza filters and acks blocked tags', async () => {
     const { runtime: baseRuntime, unhandled } = createIncomingRuntime()
     const sent: BinaryNode[] = []

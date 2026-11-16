@@ -206,14 +206,19 @@ test('userless server JID (from=s.whatsapp.net) passes through without throwing'
 })
 
 test('createIgnoreKeyFilter with predicate routes the parsed context, drops non-addressable', () => {
+    const seen: string[] = []
     const filter = createIgnoreKeyFilter(
-        (m) => m.kind === 'message' && m.id === 'DROP',
+        (m) => {
+            seen.push(m.kind)
+            return m.kind === 'message' && m.id === 'DROP'
+        },
         () => ({ meJid: ME_JID })
     )
     assert.equal(filter(message({ from: PN, id: 'DROP' })), true)
     assert.equal(filter(message({ from: PN, id: 'KEEP' })), false)
     assert.equal(filter(receipt({ from: PN, id: 'DROP' })), false)
     assert.equal(filter({ tag: 'iq', attrs: { from: PN, id: 'DROP' } }), false)
+    assert.deepEqual(seen, ['message', 'message', 'receipt'])
 })
 
 test('createIgnoreKeyFilter forwards non-message addressable kinds to the predicate', () => {

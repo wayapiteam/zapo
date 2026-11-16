@@ -183,3 +183,25 @@ test('connection cancellation rejects every waiter and cancels their old timers'
     orchestrator.tryResolvePending(resultNode('cancel-a'))
     assert.equal((await fresh).attrs.id, 'cancel-a')
 })
+
+test('early resolution accepts only a matching IQ result/error for an IQ request', async () => {
+    const { orchestrator, sent } = createHarness()
+    const iq = orchestrator.query(queryNode('early-iq'))
+    const other = orchestrator.query({ tag: 'message', attrs: { id: 'publish-id' } })
+    await waitForSent(sent, 2)
+    assert.equal(orchestrator.tryResolvePendingIqResponse(resultNode('unknown')), false)
+    assert.equal(orchestrator.tryResolvePendingIqResponse(queryNode('early-iq')), false)
+    assert.equal(
+        orchestrator.tryResolvePendingIqResponse({
+            tag: 'receipt',
+            attrs: { id: 'early-iq', type: 'retry' }
+        }),
+        false
+    )
+    assert.equal(orchestrator.tryResolvePendingIqResponse(resultNode('publish-id')), false)
+    assert.equal(orchestrator.tryResolvePendingIqResponse(resultNode('early-iq')), true)
+    assert.equal((await iq).attrs.id, 'early-iq')
+    assert.equal(orchestrator.hasPending(), true)
+    orchestrator.tryResolvePending({ tag: 'ack', attrs: { id: 'publish-id' } })
+    assert.equal((await other).tag, 'ack')
+})

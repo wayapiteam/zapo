@@ -103,3 +103,30 @@ test('eight running tasks and 4096 waiting tasks drain without drops or reorderi
     assert.equal(queue.inFlight(), 0)
     assert.equal(queue.pending(), 0)
 })
+
+test('clearing pending work rejects only waiting tasks and keeps the running task intact', async () => {
+    const queue = new BoundedTaskQueue(2, 1)
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+        release = resolve
+    })
+    const running = queue.enqueue(async () => {
+        await gate
+        return 'running'
+    })
+    let cancelledRan = false
+    const waiting = queue.enqueue(async () => {
+        cancelledRan = true
+    })
+    const rejected = assert.rejects(waiting, /generation replaced/)
+    assert.equal(queue.clearPending(new Error('generation replaced')), 1)
+    assert.equal(queue.clearPending(new Error('already clear')), 0)
+    await rejected
+    assert.equal(queue.inFlight(), 1)
+    assert.equal(queue.pending(), 0)
+    const fresh = queue.enqueue(async () => 'fresh')
+    release()
+    assert.equal(await running, 'running')
+    assert.equal(await fresh, 'fresh')
+    assert.equal(cancelledRan, false)
+})
