@@ -1,5 +1,8 @@
 # IQ: cobertura existente e contratos antes da correção
 
+O [plano da correção e manutenção futura](./upgrade-1.11-iq-dispatch-plan.md) descreve o fluxo
+proposto, as decisões de compatibilidade, os novos testes necessários e a entrega de JSDoc/docs.
+
 Rodada de 15/11/2026 em `chore/upgrade-zapo-1.11-session-safety`, a partir de `3aa8683`.
 Esta rodada altera somente testes, seus helpers/comandos e documentação. Não implementa
 o caminho antecipado de respostas, não muda as oito vagas ou os 4096 itens da fila, não
