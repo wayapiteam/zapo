@@ -276,107 +276,129 @@ function credentialFingerprint(credentials) {
     return hash.digest('hex')
 }
 
-test('WebSocket/Noise: an old decoded reply cannot settle a reused id after reconnect', async () => {
-    const server = await FakeWaServer.start({ host: '127.0.0.1' })
-    const store = core.createStore({})
-    const client = new core.WaClient(
-        {
-            store,
-            sessionId: 'iq-generation-reuse',
-            chatSocketUrls: [server.url],
-            history: { enabled: false },
-            proxy: { mediaUpload: server.mediaProxyAgent, mediaDownload: server.mediaProxyAgent },
-            testHooks: { noiseRootCa: server.noiseRootCa }
-        },
-        core.createNoopLogger()
-    )
-    const pipelines = []
-    const queries = []
-    const unbindPipeline = server.onAuthenticatedPipeline((pipeline) => pipelines.push(pipeline))
-    const unbindIq = server.registerIqHandler({ xmlns: 'w:test', type: 'get' }, (node) => {
-        queries.push(node)
-        return null
-    })
-    let releaseOld
-    const oldGate = new Promise((resolve) => {
-        releaseOld = resolve
-    })
-    let held = false
-    let returnedOld = false
-    const transport = client.deps.nodeTransport
-    const decode = transport.decodeIncomingFrame.bind(transport)
-    transport.decodeIncomingFrame = async (frame, isCurrent, accountDecodedBytes) => {
-        const node = await decode(frame, isCurrent, accountDecodedBytes)
-        if (!held && node?.attrs.id === 'reused-after-reconnect') {
-            held = true
-            // Hold after real decoding, at the boundary checked again by WaClient.
-            await oldGate
-            returnedOld = true
-        }
-        return node
-    }
-    try {
-        const credentials = await client.auth.loadOrCreateCredentials()
-        await store.session('iq-generation-reuse').auth.save({
-            ...credentials,
-            meJid: '5511999999991:1@s.whatsapp.net',
-            serverStaticKey: server.serverStaticKeyPair.pubKey,
-            serverHasPreKeys: true
-        })
-        await client.connect()
-        await waitUntil(() => pipelines.length === 1, 'initial authenticated connection')
-        const fingerprint = credentialFingerprint(client.auth.getCurrentCredentials())
-        const request = {
-            tag: 'iq',
-            attrs: { id: 'reused-after-reconnect', type: 'get', xmlns: 'w:test' }
-        }
-        const old = client.lowlevel.query(request, 5_000).then(
-            (node) => ({ node }),
-            (error) => ({ error: error.message })
-        )
-        await waitUntil(() => queries.length === 1, 'old connection query')
-        await pipelines[0].sendStanza({
-            tag: 'iq',
-            attrs: { id: request.attrs.id, type: 'result', phase: 'old' }
-        })
-        await waitUntil(() => held, 'old reply decoded and held')
-        await client.disconnect()
-        assert.match((await old).error, /client disconnected/)
-        await client.connect()
-        await waitUntil(() => pipelines.length === 2, 'new authenticated connection')
-        let freshSettled = false
-        const fresh = client.lowlevel.query(request, 5_000).then(
-            (node) => {
-                freshSettled = true
-                return { node }
+for (const delayed of ['decoded reply', 'send failure']) {
+    test(`WebSocket/Noise: old ${delayed} cannot affect a reused id after reconnect`, async () => {
+        const server = await FakeWaServer.start({ host: '127.0.0.1' })
+        const store = core.createStore({})
+        const client = new core.WaClient(
+            {
+                store,
+                sessionId: 'iq-generation-reuse',
+                chatSocketUrls: [server.url],
+                history: { enabled: false },
+                proxy: {
+                    mediaUpload: server.mediaProxyAgent,
+                    mediaDownload: server.mediaProxyAgent
+                },
+                testHooks: { noiseRootCa: server.noiseRootCa }
             },
-            (error) => {
-                freshSettled = true
-                return { error: error.message }
-            }
+            core.createNoopLogger()
         )
-        await waitUntil(() => queries.length === 2, 'new query reusing the old id')
-        releaseOld()
-        await waitUntil(() => returnedOld, 'old decode released')
-        await nextTurn()
-        assert.equal(freshSettled, false, 'old decoded data must not resolve the new query')
-        await pipelines[1].sendStanza({
-            tag: 'iq',
-            attrs: { id: request.attrs.id, type: 'result', phase: 'fresh' }
+        const pipelines = []
+        const queries = []
+        const unbindPipeline = server.onAuthenticatedPipeline((pipeline) =>
+            pipelines.push(pipeline)
+        )
+        const unbindIq = server.registerIqHandler({ xmlns: 'w:test', type: 'get' }, (node) => {
+            queries.push(node)
+            return null
         })
-        const response = await fresh
-        assert.equal(response.error, undefined)
-        assert.equal(response.node.attrs.phase, 'fresh')
-        assert.equal(credentialFingerprint(client.auth.getCurrentCredentials()), fingerprint)
-        assert.equal(client.getState().connected, true)
-        assert.equal(pipelines.length, 2)
-    } finally {
-        releaseOld()
-        transport.decodeIncomingFrame = decode
-        unbindIq()
-        unbindPipeline()
-        await client.disconnect()
-        await store.destroy()
-        await server.stop()
-    }
-})
+        let releaseOld
+        const oldGate = new Promise((resolve) => {
+            releaseOld = resolve
+        })
+        let held = false
+        let returnedOld = false
+        const transport = client.deps.nodeTransport
+        const decode = transport.decodeIncomingFrame.bind(transport)
+        const send = transport.sendNode.bind(transport)
+        if (delayed === 'decoded reply')
+            transport.decodeIncomingFrame = async (frame, isCurrent, accountDecodedBytes) => {
+                const node = await decode(frame, isCurrent, accountDecodedBytes)
+                if (!held && node?.attrs.id === 'reused-after-reconnect') {
+                    held = true
+                    // Hold after real decoding, at the boundary checked again by WaClient.
+                    await oldGate
+                    returnedOld = true
+                }
+                return node
+            }
+        if (delayed === 'send failure')
+            transport.sendNode = async (node) => {
+                await send(node)
+                if (!held && node.attrs.id === 'reused-after-reconnect') {
+                    held = true
+                    // Send bytes through the real socket, delay only its completion/failure.
+                    await oldGate
+                    returnedOld = true
+                    throw new Error('synthetic late send failure from old connection')
+                }
+            }
+        try {
+            const credentials = await client.auth.loadOrCreateCredentials()
+            await store.session('iq-generation-reuse').auth.save({
+                ...credentials,
+                meJid: '5511999999991:1@s.whatsapp.net',
+                serverStaticKey: server.serverStaticKeyPair.pubKey,
+                serverHasPreKeys: true
+            })
+            await client.connect()
+            await waitUntil(() => pipelines.length === 1, 'initial authenticated connection')
+            const fingerprint = credentialFingerprint(client.auth.getCurrentCredentials())
+            const request = {
+                tag: 'iq',
+                attrs: { id: 'reused-after-reconnect', type: 'get', xmlns: 'w:test' }
+            }
+            const old = client.lowlevel.query(request, 5_000).then(
+                (node) => ({ node }),
+                (error) => ({ error: error.message })
+            )
+            await waitUntil(() => queries.length === 1, 'old connection query')
+            if (delayed === 'decoded reply')
+                await pipelines[0].sendStanza({
+                    tag: 'iq',
+                    attrs: { id: request.attrs.id, type: 'result', phase: 'old' }
+                })
+            await waitUntil(() => held, 'old work held')
+            await client.disconnect()
+            assert.match((await old).error, /client disconnected/)
+            await client.connect()
+            await waitUntil(() => pipelines.length === 2, 'new authenticated connection')
+            let freshSettled = false
+            const fresh = client.lowlevel.query(request, 5_000).then(
+                (node) => {
+                    freshSettled = true
+                    return { node }
+                },
+                (error) => {
+                    freshSettled = true
+                    return { error: error.message }
+                }
+            )
+            await waitUntil(() => queries.length === 2, 'new query reusing the old id')
+            releaseOld()
+            await waitUntil(() => returnedOld, 'old work released')
+            await nextTurn()
+            assert.equal(freshSettled, false, 'old work must not settle the new query')
+            await pipelines[1].sendStanza({
+                tag: 'iq',
+                attrs: { id: request.attrs.id, type: 'result', phase: 'fresh' }
+            })
+            const response = await fresh
+            assert.equal(response.error, undefined)
+            assert.equal(response.node.attrs.phase, 'fresh')
+            assert.equal(credentialFingerprint(client.auth.getCurrentCredentials()), fingerprint)
+            assert.equal(client.getState().connected, true)
+            assert.equal(pipelines.length, 2)
+        } finally {
+            releaseOld()
+            transport.decodeIncomingFrame = decode
+            transport.sendNode = send
+            unbindIq()
+            unbindPipeline()
+            await client.disconnect()
+            await store.destroy()
+            await server.stop()
+        }
+    })
+}

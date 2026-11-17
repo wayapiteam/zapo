@@ -35,6 +35,52 @@ async function waitForSent(sent: readonly BinaryNode[], count: number): Promise<
     assert.fail(`expected ${count} outgoing queries, received ${sent.length}`)
 }
 
+for (const settledBy of ['disconnect', 'timeout', 'response'] as const) {
+    test(`late send failure after ${settledBy} cannot remove a newer query reusing its id`, async (t) => {
+        t.mock.timers.enable({ apis: ['setTimeout'] })
+        let rejectOldSend = (_error: Error): void => undefined
+        let sends = 0
+        const { orchestrator, sent } = createHarness(async () => {
+            if (++sends === 1) {
+                await new Promise<void>((_resolve, reject) => {
+                    rejectOldSend = reject
+                })
+            }
+        })
+        const request = queryNode('late-send-reused-id')
+        const original = orchestrator.query(request, 10).then(
+            () => 'response',
+            (error: Error) => error.message
+        )
+        await waitForSent(sent, 1)
+        if (settledBy === 'disconnect') orchestrator.clearPending(new Error('disconnect'))
+        else if (settledBy === 'timeout') t.mock.timers.tick(10)
+        else orchestrator.tryResolvePending(resultNode(request.attrs.id))
+        const outcome = await original
+        assert.match(outcome, new RegExp(settledBy === 'timeout' ? 'query timeout' : settledBy))
+
+        const fresh = orchestrator.query(request, 100)
+        const cleanup = fresh.catch(() => undefined)
+        try {
+            await waitForSent(sent, 2)
+            rejectOldSend(new Error('old connection send failed late'))
+            await new Promise<void>((resolve) => setImmediate(resolve))
+            assert.equal(orchestrator.hasPending(), true)
+            assert.equal(
+                orchestrator.tryResolvePendingIqResponse(resultNode(request.attrs.id)),
+                true
+            )
+            assert.equal((await fresh).attrs.id, request.attrs.id)
+            t.mock.timers.tick(100)
+            assert.equal(orchestrator.hasPending(), false)
+        } finally {
+            orchestrator.clearPending(new Error('test cleanup'))
+            t.mock.timers.tick(100)
+            await cleanup
+        }
+    })
+}
+
 test('query is registered before send can deliver an immediate response', async () => {
     const harness = createHarness(async (node) => {
         assert.equal(harness.orchestrator.tryResolvePending(resultNode(node.attrs.id)), true)

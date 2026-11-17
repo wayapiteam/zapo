@@ -77,7 +77,8 @@ async function startFakeProxy(
     handlers: {
         readonly onConnect: (peer: NetSocket, remaining: Buffer) => void
         readonly onTunneled?: (peer: NetSocket, chunk: Buffer) => void
-    }
+    },
+    host = '127.0.0.1'
 ): Promise<FakeProxy> {
     const forward = handlers.onTunneled ?? ((peer: NetSocket, chunk: Buffer) => peer.write(chunk))
     let request = ''
@@ -96,7 +97,13 @@ async function startFakeProxy(
             handlers.onConnect(peer, pending.subarray(end + 4))
         })
     })
-    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    await new Promise<void>((resolve, reject) => {
+        server.once('error', reject)
+        server.listen(0, host, () => {
+            server.off('error', reject)
+            resolve()
+        })
+    })
     t.after(() => server.close())
     const address = server.address()
     assert.ok(address && typeof address === 'object')
@@ -150,6 +157,45 @@ test('WaMobileTcpSocket tunnels mobile TCP through an authenticated HTTP CONNECT
     socket.send(new Uint8Array([1, 2, 3]))
     assert.deepEqual(await echoed, new Uint8Array([1, 2, 3]))
     assert.equal(socketError, undefined)
+})
+
+test('WaMobileTcpSocket exchanges bytes through an IPv6 HTTP CONNECT proxy', async (t) => {
+    let proxy: FakeProxy
+    try {
+        proxy = await startFakeProxy(
+            t,
+            {
+                onConnect: (peer) => {
+                    peer.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+                }
+            },
+            '::1'
+        )
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code
+        if (code === 'EAFNOSUPPORT' || code === 'EADDRNOTAVAIL') {
+            t.skip('IPv6 loopback unavailable')
+            return
+        }
+        throw error
+    }
+    const agent = proxyAgent(`http://[::1]:${proxy.port}`)
+    const socket = new WaMobileTcpSocket('tcp://synthetic.invalid:443', undefined, { agent })
+    t.after(() => {
+        socket.close()
+        agent.destroy()
+    })
+    const result = await waitFor<string>('IPv6 proxy open', (done) => {
+        socket.onopen = () => done('open')
+        socket.onerror = (event) => done(event.reason ?? 'unknown error')
+    })
+    assert.equal(result, 'open')
+    assert.match(proxy.request(), /^CONNECT synthetic\.invalid:443 HTTP\/1\.1/m)
+    const echoed = waitFor<Uint8Array>('IPv6 proxy echo', (done) => {
+        socket.onmessage = (event) => done(event.data as Uint8Array)
+    })
+    socket.send(new Uint8Array([4, 5, 6]))
+    assert.deepEqual(await echoed, new Uint8Array([4, 5, 6]))
 })
 
 test('WaMobileTcpSocket keeps tunneled bytes that share the packet with the CONNECT response', async (t) => {
