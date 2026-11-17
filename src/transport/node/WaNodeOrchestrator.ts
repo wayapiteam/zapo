@@ -147,6 +147,10 @@ export class WaNodeOrchestrator {
         await this.sendNodeFn(outbound)
     }
 
+    /**
+     * Registers a query before sending. Its timeout and send rejection only own that
+     * registration, so late completion cannot remove a newer query reusing the ID.
+     */
     public async query(
         node: BinaryNode,
         timeoutMs = this.defaultTimeoutMs,
@@ -169,20 +173,28 @@ export class WaNodeOrchestrator {
 
         return new Promise<BinaryNode>((resolve, reject) => {
             const timer = setTimeout(() => {
+                if (this.pendingQueries.get(id) !== pending) return
                 this.pendingQueries.delete(id)
                 queryLogger.warn('query node timeout', { timeoutMs })
                 reject(new Error(`query timeout (${id}) after ${timeoutMs}ms`))
             }, timeoutMs)
 
-            this.pendingQueries.set(id, {
+            const pending: PendingNodeQuery = {
                 requestTag: outbound.tag,
                 resolve,
                 reject,
                 timer
-            })
+            }
+            this.pendingQueries.set(id, pending)
 
             this.sendNodeFn(outbound).catch((error) => {
                 clearTimeout(timer)
+                if (this.pendingQueries.get(id) !== pending) {
+                    queryLogger.trace('ignored send failure for settled query', {
+                        message: toError(error).message
+                    })
+                    return
+                }
                 this.pendingQueries.delete(id)
                 queryLogger.warn('failed to send query node', {
                     message: toError(error).message

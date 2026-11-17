@@ -1,5 +1,10 @@
 # IQ: implementação, regressão e manutenção do fork
 
+> Atualização de 17/11/2026: a revisão independente revelou também falhas de lifecycle,
+> envio tardio com ID reutilizado e proxy. As correções TDD e os limites desta nova rodada
+> estão no [relatório da revisão](./upgrade-1.11-review-fixes.md). Os números abaixo são da
+> rodada original de 15/11/2026.
+
 15/11/2026. Branch: `chore/upgrade-zapo-1.11-session-safety`. Base da implementação:
 `4ab4561093bc3c7b673da5bae9e79070e6cb6759`. O upstream 1.11.0 já estava integrado.
 

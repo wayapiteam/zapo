@@ -68,6 +68,8 @@ const TCP_PROXY_HINT =
  * cannot honour throw instead of resolving to `undefined`, because dropping one
  * silently would dial the destination directly – the opposite of what a
  * deployment that pins its egress to a proxy asked for.
+ * IPv6 literal hostnames are returned without URL brackets for raw socket dialing.
+ * Invalid URL errors omit the input, which may contain proxy credentials.
  */
 export function toTcpProxyEndpoint(
     proxy: WaProxyTransport | undefined
@@ -92,7 +94,7 @@ export function toTcpProxyEndpoint(
     const username = decodeProxyUserInfo(url.username, 'username')
     const password = decodeProxyUserInfo(url.password, 'password')
     return {
-        hostname: url.hostname,
+        hostname: url.hostname.startsWith('[') ? url.hostname.slice(1, -1) : url.hostname,
         port: url.port ? Number(url.port) : 80,
         authorization:
             username || password
@@ -134,7 +136,7 @@ function readAgentProxyUrl(agent: WaProxyAgent): URL {
         try {
             return new URL(value)
         } catch {
-            throw new Error(`proxy agent exposes an unparseable proxy url ${JSON.stringify(value)}`)
+            throw new Error('proxy agent exposes an unparseable proxy url')
         }
     }
     if (isSocksProxyEndpoint(value)) {

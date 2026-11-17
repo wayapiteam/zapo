@@ -4,6 +4,11 @@
 
 ### Patch Changes
 
+- Preserve lifecycle request order when a post-pairing restart races with disconnect,
+  and abort a cancelled connection after asynchronous configuration before opening a socket.
+- Keep a late send failure or timeout from removing a newer IQ query that reused its ID.
+- Dial IPv6 HTTP CONNECT proxies with an unbracketed literal hostname. Omit malformed proxy
+  URLs from errors and connection logs so their userinfo is not exposed.
 - Publish the fork core and `@wayapiteam/zapo-store-sqlite` to GitHub Packages from
   this repository. The provider imports and declares `@wayapiteam/zapo` as its peer.
   Release lookups use scoped manifest names, skip existing versions and reject

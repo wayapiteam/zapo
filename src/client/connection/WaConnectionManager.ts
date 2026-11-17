@@ -128,6 +128,11 @@ export class WaConnectionManager {
         return this.pairingReconnectPromise !== null
     }
 
+    /**
+     * Cancels earlier connection intents before joining the lifecycle queue.
+     * A previously requested pairing restart cannot supersede this disconnect.
+     * Clears transient state and pending queries without clearing stored credentials.
+     */
     public async disconnect(): Promise<void> {
         this.clearPairRestartTimer()
         const lifecycleGeneration = this.nextLifecycleGeneration()
@@ -252,14 +257,17 @@ export class WaConnectionManager {
         this.pairRestartTimer = null
     }
 
+    /** Captures restart order when requested, before waiting for the lifecycle queue. */
     private async reconnectAsRegisteredAfterPairing(): Promise<void> {
         if (this.pairingReconnectPromise) {
             this.logger.trace('pairing reconnect already in-flight')
             return this.pairingReconnectPromise
         }
 
+        // Lifecycle order follows requests, not when queued operations start running.
+        const lifecycleGeneration = this.nextLifecycleGeneration()
         const operation = this.runLifecycleOperation(async () => {
-            await this.reconnectAsRegisteredAfterPairingInternal()
+            await this.reconnectAsRegisteredAfterPairingInternal(lifecycleGeneration)
         })
         const promise = operation.finally(() => {
             if (this.pairingReconnectPromise === promise) {
@@ -270,7 +278,10 @@ export class WaConnectionManager {
         return this.pairingReconnectPromise
     }
 
-    private async reconnectAsRegisteredAfterPairingInternal(): Promise<void> {
+    private async reconnectAsRegisteredAfterPairingInternal(
+        lifecycleGeneration: number
+    ): Promise<void> {
+        this.assertLifecycleCurrent(lifecycleGeneration, 'pairing reconnect')
         const frameHandler = this.frameHandler
         if (!frameHandler) {
             throw new Error('pairing reconnect requires an active frame handler')
@@ -287,9 +298,6 @@ export class WaConnectionManager {
             this.logger.trace('pairing reconnect skipped: no active comms')
             return
         }
-
-        const lifecycleGeneration = this.nextLifecycleGeneration()
-        this.assertLifecycleCurrent(lifecycleGeneration, 'pairing reconnect')
 
         this.logger.info('pairing completed, restarting comms as registered')
         this.keepAlive.stop()
@@ -357,6 +365,7 @@ export class WaConnectionManager {
             disableNoiseCertificateChainVerification:
                 this.options.dangerous?.disableNoiseCertificateChainVerification
         })
+        this.assertLifecycleCurrent(lifecycleGeneration, 'start comms')
         const comms = new WaComms(commsConfig, this.logger)
         this.pendingComms = comms
 
