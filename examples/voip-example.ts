@@ -35,9 +35,9 @@ import { type ChildProcess, spawn } from 'node:child_process'
 import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 
-import { createSqliteStore } from '@wayapiteam/zapo-store-sqlite'
 import { createPinoLogger, createStore, type LogLevel, WaClient } from 'zapo-js'
 
+import { createSqliteStore } from '@wayapiteam/zapo-store-sqlite'
 import { CallState, EndCallReason, voipPlugin } from '@zapo-js/voip'
 
 const SAMPLE_RATE = 16_000

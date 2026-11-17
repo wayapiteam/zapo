@@ -76,7 +76,7 @@ module.exports = [
             'import/parsers': {
                 '@typescript-eslint/parser': ['.ts', '.tsx']
             },
-            'import/internal-regex': '^@zapo-js/',
+            'import/internal-regex': '^@(zapo-js|wayapiteam)/',
             'import/resolver': {
                 node: {
                     extensions: ['.ts', '.tsx', '.js', '.mjs', '.cjs']
