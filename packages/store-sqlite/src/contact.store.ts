@@ -1,6 +1,6 @@
-import { isUserJid } from 'zapo-js'
-import type { WaContactStore as Contract, WaStoredContactRecord } from 'zapo-js/store'
-import { asNumber, asOptionalString, asString } from 'zapo-js/util'
+import { isUserJid } from '@wayapiteam/zapo'
+import type { WaContactStore as Contract, WaStoredContactRecord } from '@wayapiteam/zapo/store'
+import { asNumber, asOptionalString, asString } from '@wayapiteam/zapo/util'
 
 import { BaseSqliteStore } from './BaseSqliteStore'
 import type { WaSqliteConnection } from './connection'

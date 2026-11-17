@@ -1,17 +1,28 @@
-# @zapo-js/store-sqlite
+# @wayapiteam/zapo-store-sqlite
 
-SQLite-backed persistent store for [`zapo-js`](https://www.npmjs.com/package/zapo-js). Suitable for single-process bots, dev sessions, and small-to-medium production deployments that don't need a network database.
+SQLite-backed persistent store for [`@wayapiteam/zapo`](https://github.com/wayapiteam/zapo). Suitable for single-process bots, dev sessions, and small-to-medium production deployments that don't need a network database.
 
 Backed by `better-sqlite3` on Node, `bun:sqlite` on Bun, or the runtime's built-in `node:sqlite` when no native addon is available (auto-detected). Lazy migrations run on first touch per domain; all writes go through `withTransaction` so partial failures roll back cleanly.
+
+## Publicação do fork
+
+Este pacote e `@wayapiteam/zapo` são publicados juntos pelo workflow do mesmo
+repositório `wayapiteam/zapo`, no GitHub Packages. O peer do provider é o core
+`@wayapiteam/zapo`; seus imports publicados usam esse mesmo nome. Não instala um
+segundo core upstream. Veja o [guia de release](../../docs/fork-release.md).
+
+A migração de `loginCounter` é automática no domínio de autenticação e preserva
+as credenciais existentes. O nome de pacote não muda o caminho do banco: mantenha
+o mesmo arquivo de sessões ao atualizar o consumidor.
 
 ## Install
 
 ```bash
-npm install @zapo-js/store-sqlite better-sqlite3
+npm install @wayapiteam/zapo @wayapiteam/zapo-store-sqlite better-sqlite3
 # or on Bun
-bun add @zapo-js/store-sqlite
+bun add @wayapiteam/zapo @wayapiteam/zapo-store-sqlite
 # or with no native dependency at all (Node 22.13+)
-npm install @zapo-js/store-sqlite
+npm install @wayapiteam/zapo @wayapiteam/zapo-store-sqlite
 ```
 
 `better-sqlite3` is an optional peer dependency. Skip it and the store falls back to `node:sqlite`, which ships with the runtime, so nothing has to be compiled.
@@ -35,8 +46,8 @@ Write throughput is effectively the same on all three (SQLite itself dominates).
 ## Quick start
 
 ```ts
-import { createStore, WaClient } from 'zapo-js'
-import { createSqliteStore } from '@zapo-js/store-sqlite'
+import { createStore, WaClient } from '@wayapiteam/zapo'
+import { createSqliteStore } from '@wayapiteam/zapo-store-sqlite'
 
 const store = createStore({
     backends: {
@@ -79,7 +90,7 @@ The returned object is shaped as a `WaStoreBackend` (`{ stores, caches }`) - fee
 To share a single SQLite connection with the rest of your application, open it yourself with `openSqliteConnection` and pass it through `connection`:
 
 ```ts
-import { createSqliteStore, openSqliteConnection } from '@zapo-js/store-sqlite'
+import { createSqliteStore, openSqliteConnection } from '@wayapiteam/zapo-store-sqlite'
 
 const connection = await openSqliteConnection({
     path: 'app.sqlite',

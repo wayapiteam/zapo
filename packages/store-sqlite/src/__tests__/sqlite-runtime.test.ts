@@ -4,17 +4,17 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { APP_STATE_EMPTY_LT_HASH } from 'zapo-js/appstate'
-import { toSerializedPubKey, X25519 } from 'zapo-js/crypto'
-import { WA_APP_STATE_COLLECTIONS } from 'zapo-js/protocol'
-import type { WaRetryOutboundMessageRecord } from 'zapo-js/retry'
+import { APP_STATE_EMPTY_LT_HASH } from '@wayapiteam/zapo/appstate'
+import { toSerializedPubKey, X25519 } from '@wayapiteam/zapo/crypto'
+import { WA_APP_STATE_COLLECTIONS } from '@wayapiteam/zapo/protocol'
+import type { WaRetryOutboundMessageRecord } from '@wayapiteam/zapo/retry'
 import {
     decodeSignalSessionRecord,
     encodeSignalSessionRecord,
     type SenderKeyRecord,
     type SignalAddress,
     type SignalSessionRecord
-} from 'zapo-js/signal'
+} from '@wayapiteam/zapo/signal'
 
 import { WaAppStateSqliteStore } from '../appstate.store'
 import { WaChatMetadataSqliteStore } from '../chat-metadata.store'

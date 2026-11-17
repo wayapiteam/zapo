@@ -1,5 +1,5 @@
-import type { WaDeviceListSnapshot, WaDeviceListStore } from 'zapo-js/store'
-import { asNumber, asString, resolvePositive } from 'zapo-js/util'
+import type { WaDeviceListSnapshot, WaDeviceListStore } from '@wayapiteam/zapo/store'
+import { asNumber, asString, resolvePositive } from '@wayapiteam/zapo/util'
 
 import { BaseSqliteStore } from './BaseSqliteStore'
 import type { WaSqliteConnection } from './connection'

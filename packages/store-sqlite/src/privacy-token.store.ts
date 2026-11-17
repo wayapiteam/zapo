@@ -1,5 +1,5 @@
-import type { WaPrivacyTokenStore, WaStoredPrivacyTokenRecord } from 'zapo-js/store'
-import { asNumber, asOptionalBytes, asOptionalNumber, asString } from 'zapo-js/util'
+import type { WaPrivacyTokenStore, WaStoredPrivacyTokenRecord } from '@wayapiteam/zapo/store'
+import { asNumber, asOptionalBytes, asOptionalNumber, asString } from '@wayapiteam/zapo/util'
 
 import { BaseSqliteStore } from './BaseSqliteStore'
 import type { WaSqliteConnection } from './connection'

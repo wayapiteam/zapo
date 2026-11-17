@@ -1,4 +1,4 @@
-# @zapo-js/store-sqlite
+# @wayapiteam/zapo-store-sqlite
 
 ## 1.3.0
 

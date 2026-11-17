@@ -1,6 +1,6 @@
-import type { WaAuthCredentials } from 'zapo-js/auth'
-import { proto } from 'zapo-js/proto'
-import type { WaAuthStore } from 'zapo-js/store'
+import type { WaAuthCredentials } from '@wayapiteam/zapo/auth'
+import { proto } from '@wayapiteam/zapo/proto'
+import type { WaAuthStore } from '@wayapiteam/zapo/store'
 import {
     asBytes,
     asNumber,
@@ -8,7 +8,7 @@ import {
     asOptionalNumber,
     asOptionalString,
     toBoolOrUndef
-} from 'zapo-js/util'
+} from '@wayapiteam/zapo/util'
 
 import { BaseSqliteStore } from './BaseSqliteStore'
 import type { WaSqliteStorageOptions } from './types'

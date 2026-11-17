@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import type { SignalAddress } from 'zapo-js/signal'
-import { isBunRuntime } from 'zapo-js/util'
+import type { SignalAddress } from '@wayapiteam/zapo/signal'
+import { isBunRuntime } from '@wayapiteam/zapo/util'
 
 import { openSqliteConnection } from '../connection'
 import { WaIdentitySqliteStore } from '../identity.store'

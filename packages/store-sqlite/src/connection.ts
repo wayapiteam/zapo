@@ -1,5 +1,5 @@
-import type { Logger } from 'zapo-js'
-import { isBunRuntime, toSafeNumber } from 'zapo-js/util'
+import type { Logger } from '@wayapiteam/zapo'
+import { isBunRuntime, toSafeNumber } from '@wayapiteam/zapo/util'
 
 import {
     createSqliteTableNameSqlResolver,

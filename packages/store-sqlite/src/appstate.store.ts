@@ -8,12 +8,12 @@ import {
     keyEpoch,
     type WaAppStateStoreData,
     type WaAppStateSyncKey
-} from 'zapo-js/appstate'
+} from '@wayapiteam/zapo/appstate'
 import type {
     WaAppStateCollectionStateUpdate,
     WaAppStateCollectionStoreState,
     WaAppStateStore
-} from 'zapo-js/store'
+} from '@wayapiteam/zapo/store'
 import {
     asBytes,
     asNumber,
@@ -21,7 +21,7 @@ import {
     bytesToHex,
     uint8Equal,
     uint8TimingSafeEqual
-} from 'zapo-js/util'
+} from '@wayapiteam/zapo/util'
 
 import { BaseSqliteStore } from './BaseSqliteStore'
 import type { WaSqliteConnection } from './connection'

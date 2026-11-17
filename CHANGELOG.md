@@ -4,6 +4,10 @@
 
 ### Patch Changes
 
+- Publish the fork core and `@wayapiteam/zapo-store-sqlite` to GitHub Packages from
+  this repository. The provider imports and declares `@wayapiteam/zapo` as its peer.
+  Release lookups use scoped manifest names, skip existing versions and reject
+  authentication/network errors. Tarball gates cover CJS/ESM and persisted auth.
 - Resolve pending IQ result/error replies before ordinary handler admission. Eight handlers
   waiting for IQ can now receive their replies without a timeout or reconnect, including
   compressed replies and built-in `ignoreKey` filters. Preserve receipt/retry handling and

@@ -1,6 +1,6 @@
-import type { WaRetryOutboundMessageRecord, WaRetryOutboundState } from 'zapo-js/retry'
-import type { WaRetryStore } from 'zapo-js/store'
-import { asBytes, asNumber, asOptionalString, asString } from 'zapo-js/util'
+import type { WaRetryOutboundMessageRecord, WaRetryOutboundState } from '@wayapiteam/zapo/retry'
+import type { WaRetryStore } from '@wayapiteam/zapo/store'
+import { asBytes, asNumber, asOptionalString, asString } from '@wayapiteam/zapo/util'
 
 import { BaseSqliteStore } from './BaseSqliteStore'
 import type { WaSqliteStorageOptions } from './types'

@@ -39,9 +39,9 @@
     "dependencies": {
         "@modelcontextprotocol/sdk": "^1.29.0",
         "@zapo-js/media-utils": "^1.0.0",
-        "@zapo-js/store-sqlite": "^1.1.0",
         "@zapo-js/wam": "^0.1.0",
-        "better-sqlite3": "^12.6.2"
+        "better-sqlite3": "^12.6.2",
+        "@wayapiteam/zapo-store-sqlite": "^1.1.0"
     },
     "peerDependencies": {
         "zapo-js": "^1.0.0"

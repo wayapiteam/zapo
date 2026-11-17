@@ -1,4 +1,4 @@
-import type { Logger } from 'zapo-js'
+import type { Logger } from '@wayapiteam/zapo'
 
 import { WaAppStateSqliteStore } from './appstate.store'
 import { WaAuthSqliteStore } from './auth.store'
@@ -135,8 +135,8 @@ export interface WaSqliteStoreResult {
  *
  * @example
  * ```ts
- * import { createStore, WaClient } from 'zapo-js'
- * import { createSqliteStore } from '@zapo-js/store-sqlite'
+ * import { createStore, WaClient } from '@wayapiteam/zapo'
+ * import { createSqliteStore } from '@wayapiteam/zapo-store-sqlite'
  *
  * // Library-owned connection (most common)
  * const store = createStore({
@@ -149,7 +149,7 @@ export interface WaSqliteStoreResult {
  * @example
  * ```ts
  * // Bring your own connection - shared with the rest of your app
- * import { createSqliteStore, openSqliteConnection } from '@zapo-js/store-sqlite'
+ * import { createSqliteStore, openSqliteConnection } from '@wayapiteam/zapo-store-sqlite'
  *
  * const connection = await openSqliteConnection({ path: 'app.sqlite', sessionId: 'shared' })
  * const store = createStore({

@@ -1,5 +1,5 @@
 ---
-'@zapo-js/store-sqlite': patch
+'@wayapiteam/zapo-store-sqlite': patch
 '@zapo-js/store-postgres': patch
 '@zapo-js/store-mysql': patch
 '@zapo-js/store-mongo': patch

@@ -9,7 +9,7 @@ import {
     WaMessageMemoryStore,
     WaPrivacyTokenMemoryStore,
     WaThreadMemoryStore
-} from 'zapo-js/store'
+} from '@wayapiteam/zapo/store'
 
 import { WaContactSqliteStore } from '../contact.store'
 import { WaMessageSqliteStore } from '../message.store'

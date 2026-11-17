@@ -85,6 +85,7 @@ jobs:
                   name: core-build
                   path: dist/
             - run: npm test
+            - run: npm run test:release
 
     test-fake-server:
         runs-on: ubuntu-latest
@@ -136,7 +137,8 @@ jobs:
               with:
                   name: core-build
                   path: dist/
-            - run: npx turbo run build --filter=@zapo-js/store-sqlite
+            - run: npx turbo run build --filter=@wayapiteam/zapo-store-sqlite
+            - run: npm run test:release:package
             - run: npm test -w packages/store-sqlite
             # better-sqlite3 is an optional peer: prove the whole store surface
             # also works on the built-in node:sqlite backend.
@@ -165,7 +167,7 @@ jobs:
               with:
                   name: core-build
                   path: dist/
-            - run: npx turbo run build --filter=@zapo-js/fake-server --filter=@zapo-js/store-sqlite --filter=@zapo-js/media-utils --filter=@zapo-js/mcp-server
+            - run: npx turbo run build --filter=@zapo-js/fake-server --filter=@wayapiteam/zapo-store-sqlite --filter=@zapo-js/media-utils --filter=@zapo-js/mcp-server
             - run: npm test -w packages/mcp-server
 
     test-voip:
