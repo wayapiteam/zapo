@@ -5,7 +5,7 @@ import test from 'node:test'
 import { createNoopLogger } from '@infra/log/types'
 import { WaMobileTcpSocketCtor } from '@transport/node/WaMobileTcpSocket'
 import { toTcpProxyEndpoint } from '@transport/proxy'
-import { WaWebSocket } from '@transport/WaWebSocket'
+import { WaComms } from '@transport/WaComms'
 
 test('TCP proxy endpoint normalizes an IPv6 literal for socket dialing', () => {
     for (const [input, hostname] of [
@@ -37,32 +37,47 @@ test('malformed proxy URLs never expose their userinfo in errors', () => {
     }
 })
 
-test('a malformed proxy remains redacted through socket connection logs', async () => {
-    const logged: string[] = []
-    const agent = Object.assign(new Agent(), {
-        proxy: 'http://synthetic-user:synthetic-secret@['
-    })
-    const logger = createNoopLogger()
-    const capture = (message: string, context?: unknown): void => {
-        logged.push(message, JSON.stringify(context))
-    }
-    const socket = new WaWebSocket(
-        {
-            url: 'tcp://synthetic.invalid:443',
-            agent,
-            rawWebSocketConstructor: WaMobileTcpSocketCtor
-        },
-        { ...logger, warn: capture, error: capture, debug: capture, trace: capture }
-    )
-    try {
-        await assert.rejects(socket.open(), (error: Error) => {
-            assert.doesNotMatch(error.message, /synthetic-user|synthetic-secret/)
-            return true
+test(
+    'a malformed proxy remains redacted through socket connection logs',
+    { timeout: 5_000 },
+    async () => {
+        const logged: string[] = []
+        const agent = Object.assign(new Agent(), {
+            proxy: 'http://synthetic-user:synthetic-secret@['
         })
-        assert.ok(logged.length > 0)
-        assert.doesNotMatch(logged.join('\n'), /synthetic-user|synthetic-secret/)
-    } finally {
-        await socket.close()
-        agent.destroy()
+        let reportFailure = (_message: string): void => undefined
+        const failure = new Promise<string>((resolve) => {
+            reportFailure = resolve
+        })
+        const capture = (message: string, context?: unknown): void => {
+            logged.push(message, JSON.stringify(context))
+        }
+        const comms = new WaComms(
+            {
+                url: 'tcp://synthetic.invalid:443',
+                agent,
+                rawWebSocketConstructor: WaMobileTcpSocketCtor,
+                maxReconnectAttempts: 0,
+                noise: {
+                    isRegistered: true,
+                    clientStaticKeyPair: { pubKey: new Uint8Array(32), privKey: new Uint8Array(32) }
+                }
+            },
+            {
+                ...createNoopLogger(),
+                warn: (message, context) => {
+                    capture(message, context)
+                    if (message === 'socket open failed') reportFailure(String(context?.message))
+                }
+            }
+        )
+        try {
+            comms.startComms(async () => undefined)
+            assert.match(await failure, /unparseable proxy url/)
+            assert.doesNotMatch(logged.join('\n'), /synthetic-user|synthetic-secret/)
+        } finally {
+            await comms.stopComms()
+            agent.destroy()
+        }
     }
-})
+)
