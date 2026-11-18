@@ -67,4 +67,4 @@ ausência de um core `zapo-js` separado, reabertura de auth e persistência de
 O CI executa os dois gates. Estes testes não publicam pacotes nem comprovam
 permissões no registry, aceitação de sessão pelo WhatsApp real ou segurança de
 restart em produção. O canário e a validação de rollback continuam descritos em
-[correção IQ](./upgrade-1.11-iq-fix.md#condições-para-implantação).
+[guia de manutenção](./fork-maintenance.md).
