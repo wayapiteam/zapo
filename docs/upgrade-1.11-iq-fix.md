@@ -1,5 +1,8 @@
 # IQ: implementação, regressão e manutenção do fork
 
+> O padrão atual do fork é 12 handlers e 4096 aguardando, com wire limitado a 4108 chunks.
+> Os números deste relatório são históricos. Veja a [validação de 12/4096](./incoming-concurrency-12.md).
+
 > Atualização de 17/11/2026: a revisão independente revelou também falhas de lifecycle,
 > envio tardio com ID reutilizado e proxy. As correções TDD e os limites desta nova rodada
 > estão no [relatório da revisão](./upgrade-1.11-review-fixes.md). Os números abaixo são da

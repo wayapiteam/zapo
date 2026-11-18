@@ -1,8 +1,11 @@
 # Experimento: 8/4096 contra 12/6144 na entrada
 
+> Estado posterior: o fork adotou 12/4096. Veja a [implementação e validação](./incoming-concurrency-12.md).
+> As medições abaixo são do experimento anterior à adoção e preservam seu baseline histórico.
+
 17/11/2026. Base: `8ecc050`, branch `chore/upgrade-zapo-1.11-session-safety`.
 O experimento altera só duas constantes em cópias temporárias do build. Os padrões do
-runtime continuam em oito handlers ativos e 4096 aguardando. Não houve deploy ou publicação.
+runtime naquela rodada continuavam em oito handlers ativos e 4096 aguardando. Não houve deploy ou publicação.
 
 ## Resultado e recomendação
 

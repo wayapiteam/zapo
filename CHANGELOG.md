@@ -4,6 +4,10 @@
 
 ### Patch Changes
 
+- Allow twelve incoming handlers per connection generation, retaining 4096 waiting
+  callbacks and the existing byte budgets. Bound admitted wire input to 4108 chunks.
+  Cover the thirteenth waiter, twelve pending IQ queries with a full backlog, failure
+  recovery and old-generation cancellation. See [validation](docs/incoming-concurrency-12.md).
 - Preserve lifecycle request order when a post-pairing restart races with disconnect,
   and abort a cancelled connection after asynchronous configuration before opening a socket.
 - Keep a late send failure or timeout from removing a newer IQ query that reused its ID.
@@ -20,7 +24,7 @@
   input budgets are bounded per connection generation; already-running callbacks complete
   their own I/O after reconnect. No credential store or migration changes are part of this fix.
 - Compatibility: arbitrary `lowlevel.registerIncomingStanzaFilter` filters retain the
-  filtered ordinary queue, including its eight-handler starvation limitation. Raw `WaComms`
+  filtered ordinary queue, including starvation when all twelve handlers await replies. Raw `WaComms`
   callers without the optional preparer retain their callback path. See
   [implementation and validation](docs/upgrade-1.11-iq-fix.md) for limits and local evidence.
 

@@ -350,7 +350,7 @@ async function main() {
                     compiledSha256: candidate.compiledSha256,
                     ...JSON.parse(output)
                 }
-                if (round === 0 && profile.pending === (profile.active === 8 ? 4096 : 6144)) {
+                if (round === 0 && (profile.pending === 4096 || profile.active === 12)) {
                     result.loopbackLog = loopback(candidate.directory, profile)
                 }
                 results.push(result)

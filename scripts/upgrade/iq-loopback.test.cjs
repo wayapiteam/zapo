@@ -28,7 +28,8 @@ async function exerciseQueries(options) {
         filterMode,
         removeFilter,
         drain,
-        handlerThrows
+        handlerThrows,
+        normalBacklog = 0
     } = options
     const server = await FakeWaServer.start({ host: '127.0.0.1' })
     const store = core.createStore({})
@@ -49,6 +50,12 @@ async function exerciseQueries(options) {
     const timedOut = []
     const errors = []
     const handlerErrors = []
+    const normalIds = []
+    let releaseNormal
+    const normalGate = new Promise((resolve) => {
+        releaseNormal = resolve
+    })
+    let backlogBeforeReplies = null
     client.on('debug_client_error', ({ error }) => handlerErrors.push(error.message))
     const connectionEvents = []
     let finished = 0
@@ -97,6 +104,11 @@ async function exerciseQueries(options) {
         subtype: 'test',
         prepend: true,
         handler: async (node) => {
+            if (node.attrs.id.startsWith('normal-')) {
+                await normalGate
+                normalIds.push(node.attrs.id)
+                return true
+            }
             const tracked = drain ? client.tryEnterIncomingHandler() : false
             const id = 'loopback-query-' + node.attrs.id
             try {
@@ -152,6 +164,27 @@ async function exerciseQueries(options) {
         await waitUntil(() => outgoing.length === count, 'all test IQs reaching the server')
         assert.equal(completed.length, 0, 'the server has not sent any test responses yet')
         assert.equal(timedOut.length, 0, 'setup must finish before the query deadline')
+        const authBefore = normalBacklog
+            ? credentialFingerprint(await store.session(sessionId).auth.load())
+            : null
+        if (normalBacklog) {
+            for (let index = 0; index < normalBacklog; index++) {
+                await pipeline.sendStanza({
+                    tag: 'notification',
+                    attrs: { id: 'normal-' + index, type: 'test' }
+                })
+            }
+            const comms = client.deps.connectionManager.getComms()
+            await waitUntil(
+                () => comms.frameHandlerQueue.pending() === normalBacklog,
+                'all ordinary frames decoded into the waiting queue'
+            )
+            backlogBeforeReplies = {
+                inFlight: comms.frameHandlerQueue.inFlight(),
+                pending: comms.frameHandlerQueue.pending()
+            }
+            assert.equal(timedOut.length, 0, 'backlog setup must finish before the query deadline')
+        }
         if (retryProbe) {
             for (const type of [
                 WA_MESSAGE_TYPES.RECEIPT_TYPE_RETRY,
@@ -191,6 +224,18 @@ async function exerciseQueries(options) {
             }
         }
         await waitUntil(() => finished === count, 'all handler queries settling')
+        releaseNormal()
+        if (normalBacklog) {
+            await waitUntil(() => normalIds.length === normalBacklog, 'ordinary backlog draining')
+            assert.deepEqual(
+                normalIds,
+                Array.from({ length: normalBacklog }, (_, id) => 'normal-' + id)
+            )
+            assert.equal(
+                credentialFingerprint(await store.session(sessionId).auth.load()),
+                authBefore
+            )
+        }
         if (disconnecting) await disconnecting
         return {
             completed,
@@ -200,11 +245,13 @@ async function exerciseQueries(options) {
             authentications,
             retriesHandled,
             filterCalls,
+            backlogBeforeReplies,
             observedIqIds,
             connected: client.getState().connected,
             closes: connectionEvents.filter((status) => status === 'close').length
         }
     } finally {
+        releaseNormal()
         unregisterFilter()
         unregisterHandler()
         unregisterReceipt()
@@ -232,6 +279,7 @@ for (const options of [
     { label: 'managed-handler graceful drain', count: 8, drain: true },
     { label: 'handler failures still reach debug_client_error', count: 8, handlerThrows: true },
     { label: 'twelve handlers', count: 12 },
+    { label: 'twelve handlers and 4096 ordinary frames waiting', count: 12, normalBacklog: 4096 },
     { label: 'twelve mixed result/error replies', count: 12, mixedErrors: true },
     { label: 'twelve compressed replies', count: 12, compressed: true },
     { label: 'twelve ignoreKey descriptor', count: 12, ignoreMode: 'descriptor' },
@@ -266,6 +314,8 @@ for (const options of [
         assert.equal(observed.completed.length, options.count - dropped, JSON.stringify(observed))
         assert.equal(observed.timedOut.length, dropped)
         assert.equal(observed.observedIqIds.length, options.count, 'each reply is observed once')
+        if (options.normalBacklog)
+            assert.deepEqual(observed.backlogBeforeReplies, { inFlight: 12, pending: 4096 })
         assert.equal(new Set(observed.observedIqIds).size, options.count)
         for (const response of observed.completed) assert.equal(response.id, response.expected)
         if (options.mixedErrors) {

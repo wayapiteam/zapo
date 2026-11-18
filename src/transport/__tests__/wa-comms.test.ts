@@ -140,6 +140,48 @@ test('twelve handlers start and the thirteenth waits until one slot is released'
     assert.equal(active, 0)
 })
 
+test('a failed prepared handler frees one of twelve slots and releases only its byte reservation', async () => {
+    const errors: unknown[] = []
+    const state = stateOf(
+        createComms({
+            ...createNoopLogger(),
+            error: (_message, context) => errors.push(context?.message)
+        })
+    )
+    const gates = Array.from({ length: 13 }, () => deferred<void>())
+    const started: number[] = []
+    state.connected = true
+    state.handlingRequests = true
+    state.stanzaHandler = async () => undefined
+    state.prepareStanza = async (frame, _isCurrent, accountDecodedBytes) => {
+        const id = frame[0]
+        accountDecodedBytes(1024)
+        return async () => {
+            started.push(id)
+            await gates[id].promise
+            if (id === 3) throw new Error('synthetic prepared handler failure')
+        }
+    }
+    try {
+        await state.routeDecodedFrames(Array.from({ length: 13 }, (_, id) => new Uint8Array([id])))
+        assert.equal(started.length, 12)
+        assert.equal(state.frameHandlerQueue.pending(), 1)
+        assert.equal(state.handlerByteBudget.bytes, 13 * 1024)
+        gates[3].resolve()
+        await flushTasks()
+        assert.equal(started[started.length - 1], 12)
+        assert.equal(state.frameHandlerQueue.inFlight(), 12)
+        assert.equal(state.frameHandlerQueue.pending(), 0)
+        assert.equal(state.handlerByteBudget.bytes, 12 * 1024)
+        assert.deepEqual(errors, ['synthetic prepared handler failure'])
+    } finally {
+        for (const gate of gates) gate.resolve()
+        await flushTasks()
+    }
+    assert.equal(state.handlerByteBudget.bytes, 0)
+    assert.equal(state.frameHandlerQueue.inFlight(), 0)
+})
+
 test('queued callbacks from an old generation cannot run on the resumed connection', async () => {
     const state = stateOf(createComms())
     const gate = deferred<void>()
