@@ -15,7 +15,7 @@ import { bytesToBase64UrlSafe, EMPTY_BYTES } from '@util/bytes'
 import { toError } from '@util/primitives'
 
 const WA_FRAME_HANDLER_QUEUE_MAX_SIZE = 4096
-const WA_FRAME_HANDLER_MAX_CONCURRENCY = 8
+const WA_FRAME_HANDLER_MAX_CONCURRENCY = 12
 const WA_PENDING_FRAMES_MAX_COUNT = 2048
 const WA_PENDING_FRAMES_MAX_BYTES = 16 * 1024 * 1024
 const WA_WIRE_INPUT_MAX_COUNT = WA_FRAME_HANDLER_QUEUE_MAX_SIZE + WA_FRAME_HANDLER_MAX_CONCURRENCY
@@ -194,8 +194,8 @@ export class WaComms {
      * ordinary work for the same bounded queue, or `null` for a consumed/dropped frame.
      * Preparers must check their generation predicate after async work and must not
      * await business handlers. Wire input in processing or waiting is capped at
-     * 4104 chunks / 64 MiB. Prepared ordinary callbacks retain at most 64 MiB of
-     * accounted decoded body bytes across 8 active / 4096 waiting callbacks.
+     * 4108 chunks / 64 MiB. Prepared ordinary callbacks retain at most 64 MiB of
+     * accounted decoded body bytes across 12 active / 4096 waiting callbacks.
      * These limits apply per connection generation, not to process RSS. Running
      * callbacks from a replaced generation must complete their own bounded I/O.
      * @param handleStanza Raw callback used when no preparer is supplied.

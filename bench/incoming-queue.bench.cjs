@@ -268,16 +268,22 @@ function stage(profile) {
         }
         const file = path.join(directory, 'dist/transport/WaComms.js')
         let code = readFileSync(file, 'utf8')
-        for (const [name, oldValue, nextValue] of [
-            ['WA_FRAME_HANDLER_QUEUE_MAX_SIZE', 4096, profile.pending],
-            ['WA_FRAME_HANDLER_MAX_CONCURRENCY', 8, profile.active]
+        const originalLimits = {}
+        for (const [name, nextValue] of [
+            ['WA_FRAME_HANDLER_QUEUE_MAX_SIZE', profile.pending],
+            ['WA_FRAME_HANDLER_MAX_CONCURRENCY', profile.active]
         ]) {
-            const needle = `const ${name} = ${oldValue};`
-            assert.equal(code.split(needle).length, 2, `unexpected compiled constant: ${name}`)
-            code = code.replace(needle, `const ${name} = ${nextValue};`)
+            const matches = [...code.matchAll(new RegExp(`const ${name} = ([0-9]+);`, 'g'))]
+            assert.equal(matches.length, 1, `unexpected compiled constant: ${name}`)
+            originalLimits[name] = Number(matches[0][1])
+            code = code.replace(matches[0][0], `const ${name} = ${nextValue};`)
         }
         writeFileSync(file, code)
-        return { directory, compiledSha256: createHash('sha256').update(code).digest('hex') }
+        return {
+            directory,
+            originalLimits,
+            compiledSha256: createHash('sha256').update(code).digest('hex')
+        }
     } catch (error) {
         rmSync(directory, { recursive: true, force: true })
         throw error
@@ -295,9 +301,19 @@ function loopback(directory, profile) {
         { label: 'configured graceful drain', count: profile.active, drain: true }
     ]
     const file = path.join(directory, 'loopback.test.cjs')
+    const testMarker = '    test(`WebSocket/Noise: ${options.label}`, async () => {'
+    assert.equal(source.split(testMarker).length, 2)
+    // A comparison with eight slots cannot satisfy a barrier requiring twelve active queries.
+    const eligibleSource = source.replace(
+        testMarker,
+        `    if (options.count > ${profile.active}) continue\n${testMarker}`
+    )
     writeFileSync(
         file,
-        source.replace(marker, marker + '\n' + cases.map((c) => JSON.stringify(c) + ',').join('\n'))
+        eligibleSource.replace(
+            marker,
+            marker + '\n' + cases.map((c) => JSON.stringify(c) + ',').join('\n')
+        )
     )
     return execFileSync(process.execPath, ['--test', '--test-concurrency=1', file], {
         env: { ...process.env, ZAPO_UPGRADE_CANDIDATE_ROOT: directory },
@@ -330,6 +346,7 @@ async function main() {
                 )
                 const result = {
                     round,
+                    originalLimits: candidate.originalLimits,
                     compiledSha256: candidate.compiledSha256,
                     ...JSON.parse(output)
                 }

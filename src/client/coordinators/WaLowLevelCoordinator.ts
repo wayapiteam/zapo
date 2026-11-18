@@ -38,7 +38,7 @@ export interface WaLowLevelCoordinator {
     /**
      * Registers an incoming-stanza filter (runs before the typed handlers).
      * While any raw filter is registered, IQ responses keep this filtered, ordinary
-     * queue path. Eight handlers waiting for IQ can therefore exhaust its concurrency.
+     * queue path. Twelve handlers waiting for IQ can therefore exhaust its concurrency.
      * Built-in `ignoreKey` filters exclude IQ and retain early pending-IQ resolution.
      * Returns an `unregister` function.
      */
