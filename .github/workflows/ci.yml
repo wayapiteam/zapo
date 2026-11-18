@@ -106,7 +106,7 @@ jobs:
 
     test-media-utils:
         runs-on: ubuntu-latest
-        timeout-minutes: 15
+        timeout-minutes: 20
         needs: build-core
 
         steps:
@@ -119,8 +119,12 @@ jobs:
 
             - name: install ffmpeg and ffprobe
               run: |
-                  sudo apt-get update
-                  sudo apt-get install -y ffmpeg
+                  if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+                      sudo apt-get -o Acquire::Retries=3 update
+                      sudo apt-get -o Acquire::Retries=3 install -y --no-install-recommends ffmpeg
+                  fi
+                  ffmpeg -version
+                  ffprobe -version
 
             - run: npx turbo run build --filter=@zapo-js/media-utils
             - run: npm test -w packages/media-utils
