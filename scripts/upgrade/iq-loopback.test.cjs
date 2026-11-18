@@ -230,7 +230,25 @@ for (const options of [
     { label: 'filter registered during decode', count: 7, filterMode: 'dynamic' },
     { label: 'filter removed before dispatch', count: 8, filterMode: 'accept', removeFilter: true },
     { label: 'managed-handler graceful drain', count: 8, drain: true },
-    { label: 'handler failures still reach debug_client_error', count: 8, handlerThrows: true }
+    { label: 'handler failures still reach debug_client_error', count: 8, handlerThrows: true },
+    { label: 'twelve handlers', count: 12 },
+    { label: 'twelve mixed result/error replies', count: 12, mixedErrors: true },
+    { label: 'twelve compressed replies', count: 12, compressed: true },
+    { label: 'twelve ignoreKey descriptor', count: 12, ignoreMode: 'descriptor' },
+    { label: 'twelve ignoreKey predicate', count: 12, ignoreMode: 'predicate' },
+    {
+        label: 'twelve handlers after removing a raw filter',
+        count: 12,
+        filterMode: 'accept',
+        removeFilter: true
+    },
+    { label: 'twelve managed handlers drain before disconnect', count: 12, drain: true },
+    { label: 'twelve handler failures remain observable', count: 12, handlerThrows: true },
+    { label: 'eleven handlers preserve retry receipts', count: 11, retryProbe: true },
+    { label: 'eleven handlers with raw accepting filter', count: 11, filterMode: 'accept' },
+    { label: 'eleven handlers with raw dropping filter', count: 11, filterMode: 'drop' },
+    { label: 'eleven handlers with raw throwing filter', count: 11, filterMode: 'throw' },
+    { label: 'eleven handlers with dynamic raw filter', count: 11, filterMode: 'dynamic' }
 ]) {
     test(`WebSocket/Noise: ${options.label}`, async () => {
         const observed = await exerciseQueries(options)
@@ -251,7 +269,10 @@ for (const options of [
         assert.equal(new Set(observed.observedIqIds).size, options.count)
         for (const response of observed.completed) assert.equal(response.id, response.expected)
         if (options.mixedErrors) {
-            assert.equal(observed.completed.filter((node) => node.type === 'error').length, 4)
+            assert.equal(
+                observed.completed.filter((node) => node.type === 'error').length,
+                options.count / 2
+            )
         }
         if (options.retryProbe) assert.equal(observed.retriesHandled, 2)
         if (options.filterMode && !options.removeFilter) {

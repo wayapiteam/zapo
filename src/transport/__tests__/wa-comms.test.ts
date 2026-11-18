@@ -6,6 +6,9 @@ import { WaNoiseSession } from '@transport/noise/WaNoiseSession'
 import type { RawWebSocketConstructor, WaStanzaPreparer } from '@transport/types'
 import { WaComms } from '@transport/WaComms'
 
+const HANDLER_CONCURRENCY = 12
+const HANDLER_QUEUE_SIZE = 4_096
+
 const NOOP_SOCKET_CTOR = class {
     public binaryType = 'arraybuffer'
     public readyState = 0
@@ -71,6 +74,7 @@ interface CommsTestState {
     prepareStanza: WaStanzaPreparer | null
     wireInputBudget: { count: number; bytes: number }
     handlerByteBudget: { bytes: number }
+    frameHandlerQueue: { pending: () => number; inFlight: () => number }
     routeDecodedFrames: (frames: readonly Uint8Array[]) => Promise<void>
     onSocketMessage: (payload: Uint8Array) => void
     onSocketOpened: () => Promise<void>
@@ -97,6 +101,45 @@ async function flushTasks(): Promise<void> {
     }
 }
 
+test('twelve handlers start and the thirteenth waits until one slot is released', async () => {
+    const state = stateOf(createComms())
+    const gates = Array.from({ length: 13 }, () => deferred<void>())
+    const started: number[] = []
+    let active = 0
+    let peakActive = 0
+    state.handlingRequests = true
+    state.stanzaHandler = async (frame) => {
+        const id = frame[0]
+        started.push(id)
+        peakActive = Math.max(peakActive, ++active)
+        try {
+            await gates[id].promise
+        } finally {
+            active--
+        }
+    }
+    try {
+        for (let id = 0; id < 13; id++) state.scheduleDecodedFrame(new Uint8Array([id]))
+        await flushTasks()
+        assert.deepEqual(
+            started,
+            Array.from({ length: 12 }, (_, id) => id)
+        )
+        assert.equal(state.frameHandlerQueue.inFlight(), 12)
+        assert.equal(state.frameHandlerQueue.pending(), 1)
+        gates[3].resolve()
+        await flushTasks()
+        assert.equal(started.at(-1), 12)
+        assert.equal(active, 12)
+        assert.equal(state.frameHandlerQueue.pending(), 0)
+    } finally {
+        for (const gate of gates) gate.resolve()
+        await flushTasks()
+    }
+    assert.equal(peakActive, 12)
+    assert.equal(active, 0)
+})
+
 test('queued callbacks from an old generation cannot run on the resumed connection', async () => {
     const state = stateOf(createComms())
     const gate = deferred<void>()
@@ -104,9 +147,10 @@ test('queued callbacks from an old generation cannot run on the resumed connecti
     state.handlingRequests = true
     state.stanzaHandler = async (frame) => {
         delivered.push(frame[0])
-        if (frame[0] < 8) await gate.promise
+        if (frame[0] < HANDLER_CONCURRENCY) await gate.promise
     }
-    for (let index = 0; index < 9; index++) state.scheduleDecodedFrame(new Uint8Array([index]))
+    for (let index = 0; index < HANDLER_CONCURRENCY + 1; index++)
+        state.scheduleDecodedFrame(new Uint8Array([index]))
     await flushTasks()
     state.resetConnectionState({
         started: true,
@@ -115,10 +159,10 @@ test('queued callbacks from an old generation cannot run on the resumed connecti
         preventRetry: false,
         resumeInFlight: false
     })
-    state.scheduleDecodedFrame(new Uint8Array([9]))
+    state.scheduleDecodedFrame(new Uint8Array([13]))
     gate.resolve()
     await flushTasks()
-    assert.deepEqual(delivered, [0, 1, 2, 3, 4, 5, 6, 7, 9])
+    assert.deepEqual(delivered, [...Array.from({ length: 12 }, (_, id) => id), 13])
 })
 
 test('a frame finishing async inflation after reset cannot reach the new connection', async () => {
@@ -174,12 +218,17 @@ test('wire admission bounds queued chunks and starts a single overflow recovery'
         resumes++
         state.resumeInFlight = true
     }
-    for (let index = 0; index < 8 + 4_096 + 5; index++) {
+    for (let index = 0; index < HANDLER_CONCURRENCY + HANDLER_QUEUE_SIZE; index++) {
         state.onSocketMessage(new Uint8Array([1]))
     }
+    assert.equal(state.wireInputBudget.count, 4_108)
+    assert.equal(resumes, 0)
+    for (let index = 0; index < 5; index++) state.onSocketMessage(new Uint8Array([1]))
+    assert.equal(state.wireInputBudget.count, 4_108)
     gate.resolve([])
     await state.frameProcessingQueue
     assert.equal(resumes, 1)
+    assert.deepEqual(state.wireInputBudget, { count: 0, bytes: 0 })
 })
 
 test('wire admission rejects a chunk exceeding the byte budget without decoding it', async () => {
@@ -268,7 +317,7 @@ test('overflow rejection from a replaced generation cannot resume the new socket
     comms.closeSocketAndResume = async () => {
         resumes++
     }
-    for (let index = 0; index < 8 + 4_096 + 1; index++) {
+    for (let index = 0; index < HANDLER_CONCURRENCY + HANDLER_QUEUE_SIZE + 1; index++) {
         state.scheduleDecodedFrame(new Uint8Array([1]))
     }
     state.resetConnectionState({
@@ -298,7 +347,7 @@ test('a full old handler queue cannot consume the new generation capacity', asyn
     comms.closeSocketAndResume = async () => {
         resumes++
     }
-    for (let index = 0; index < 8 + 4_096; index++) {
+    for (let index = 0; index < HANDLER_CONCURRENCY + HANDLER_QUEUE_SIZE; index++) {
         state.scheduleDecodedFrame(new Uint8Array([1]))
     }
     state.resetConnectionState({
@@ -313,7 +362,7 @@ test('a full old handler queue cannot consume the new generation capacity', asyn
         await flushTasks()
         assert.equal(delivered.includes(2), true)
         assert.equal(resumes, 0)
-        assert.equal(delivered.filter((id) => id === 1).length, 8)
+        assert.equal(delivered.filter((id) => id === 1).length, 12)
     } finally {
         gate.resolve()
         await flushTasks()
@@ -418,9 +467,10 @@ test('pending prepared byte reservations are released on generation cancellation
         accountDecodedBytes(1024)
         return () => gate.promise
     }
-    await state.routeDecodedFrames(Array.from({ length: 12 }, () => new Uint8Array([1])))
+    await state.routeDecodedFrames(Array.from({ length: 16 }, () => new Uint8Array([1])))
     const oldBudget = state.handlerByteBudget
-    assert.equal(oldBudget.bytes, 12 * 1024)
+    assert.equal(oldBudget.bytes, 16 * 1024)
+    assert.equal(state.frameHandlerQueue.pending(), 4)
     state.resetConnectionState({
         started: true,
         connected: true,
@@ -429,7 +479,7 @@ test('pending prepared byte reservations are released on generation cancellation
         resumeInFlight: false
     })
     await flushTasks()
-    assert.equal(oldBudget.bytes, 8 * 1024, 'only running callbacks retain their old reservation')
+    assert.equal(oldBudget.bytes, 12 * 1024, 'only running callbacks retain their old reservation')
     assert.equal(state.handlerByteBudget.bytes, 0)
     gate.resolve()
     await flushTasks()

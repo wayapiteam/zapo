@@ -98,6 +98,10 @@ async function blockedQueries(options = {}) {
         const beforeReplies = { completed, timedOut }
         for (let i = 0; i < (options.normalBacklog ?? 0); i++)
             await deliver({ tag: 'notification', attrs: { id: 'normal-' + i, type: 'work' } })
+        const backlogBeforeReplies = {
+            inFlight: comms.frameHandlerQueue.inFlight(),
+            pending: comms.frameHandlerQueue.pending()
+        }
 
         const answers = options.reverse ? [...outbound].reverse() : outbound
         for (let i = 0; i < answers.length; i++) {
@@ -125,6 +129,7 @@ async function blockedQueries(options = {}) {
         await flush()
         observed = {
             beforeReplies,
+            backlogBeforeReplies,
             beforeTimeout,
             afterTimeout: { completed, timedOut },
             resumes
@@ -159,14 +164,18 @@ async function overflow() {
     comms.openSocket = async () => {
         opens++
     }
-    for (let i = 0; i < 8 + 4096; i++) comms.scheduleDecodedFrame(new Uint8Array([0]))
+    for (let i = 0; i < 12 + 4096; i++) comms.scheduleDecodedFrame(new Uint8Array([0]))
+    const atCapacity = {
+        inFlight: comms.frameHandlerQueue.inFlight(),
+        pending: comms.frameHandlerQueue.pending()
+    }
     for (let i = 0; i < 5; i++) comms.scheduleDecodedFrame(new Uint8Array([0]))
     await tick()
     releaseClose()
     await tick()
     releaseTask()
     await tick()
-    return { excessFrames: 5, closes, opens }
+    return { excessFrames: 5, closes, opens, atCapacity }
 }
 async function main() {
     console.log(
