@@ -123,9 +123,9 @@ jobs:
                   if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
                       # The Azure mirror can stream packages too slowly to hit an idle timeout.
                       # Use Ubuntu's HTTPS mirrors instead of retrying that same mirror.
-                      printf '%s\n' \
-                          'https://archive.ubuntu.com/ubuntu/ priority:1' \
-                          'https://security.ubuntu.com/ubuntu/ priority:2' \
+                      printf '%s\t%s\n' \
+                          'https://archive.ubuntu.com/ubuntu/' 'priority:1' \
+                          'https://security.ubuntu.com/ubuntu/' 'priority:2' \
                           | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
                       apt_options=(-o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15)
                       sudo apt-get "${apt_options[@]}" update
