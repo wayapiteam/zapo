@@ -22,6 +22,24 @@ function nextSessionId(label: string): string {
     return `test-session-${label}-${Date.now()}-${sessionSeed}`
 }
 
+function makeAuthCredentials() {
+    return {
+        noiseKeyPair: { pubKey: new Uint8Array(32), privKey: new Uint8Array(32) },
+        registrationInfo: {
+            registrationId: 12345,
+            identityKeyPair: { pubKey: new Uint8Array(33), privKey: new Uint8Array(32) }
+        },
+        signedPreKey: {
+            keyId: 1,
+            keyPair: { pubKey: new Uint8Array(33), privKey: new Uint8Array(32) },
+            signature: new Uint8Array(64),
+            uploaded: false
+        },
+        advSecretKey: new Uint8Array(32),
+        loginCounter: 42
+    }
+}
+
 function makeAddress(user: string, device: number): SignalAddress {
     return { user, server: 's.whatsapp.net', device }
 }
@@ -106,30 +124,101 @@ describe('store-mysql integration', { timeout: 60_000 }, () => {
         if (pool) await pool.end()
     })
 
+    it('auth: recovers an unmarked counter migration without changing rows', async (t) => {
+        if (!pool) return t.skip('ZAPO_TEST_MYSQL_* not set')
+
+        const prefix = `counter_resume_${Date.now()}_`
+        const backend = createMysqlStore({ pool, tablePrefix: prefix })
+        const authA = backend.stores.auth('migration-a')
+        const authB = backend.stores.auth('migration-b')
+        try {
+            await authA.save(makeAuthCredentials())
+            await authB.save({ ...makeAuthCredentials(), loginCounter: 43 })
+            const [before] = await pool.execute(
+                `SELECT * FROM \`${prefix}auth_credentials\` ORDER BY session_id`
+            )
+            // This is the durable state after MySQL commits ALTER TABLE but the process
+            // stops before recording the migration. Only synthetic fixture tables are used.
+            await pool.execute(`DELETE FROM \`${prefix}_migrations\` WHERE name = ?`, [
+                '0022_auth_login_counter'
+            ])
+            const attempts = await Promise.allSettled([
+                ensureMysqlMigrations(pool, ['auth'], prefix),
+                ensureMysqlMigrations(pool, ['auth'], prefix)
+            ])
+            for (const attempt of attempts) {
+                assert.equal(attempt.status, 'fulfilled', 'counter migration must be resumable')
+            }
+            const [after] = await pool.execute(
+                `SELECT * FROM \`${prefix}auth_credentials\` ORDER BY session_id`
+            )
+            assert.deepEqual(after, before)
+            assert.equal((await authA.load())?.loginCounter, 42)
+            assert.equal((await authB.load())?.loginCounter, 43)
+            const [markers] = await pool.execute(
+                `SELECT name FROM \`${prefix}_migrations\` WHERE name = ?`,
+                ['0022_auth_login_counter']
+            )
+            assert.deepEqual(markers, [{ name: '0022_auth_login_counter' }])
+            await ensureMysqlMigrations(pool, ['auth'], prefix)
+        } finally {
+            await Promise.all([authA.destroy(), authB.destroy()])
+            await backend.destroy()
+            await pool.execute(`DROP TABLE IF EXISTS \`${prefix}auth_credentials\``)
+            await pool.execute(`DROP TABLE IF EXISTS \`${prefix}_migrations\``)
+        }
+    })
+
+    it('auth: rejects an incompatible preexisting counter without marking migration applied', async (t) => {
+        if (!pool) return t.skip('ZAPO_TEST_MYSQL_* not set')
+
+        const prefix = `counter_conflict_${Date.now()}_`
+        try {
+            await ensureMysqlMigrations(pool, ['auth'], prefix)
+            await pool.execute(`DELETE FROM \`${prefix}_migrations\` WHERE name = ?`, [
+                '0022_auth_login_counter'
+            ])
+            await pool.execute(
+                `ALTER TABLE \`${prefix}auth_credentials\` MODIFY COLUMN login_counter VARCHAR(32) NULL`
+            )
+            await assert.rejects(ensureMysqlMigrations(pool, ['auth'], prefix), {
+                code: 'ER_DUP_FIELDNAME'
+            })
+            const [markers] = await pool.execute(
+                `SELECT name FROM \`${prefix}_migrations\` WHERE name = ?`,
+                ['0022_auth_login_counter']
+            )
+            assert.deepEqual(markers, [])
+        } finally {
+            await pool.execute(`DROP TABLE IF EXISTS \`${prefix}auth_credentials\``)
+            await pool.execute(`DROP TABLE IF EXISTS \`${prefix}_migrations\``)
+        }
+    })
+
     it('auth: save, load, clear', async (t) => {
         if (!store) return t.skip('ZAPO_TEST_MYSQL_* not set')
 
-        const auth = store.stores.auth('test-session')
+        const sessionId = nextSessionId('auth')
+        const auth = store.stores.auth(sessionId)
         assert.equal(await auth.load(), null)
 
-        const creds = {
-            noiseKeyPair: { pubKey: new Uint8Array(32), privKey: new Uint8Array(32) },
-            registrationInfo: {
-                registrationId: 12345,
-                identityKeyPair: { pubKey: new Uint8Array(33), privKey: new Uint8Array(32) }
-            },
-            signedPreKey: {
-                keyId: 1,
-                keyPair: { pubKey: new Uint8Array(33), privKey: new Uint8Array(32) },
-                signature: new Uint8Array(64),
-                uploaded: false
-            },
-            advSecretKey: new Uint8Array(32)
-        }
+        const creds = makeAuthCredentials()
         await auth.save(creds)
 
         const loaded = await auth.load()
         assert.ok(loaded)
+        assert.equal(loaded.loginCounter, 42)
+        for (const loginCounter of [0, 4_294_967_296]) {
+            await auth.save({ ...creds, loginCounter })
+            const restored = await store.stores.auth(sessionId).load()
+            assert.equal(restored?.loginCounter, loginCounter)
+            assert.deepEqual(restored?.noiseKeyPair, creds.noiseKeyPair)
+            assert.deepEqual(restored?.registrationInfo, creds.registrationInfo)
+            assert.deepEqual(restored?.signedPreKey, creds.signedPreKey)
+            assert.deepEqual(restored?.advSecretKey, creds.advSecretKey)
+        }
+        await auth.save({ ...creds, loginCounter: undefined })
+        assert.equal((await auth.load())?.loginCounter, undefined)
         assert.equal(loaded.registrationInfo.registrationId, 12345)
         assert.equal(loaded.noiseKeyPair.pubKey.length, creds.noiseKeyPair.pubKey.length)
         assert.ok(loaded.noiseKeyPair.pubKey.every((b, i) => b === creds.noiseKeyPair.pubKey[i]))

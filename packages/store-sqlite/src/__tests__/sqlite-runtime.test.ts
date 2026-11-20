@@ -4,17 +4,17 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { APP_STATE_EMPTY_LT_HASH } from 'zapo-js/appstate'
-import { toSerializedPubKey, X25519 } from 'zapo-js/crypto'
-import { WA_APP_STATE_COLLECTIONS } from 'zapo-js/protocol'
-import type { WaRetryOutboundMessageRecord } from 'zapo-js/retry'
+import { APP_STATE_EMPTY_LT_HASH } from '@wayapiteam/zapo/appstate'
+import { toSerializedPubKey, X25519 } from '@wayapiteam/zapo/crypto'
+import { WA_APP_STATE_COLLECTIONS } from '@wayapiteam/zapo/protocol'
+import type { WaRetryOutboundMessageRecord } from '@wayapiteam/zapo/retry'
 import {
     decodeSignalSessionRecord,
     encodeSignalSessionRecord,
     type SenderKeyRecord,
     type SignalAddress,
     type SignalSessionRecord
-} from 'zapo-js/signal'
+} from '@wayapiteam/zapo/signal'
 
 import { WaAppStateSqliteStore } from '../appstate.store'
 import { WaChatMetadataSqliteStore } from '../chat-metadata.store'
@@ -30,6 +30,8 @@ import { WaSessionSqliteStore } from '../session.store'
 import { WaSignalSqliteStore } from '../signal.store'
 import type { WaSqliteStorageOptions } from '../types'
 
+import { TEST_SQLITE_DRIVER } from './_helpers'
+
 function makeBytes(length: number, seed = 0): Uint8Array {
     const out = new Uint8Array(length)
     for (let index = 0; index < out.length; index += 1) {
@@ -42,7 +44,7 @@ function makeSqliteOptions(path: string, sessionId: string): WaSqliteStorageOpti
     return {
         path,
         sessionId,
-        driver: 'better-sqlite3'
+        driver: TEST_SQLITE_DRIVER
     }
 }
 
@@ -197,7 +199,7 @@ test('sqlite appstate setCollectionStates writes only the index/value delta', as
     const connection = await openSqliteConnection({
         path: join(dir, 'state.sqlite'),
         sessionId: 'session-diff',
-        driver: 'better-sqlite3'
+        driver: TEST_SQLITE_DRIVER
     })
 
     // Count write statements so the test asserts the delta is written, not a

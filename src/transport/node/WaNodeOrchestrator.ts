@@ -6,6 +6,7 @@ import { toError } from '@util/primitives'
 import { createMobileNodeIdGenerator, createNodeIdGenerator, type NodeIdGenerator } from './helpers'
 
 interface PendingNodeQuery {
+    readonly requestTag: string
     readonly resolve: (value: BinaryNode) => void
     readonly reject: (error: Error) => void
     readonly timer: NodeJS.Timeout
@@ -90,6 +91,28 @@ export class WaNodeOrchestrator {
         return true
     }
 
+    /**
+     * Resolves only IQ result/error nodes matching an outstanding IQ request.
+     * Call after checking the input generation and stanza-filter policy. Receipts,
+     * requests and responses to non-IQ requests retain ordinary dispatch semantics.
+     * Returns `true` only when an existing pending query was consumed.
+     */
+    public tryResolvePendingIqResponse(node: BinaryNode): boolean {
+        return this.isPendingIqResponse(node) && this.tryResolvePending(node)
+    }
+
+    /** Tests eligibility without consuming a query, allowing pre-resolution accounting. */
+    public isPendingIqResponse(node: BinaryNode): boolean {
+        if (
+            node.tag !== WA_NODE_TAGS.IQ ||
+            (node.attrs.type !== WA_IQ_TYPES.RESULT && node.attrs.type !== WA_IQ_TYPES.ERROR)
+        ) {
+            return false
+        }
+        const pending = this.pendingQueries.get(node.attrs.id)
+        return pending?.requestTag === WA_NODE_TAGS.IQ
+    }
+
     public async handleIncomingNode(node: BinaryNode): Promise<boolean> {
         if (this.tryResolvePending(node)) {
             return true
@@ -124,6 +147,10 @@ export class WaNodeOrchestrator {
         await this.sendNodeFn(outbound)
     }
 
+    /**
+     * Registers a query before sending. Its timeout and send rejection only own that
+     * registration, so late completion cannot remove a newer query reusing the ID.
+     */
     public async query(
         node: BinaryNode,
         timeoutMs = this.defaultTimeoutMs,
@@ -146,19 +173,28 @@ export class WaNodeOrchestrator {
 
         return new Promise<BinaryNode>((resolve, reject) => {
             const timer = setTimeout(() => {
+                if (this.pendingQueries.get(id) !== pending) return
                 this.pendingQueries.delete(id)
                 queryLogger.warn('query node timeout', { timeoutMs })
                 reject(new Error(`query timeout (${id}) after ${timeoutMs}ms`))
             }, timeoutMs)
 
-            this.pendingQueries.set(id, {
+            const pending: PendingNodeQuery = {
+                requestTag: outbound.tag,
                 resolve,
                 reject,
                 timer
-            })
+            }
+            this.pendingQueries.set(id, pending)
 
             this.sendNodeFn(outbound).catch((error) => {
                 clearTimeout(timer)
+                if (this.pendingQueries.get(id) !== pending) {
+                    queryLogger.trace('ignored send failure for settled query', {
+                        message: toError(error).message
+                    })
+                    return
+                }
                 this.pendingQueries.delete(id)
                 queryLogger.warn('failed to send query node', {
                     message: toError(error).message

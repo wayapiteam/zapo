@@ -11,6 +11,8 @@ import { WaMessageSqliteStore } from '../message.store'
 import { WaPrivacyTokenSqliteStore } from '../privacy-token.store'
 import { WaThreadSqliteStore } from '../thread.store'
 
+import { TEST_SQLITE_DRIVER } from './_helpers'
+
 interface Destroyable {
     destroy: () => Promise<void>
 }
@@ -50,7 +52,7 @@ test('sqlite auth store saves, loads and clears credentials', async () => {
     const store = new WaAuthSqliteStore({
         path: join(dir, 'state.sqlite'),
         sessionId: 'a',
-        driver: 'better-sqlite3'
+        driver: TEST_SQLITE_DRIVER
     })
 
     try {
@@ -74,23 +76,51 @@ test('sqlite auth store saves, loads and clears credentials', async () => {
     }
 })
 
+test('sqlite auth counter survives reopen without changing credential keys', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'zapo-sqlite-counter-'))
+    const path = join(dir, 'state.sqlite')
+    const options = { path, sessionId: 'counter', driver: TEST_SQLITE_DRIVER }
+    const credentials = createCredentials()
+    try {
+        for (const loginCounter of [undefined, 0, 42, 4_294_967_296]) {
+            const writer = new WaAuthSqliteStore(options)
+            await writer.save({ ...credentials, loginCounter })
+            await writer.destroy()
+            const reader = new WaAuthSqliteStore(options)
+            try {
+                const restored = await reader.load()
+                assert.ok(restored)
+                assert.equal(restored.loginCounter, loginCounter)
+                assert.deepEqual(restored.noiseKeyPair, credentials.noiseKeyPair)
+                assert.deepEqual(restored.registrationInfo, credentials.registrationInfo)
+                assert.deepEqual(restored.signedPreKey, credentials.signedPreKey)
+                assert.deepEqual(restored.advSecretKey, credentials.advSecretKey)
+            } finally {
+                await reader.destroy()
+            }
+        }
+    } finally {
+        await rm(dir, { recursive: true, force: true })
+    }
+})
+
 test('sqlite message/thread stores are session-scoped and preserve coalesced fields', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'zapo-sqlite-mailbox-'))
     const sqlitePath = join(dir, 'state.sqlite')
     const storeA = new WaMessageSqliteStore({
         path: sqlitePath,
         sessionId: 'session-a',
-        driver: 'better-sqlite3'
+        driver: TEST_SQLITE_DRIVER
     })
     const storeB = new WaMessageSqliteStore({
         path: sqlitePath,
         sessionId: 'session-b',
-        driver: 'better-sqlite3'
+        driver: TEST_SQLITE_DRIVER
     })
     const threadStore = new WaThreadSqliteStore({
         path: sqlitePath,
         sessionId: 'session-a',
-        driver: 'better-sqlite3'
+        driver: TEST_SQLITE_DRIVER
     })
 
     try {
@@ -127,12 +157,12 @@ test('sqlite privacy token store is session-scoped and preserves coalesced field
     const storeA = new WaPrivacyTokenSqliteStore({
         path: sqlitePath,
         sessionId: 'session-a',
-        driver: 'better-sqlite3'
+        driver: TEST_SQLITE_DRIVER
     })
     const storeB = new WaPrivacyTokenSqliteStore({
         path: sqlitePath,
         sessionId: 'session-b',
-        driver: 'better-sqlite3'
+        driver: TEST_SQLITE_DRIVER
     })
 
     try {
@@ -200,7 +230,7 @@ test('sqlite connection rejects unsupported pragma names', async () => {
                 openSqliteConnection({
                     path: join(dir, 'state.sqlite'),
                     sessionId: 'x',
-                    driver: 'better-sqlite3',
+                    driver: TEST_SQLITE_DRIVER,
                     pragmas: {
                         not_allowed: 'x'
                     }
@@ -217,7 +247,7 @@ test('sqlite auth store supports custom table names', async () => {
     const options = {
         path: join(dir, 'state.sqlite'),
         sessionId: 'a',
-        driver: 'better-sqlite3',
+        driver: TEST_SQLITE_DRIVER,
         tableNames: {
             wa_migrations: 'custom_wa_migrations',
             auth_credentials: 'custom_auth_credentials'
@@ -271,7 +301,7 @@ test('sqlite connection rejects invalid custom table names', async () => {
                 openSqliteConnection({
                     path: join(dir, 'state.sqlite'),
                     sessionId: 'x',
-                    driver: 'better-sqlite3',
+                    driver: TEST_SQLITE_DRIVER,
                     tableNames: {
                         auth_credentials: 'auth-credentials'
                     }
@@ -284,7 +314,7 @@ test('sqlite connection rejects invalid custom table names', async () => {
                 openSqliteConnection({
                     path: join(dir, 'state.sqlite'),
                     sessionId: 'x',
-                    driver: 'better-sqlite3',
+                    driver: TEST_SQLITE_DRIVER,
                     tableNames: {
                         wa_migrations: 'shared_table',
                         auth_credentials: 'shared_table'
@@ -298,7 +328,7 @@ test('sqlite connection rejects invalid custom table names', async () => {
                 openSqliteConnection({
                     path: join(dir, 'state.sqlite'),
                     sessionId: 'x',
-                    driver: 'better-sqlite3',
+                    driver: TEST_SQLITE_DRIVER,
                     tableNames: {
                         unknown_table_name: 'anything'
                     } as never
@@ -315,7 +345,7 @@ test('sqlite store reuses externally-owned connection and does not close it on d
     const connection = await openSqliteConnection({
         path: join(dir, 'state.sqlite'),
         sessionId: 'shared',
-        driver: 'better-sqlite3'
+        driver: TEST_SQLITE_DRIVER
     })
 
     try {
@@ -351,7 +381,7 @@ test('sqlite store rejects invalid path/connection combinations', async () => {
     const connection = await openSqliteConnection({
         path: join(dir, 'state.sqlite'),
         sessionId: 'x',
-        driver: 'better-sqlite3'
+        driver: TEST_SQLITE_DRIVER
     })
     try {
         await assert.rejects(async () => {
@@ -373,7 +403,7 @@ test('createSqliteStore accepts an externally-owned connection', async () => {
     const connection = await openSqliteConnection({
         path: join(dir, 'state.sqlite'),
         sessionId: 'shared',
-        driver: 'better-sqlite3'
+        driver: TEST_SQLITE_DRIVER
     })
 
     try {
@@ -404,7 +434,7 @@ test('createSqliteStore rejects missing or duplicated connection source', async 
     const connection = await openSqliteConnection({
         path: join(dir, 'state.sqlite'),
         sessionId: 'shared',
-        driver: 'better-sqlite3'
+        driver: TEST_SQLITE_DRIVER
     })
     try {
         assert.throws(
@@ -422,7 +452,7 @@ test('sqlite connection keeps pending open references alive until handle acquisi
     const options = {
         path: join(dir, 'state.sqlite'),
         sessionId: 'race',
-        driver: 'better-sqlite3'
+        driver: TEST_SQLITE_DRIVER
     } as const
     const first = await openSqliteConnection(options)
 

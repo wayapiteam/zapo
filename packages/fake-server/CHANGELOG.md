@@ -1,5 +1,11 @@
 # @zapo-js/fake-server
 
+## 1.3.1
+
+### Patch Changes
+
+- 259cfc6: Send `stream:error` 515 after the companion answers `pair-success`, as the real server does, so the client restarts on the server's signal.
+
 ## 1.3.0
 
 ### Minor Changes

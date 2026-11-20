@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import test, { type TestContext } from 'node:test'
 
 import { WaConnectionManager } from '@client/connection/WaConnectionManager'
 import { WaReceiptQueue } from '@client/connection/WaReceiptQueue'
 import { createNoopLogger } from '@infra/log/types'
+import { WA_DEFAULTS } from '@protocol/constants'
+import { WaComms } from '@transport/WaComms'
 
 test('receipt queue enforces max size and drains in insertion order', () => {
     const queue = new WaReceiptQueue({ maxSize: 2 })
@@ -97,4 +99,258 @@ test('connection manager exposes media cache and clock skew helpers', async () =
 
     await manager.clearStoredCredentials()
     assert.equal(clearedCredentialsCalls, 1)
+})
+
+interface PairRestartHarness {
+    readonly manager: WaConnectionManager
+    readonly oldComms: { readonly stopCalls: number; readonly serverClose: () => void }
+    readonly counts: { readonly restarts: number; readonly postPair: number }
+}
+
+function createPairRestartHarness(t: TestContext): PairRestartHarness {
+    t.mock.timers.enable({ apis: ['setTimeout'] })
+    let stopCalls = 0
+    let hold: (() => void) | null = null
+    const comms = {
+        stopComms: async () => {
+            stopCalls += 1
+        },
+        holdForServerRestart: (onClosed: () => void) => {
+            hold = onClosed
+        }
+    }
+    const counts = { restarts: 0, postPair: 0 }
+    const manager = new WaConnectionManager({
+        logger: createNoopLogger(),
+        options: {} as never,
+        authClient: {
+            clearTransientState: async () => undefined,
+            getCurrentCredentials: () => ({ meJid: '5511999999999@s.whatsapp.net' })
+        } as never,
+        keepAlive: { stop: () => undefined } as never,
+        nodeOrchestrator: { clearPending: () => undefined } as never,
+        nodeTransport: { bindComms: () => undefined } as never,
+        getPassiveTasks: () => null,
+        clearStoredCredentials: async () => undefined,
+        onPostPairReconnected: () => {
+            counts.postPair += 1
+        }
+    })
+    const internals = manager as unknown as {
+        comms: unknown
+        frameHandler: unknown
+        startCommsWithCredentials: () => Promise<void>
+    }
+    internals.comms = comms
+    internals.frameHandler = async () => undefined
+    internals.startCommsWithCredentials = async () => {
+        counts.restarts += 1
+    }
+    return {
+        manager,
+        oldComms: {
+            get stopCalls() {
+                return stopCalls
+            },
+            serverClose: () => hold?.()
+        },
+        counts
+    }
+}
+
+async function settle(): Promise<void> {
+    for (let i = 0; i < 5; i += 1) {
+        await new Promise<void>((resolve) => setImmediate(resolve))
+    }
+}
+
+test('pairing waits for the server and does not stop comms by itself', async (t) => {
+    const { manager, oldComms, counts } = createPairRestartHarness(t)
+
+    manager.awaitServerRestartAfterPairing()
+    await settle()
+
+    assert.equal(oldComms.stopCalls, 0)
+    assert.equal(counts.restarts, 0)
+    assert.equal(counts.postPair, 0)
+})
+
+test('stream:error 515 after pairing restarts once and is claimed from the generic path', async (t) => {
+    const { manager, oldComms, counts } = createPairRestartHarness(t)
+    manager.awaitServerRestartAfterPairing()
+
+    assert.equal(manager.handleServerRestartRequest(), true)
+    assert.equal(manager.handleServerRestartRequest(), true)
+    oldComms.serverClose()
+    t.mock.timers.tick(WA_DEFAULTS.PAIRING_RESTART_WAIT_MS)
+    await settle()
+
+    assert.equal(oldComms.stopCalls, 1)
+    assert.equal(counts.restarts, 1)
+    assert.equal(counts.postPair, 1)
+})
+
+test('a server close after pairing restarts once', async (t) => {
+    const { manager, oldComms, counts } = createPairRestartHarness(t)
+    manager.awaitServerRestartAfterPairing()
+
+    oldComms.serverClose()
+    oldComms.serverClose()
+    t.mock.timers.tick(WA_DEFAULTS.PAIRING_RESTART_WAIT_MS)
+    await settle()
+
+    assert.equal(oldComms.stopCalls, 1)
+    assert.equal(counts.restarts, 1)
+    assert.equal(counts.postPair, 1)
+})
+
+test('the fallback timer restarts after pairing once when the server stays silent', async (t) => {
+    const { manager, oldComms, counts } = createPairRestartHarness(t)
+    manager.awaitServerRestartAfterPairing()
+
+    t.mock.timers.tick(WA_DEFAULTS.PAIRING_RESTART_WAIT_MS - 1)
+    await settle()
+    assert.equal(counts.restarts, 0)
+
+    t.mock.timers.tick(1)
+    await settle()
+    oldComms.serverClose()
+    await settle()
+
+    assert.equal(oldComms.stopCalls, 1)
+    assert.equal(counts.restarts, 1)
+    assert.equal(counts.postPair, 1)
+})
+
+test('disconnecting while waiting for the server restart cancels it', async (t) => {
+    const { manager, oldComms, counts } = createPairRestartHarness(t)
+    manager.awaitServerRestartAfterPairing()
+
+    await manager.disconnect()
+    assert.equal(manager.handleServerRestartRequest(), false)
+    oldComms.serverClose()
+    t.mock.timers.tick(WA_DEFAULTS.PAIRING_RESTART_WAIT_MS)
+    await settle()
+
+    assert.equal(oldComms.stopCalls, 1)
+    assert.equal(counts.restarts, 0)
+    assert.equal(counts.postPair, 0)
+})
+
+test('stream:error 515 outside the pairing window is left to the generic path', (t) => {
+    const { manager } = createPairRestartHarness(t)
+
+    assert.equal(manager.handleServerRestartRequest(), false)
+})
+
+for (const trigger of ['stream_error', 'server_close', 'fallback_timeout'] as const) {
+    for (const busy of [false, true]) {
+        test(`disconnect supersedes queued pairing restart: ${trigger}, busy=${busy}`, async (t) => {
+            const { manager, oldComms, counts } = createPairRestartHarness(t)
+            let release = (): void => undefined
+            const state = manager as unknown as {
+                runLifecycleOperation: (operation: () => Promise<void>) => Promise<void>
+            }
+            const queued = busy
+                ? state.runLifecycleOperation(
+                      () =>
+                          new Promise<void>((resolve) => {
+                              release = resolve
+                          })
+                  )
+                : Promise.resolve()
+            if (busy) await settle()
+            manager.awaitServerRestartAfterPairing()
+            if (trigger === 'stream_error') manager.handleServerRestartRequest()
+            else if (trigger === 'server_close') oldComms.serverClose()
+            else t.mock.timers.tick(WA_DEFAULTS.PAIRING_RESTART_WAIT_MS)
+
+            const disconnected = manager.disconnect()
+            release()
+            await queued
+            await disconnected
+            await settle()
+
+            assert.equal(counts.restarts, 0)
+            assert.equal(counts.postPair, 0)
+            assert.equal(oldComms.stopCalls, 1)
+            assert.equal(manager.getComms(), null)
+            assert.equal(manager.isConnected(), false)
+        })
+    }
+}
+
+test('disconnect during the old pairing socket stop prevents a replacement connection', async (t) => {
+    const { manager, counts } = createPairRestartHarness(t)
+    let release = (): void => undefined
+    let stopping = false
+    const comms = manager.getComms()
+    assert.ok(comms)
+    t.mock.method(comms, 'stopComms', async () => {
+        stopping = true
+        await new Promise<void>((resolve) => {
+            release = resolve
+        })
+    })
+    manager.awaitServerRestartAfterPairing()
+    manager.handleServerRestartRequest()
+    await settle()
+    assert.equal(stopping, true)
+    const disconnected = manager.disconnect()
+    release()
+    await disconnected
+    await settle()
+    assert.equal(counts.restarts, 0)
+    assert.equal(counts.postPair, 0)
+    assert.equal(manager.getComms(), null)
+})
+
+test('disconnect during asynchronous config building never starts obsolete comms', async (t) => {
+    let releaseConfig = (_config: unknown): void => undefined
+    const config = new Promise((resolve) => {
+        releaseConfig = resolve
+    })
+    let building = false
+    let starts = 0
+    let credentialClears = 0
+    const manager = new WaConnectionManager({
+        logger: createNoopLogger(),
+        options: {} as never,
+        authClient: {
+            loadOrCreateCredentials: async () => ({}),
+            buildCommsConfig: async () => {
+                building = true
+                return config
+            },
+            clearTransientState: async () => undefined
+        } as never,
+        keepAlive: { stop: () => undefined } as never,
+        nodeOrchestrator: { clearPending: () => undefined } as never,
+        nodeTransport: { bindComms: () => undefined } as never,
+        getPassiveTasks: () => null,
+        clearStoredCredentials: async () => {
+            credentialClears++
+        },
+        onPostPairReconnected: () => undefined
+    })
+    t.mock.method(WaComms.prototype, 'startComms', () => {
+        starts++
+    })
+    t.mock.method(WaComms.prototype, 'waitForConnection', async () => {
+        throw new Error('unexpected obsolete connection attempt')
+    })
+    t.mock.method(WaComms.prototype, 'stopComms', async () => undefined)
+    const connecting = assert.rejects(
+        manager.connect(async () => undefined),
+        /superseded/
+    )
+    await settle()
+    assert.equal(building, true)
+    const disconnected = manager.disconnect()
+    releaseConfig({ noise: {}, rawWebSocketConstructor: class {} })
+    await connecting
+    await disconnected
+    assert.equal(starts, 0)
+    assert.equal(credentialClears, 0)
+    assert.equal(manager.getComms(), null)
 })

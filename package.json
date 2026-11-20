@@ -1,6 +1,6 @@
 {
     "name": "@wayapiteam/zapo",
-    "version": "1.7.1",
+    "version": "1.11.0",
     "description": "High-performance WhatsApp Web TypeScript library",
     "license": "MIT",
     "author": "vinikjkkj <contact@vinicius.email> (https://github.com/vinikjkkj)",
@@ -130,7 +130,7 @@
         "changeset": "changeset",
         "changeset:status": "changeset status --verbose",
         "version:packages": "changeset version",
-        "release:publish": "npm run build && npm run build:packages && changeset publish",
+        "release:publish": "npm run build && npm run build -w packages/store-sqlite && node scripts/release/publish-fork-packages.cjs",
         "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
         "build:cjs": "tsc -p tsconfig.build.cjs.json && tsc-alias -p tsconfig.build.cjs.json",
         "build:esm": "tsc -p tsconfig.build.esm.json && tsc-alias -p tsconfig.build.esm.json",
@@ -163,7 +163,12 @@
         "lint": "eslint . --ext .ts,.js,.cjs",
         "lint:fix": "eslint . --ext .ts,.js,.cjs --fix",
         "format": "prettier . --write",
-        "format:check": "prettier . --check"
+        "format:check": "prettier . --check",
+        "test:upgrade:persistence": "node --test scripts/upgrade/credential-upgrade.test.cjs",
+        "test:upgrade:queue": "node --test scripts/upgrade/frame-queue.test.cjs",
+        "test:upgrade:iq-loopback": "node --test --test-concurrency=1 scripts/upgrade/iq-loopback.test.cjs",
+        "test:release": "node --test scripts/release/publish-fork-packages.test.cjs",
+        "test:release:package": "node --test scripts/release/packed-sqlite.test.cjs"
     },
     "peerDependencies": {
         "argo-codec": "^0.2.1",
@@ -218,5 +223,8 @@
         "brace-expansion@2": "^2.0.3",
         "brace-expansion@4": "^4.0.2",
         "brace-expansion@5": "^5.0.6"
+    },
+    "publishConfig": {
+        "registry": "https://npm.pkg.github.com"
     }
 }

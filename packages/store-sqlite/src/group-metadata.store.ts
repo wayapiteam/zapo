@@ -1,5 +1,5 @@
-import type { WaGroupMetadataSnapshot, WaGroupMetadataStore } from 'zapo-js/store'
-import { asNumber, asString } from 'zapo-js/util'
+import type { WaGroupMetadataSnapshot, WaGroupMetadataStore } from '@wayapiteam/zapo/store'
+import { asNumber, asString } from '@wayapiteam/zapo/util'
 
 import { BaseSqliteStore } from './BaseSqliteStore'
 import type { WaSqliteStorageOptions } from './types'

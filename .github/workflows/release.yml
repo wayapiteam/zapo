@@ -4,7 +4,7 @@ on:
     push:
         tags:
             - 'v*'
-    workflow_dispatch: # manual re-publish from the default branch (e.g. retry a tag publish that failed after the tag was already consumed)
+    workflow_dispatch: # Retoma uma publicação parcial sem republicar versões existentes.
 
 permissions: {}
 
@@ -14,49 +14,28 @@ concurrency:
 
 jobs:
     publish:
-        env:
-          CR_PAT: ${{ secrets.GHCR_PAT }}
         runs-on: ubuntu-latest
         timeout-minutes: 20
         permissions:
             contents: read
             packages: write
-            id-token: write # OIDC token exchanged for npm publish credentials
-        # environment: npm-publish   # optional: gate publishes behind required reviewers
 
         steps:
             - uses: actions/checkout@v4
               with:
-                  persist-credentials: false # job publishes via OIDC and never git-pushes
+                  persist-credentials: false
 
             - uses: ./.github/actions/setup-node
 
-            - name: upgrade npm for trusted publishing
-              # pin 11.18.0: OIDC needs npm >= 11.5.1, and npm 12 breaks changeset publish's
-              # published-version check (it misreads every package as unpublished and retries it)
+            - name: use the release npm version
               run: npm install -g npm@11.18.0
 
-            - name: build core + packages
+            - name: build fork core and SQLite provider
               run: |
                   npm run build
-                  npm run build:packages
+                  npm run build -w packages/store-sqlite
 
-            - name: build @zapo-js/native wasm backend
-              # wasm-bindgen-cli must match the wasm-bindgen crate version pinned
-              # in packages/native/wasm/Cargo.toml (=0.2.100)
-              run: |
-                  rustup target add wasm32-unknown-unknown
-                  cargo install wasm-bindgen-cli@0.2.100 --locked
-                  npm run build:wasm -w packages/native
-
-            - name: publish core (wayapiteam/zapo-js), skip if version already on npm
-              run: |
-                  VERSION="$(node -p "require('./package.json').version")"
-                  PUBLISHED="$(npm view "wayapiteam/zapo@$VERSION" version 2>/dev/null || true)"
-                  if [ -n "$PUBLISHED" ]; then
-                    echo "wayapiteam/zapo@$VERSION already on npm, skipping"
-                  else
-                    npm publish
-                  fi
+            - name: publish fork packages to GitHub Packages
+              run: node scripts/release/publish-fork-packages.cjs
               env:
-                NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

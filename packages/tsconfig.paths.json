@@ -43,7 +43,22 @@
             "@transport/*": ["src/transport/*"],
             "@util/*": ["src/util/*"],
             "@version-spec": ["src/version-spec.ts"],
-            "@zapo-js/*": ["packages/*/src/index.ts"]
+            "@zapo-js/voip-media/node": ["packages/voip-media/src/node/index.ts"],
+            "@zapo-js/voip-media/web": ["packages/voip-media/src/web/index.ts"],
+            "@zapo-js/*": ["packages/*/src/index.ts"],
+            "@wayapiteam/zapo": ["src/index.ts"],
+            "@wayapiteam/zapo/store": ["src/store/index.ts"],
+            "@wayapiteam/zapo/signal": ["src/signal/index.ts"],
+            "@wayapiteam/zapo/auth": ["src/auth/index.ts"],
+            "@wayapiteam/zapo/appstate": ["src/appstate/index.ts"],
+            "@wayapiteam/zapo/retry": ["src/retry/index.ts"],
+            "@wayapiteam/zapo/proto": ["src/proto.ts"],
+            "@wayapiteam/zapo/protocol": ["src/protocol/index.ts"],
+            "@wayapiteam/zapo/crypto": ["src/crypto/index.ts"],
+            "@wayapiteam/zapo/media": ["src/media/index.ts"],
+            "@wayapiteam/zapo/util": ["src/util/index.ts"],
+            "@wayapiteam/zapo/transport": ["src/transport/index.ts"],
+            "@wayapiteam/zapo-store-sqlite": ["packages/store-sqlite/src/index.ts"]
         }
     }
 }

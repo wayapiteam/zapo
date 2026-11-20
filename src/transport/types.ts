@@ -19,6 +19,25 @@ export interface BinaryNode {
     readonly content?: Uint8Array | string | readonly BinaryNode[]
 }
 
+/** Ordinary stanza work, admitted to the bounded handler queue after preparation. */
+export type WaPreparedStanzaHandler = () => void | Promise<void>
+
+/**
+ * Prepares one decoded Noise frame without awaiting ordinary handler work.
+ * Return `null` when consumed/dropped, or a callback for bounded ordinary dispatch.
+ * Check `isCurrent()` after asynchronous decoding and before resolving pending work.
+ * The callback is checked again against its connection generation before execution.
+ * A reset discards queued callbacks, not already-running work. Callbacks must bound
+ * their own I/O; an earlier generation's running callbacks may finish after reconnect.
+ * Report expanded stanza bytes through `onDecodedByteLength` when decoding compressed
+ * input, so ordinary work is charged for the decoded body rather than compressed wire size.
+ */
+export type WaStanzaPreparer = (
+    frame: Uint8Array,
+    isCurrent: () => boolean,
+    onDecodedByteLength: (byteLength: number) => void
+) => Promise<WaPreparedStanzaHandler | null>
+
 export interface SocketOpenInfo {
     readonly openedAt: number
 }

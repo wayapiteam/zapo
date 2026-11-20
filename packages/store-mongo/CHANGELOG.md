@@ -1,5 +1,16 @@
 # @zapo-js/store-mongo
 
+## 1.2.0
+
+### Minor Changes
+
+- 471ca18: Persist the contact's username handle. `WaStoredContactRecord` gained an
+  optional `username` field, and every backend now reads and writes it: SQL
+  providers add a `username` column through a new migration (`0020` on sqlite,
+  `0021` on postgres and mysql), redis adds a hash field, and mongo adds a
+  document field. The handle feeds the username-addressed blocklist and
+  privacy-list identifiers.
+
 ## 1.1.0
 
 ### Minor Changes

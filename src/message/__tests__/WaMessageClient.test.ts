@@ -3,12 +3,82 @@ import test from 'node:test'
 
 import { createNoopLogger, type Logger } from '@infra/log/types'
 import { WaMessageClient } from '@message/WaMessageClient'
+import { WA_NACK_REASONS } from '@protocol/constants'
 import type { BinaryNode } from '@transport/types'
 
 interface CapturedLog {
     readonly message: string
     readonly context?: Readonly<Record<string, unknown>>
 }
+
+for (const [code, category] of [
+    ['401', 'authorization'],
+    [String(WA_NACK_REASONS.STALE_GROUP_ADDRESSING_MODE), 'stale_group_addressing_mode'],
+    ['429', 'rate_limit'],
+    ['420', 'client_rejection'],
+    ['503', 'server_error'],
+    ['unknown', 'other']
+]) {
+    test(`publish NACK code ${code} keeps its category and stops at the configured attempt`, async () => {
+        const warnings: CapturedLog[] = []
+        let calls = 0
+        const client = new WaMessageClient({
+            logger: {
+                ...createNoopLogger(),
+                warn: (message, context) => warnings.push({ message, context })
+            },
+            sendNode: async () => {},
+            query: async () => {
+                calls += 1
+                return { tag: 'ack', attrs: { id: 'nack-contract', error: code } }
+            }
+        })
+        await assert.rejects(
+            client.publishNode(
+                { tag: 'message', attrs: { id: 'nack-contract' } },
+                { maxAttempts: 1 }
+            ),
+            /negative publish ack/
+        )
+        assert.equal(calls, 1)
+        assert.equal(warnings.length, 1)
+        assert.equal(warnings[0].context?.nackCategory, category)
+    })
+}
+
+test('retryable NACK retains scoped diagnostics and succeeds on the next attempt', async () => {
+    const retries: CapturedLog[] = []
+    let calls = 0
+    const client = new WaMessageClient({
+        logger: createNoopLogger(),
+        sendNode: async () => {},
+        query: async (): Promise<BinaryNode> => {
+            calls += 1
+            return calls === 1
+                ? { tag: 'ack', attrs: { id: 'retry-contract', error: '503', code: '503' } }
+                : { tag: 'ack', attrs: { id: 'retry-contract' } }
+        }
+    })
+    const result = await client.publishNode(
+        { tag: 'message', attrs: { id: 'retry-contract' } },
+        {
+            maxAttempts: 2,
+            retryDelayMs: 0,
+            logger: {
+                ...createNoopLogger(),
+                debug: (message, context) => retries.push({ message, context }),
+                warn: () => assert.fail('a recovered publish must not emit a terminal warning')
+            }
+        }
+    )
+    assert.equal(result.attempts, 2)
+    const retry = retries.find(
+        (entry) => entry.message === 'message publish attempt failed, will retry'
+    )
+    assert.equal(retry?.context?.nackCode, '503')
+    assert.equal(retry?.context?.nackCategory, 'server_error')
+    assert.equal(retry?.context?.attempt, 1)
+})
 
 test('message publish NACK logs sanitized ack and outbound diagnostics', async () => {
     const warnings: CapturedLog[] = []

@@ -12,7 +12,7 @@ import { createNoopLogger } from '@infra/log/types'
 import { proto } from '@proto'
 import { WaPreKeyMemoryStore } from '@store/memory/pre-key.store'
 import { WaSignalMemoryStore } from '@store/memory/signal.store'
-import type { WaProxyDispatcher } from '@transport/types'
+import type { WaCommsConfig, WaProxyDispatcher, WaProxyTransport } from '@transport/types'
 
 function createCredentials(): WaAuthCredentials {
     return {
@@ -190,6 +190,94 @@ test('buildCommsConfig maps ws proxy agent when provided', async () => {
     assert.equal(config.dispatcher, undefined)
     assert.equal(config.agent, wsAgent)
     wsAgent.destroy()
+})
+
+test('buildCommsConfig forwards the ws proxy agent to a mobile TCP session', async () => {
+    const wsAgent = Object.assign(new http.Agent({ keepAlive: true }), {
+        proxy: new URL('http://127.0.0.1:3128')
+    })
+    const config = await buildCommsConfig(
+        createNoopLogger(),
+        {
+            ...createCredentials(),
+            deviceInfo: {
+                manufacturer: 'Google',
+                device: 'panther',
+                osVersion: '14',
+                osBuildNumber: 'AP3A',
+                appVersion: '2.26.15.11'
+            }
+        },
+        {
+            proxy: {
+                ws: wsAgent
+            }
+        },
+        { requireFullSync: false }
+    )
+
+    assert.equal(config.agent, wsAgent)
+    assert.ok(config.rawWebSocketConstructor)
+    wsAgent.destroy()
+})
+
+async function buildMobileCommsConfig(ws: WaProxyTransport): Promise<WaCommsConfig> {
+    return buildCommsConfig(
+        createNoopLogger(),
+        {
+            ...createCredentials(),
+            deviceInfo: {
+                manufacturer: 'Google',
+                device: 'panther',
+                osVersion: '14',
+                osBuildNumber: 'AP3A',
+                appVersion: '2.26.15.11'
+            }
+        },
+        { proxy: { ws } },
+        { requireFullSync: false }
+    )
+}
+
+test('buildCommsConfig rejects mobile proxies the raw TCP tunnel cannot honour', async () => {
+    const dispatcher: WaProxyDispatcher = { dispatch: () => true }
+    await assert.rejects(
+        buildMobileCommsConfig(dispatcher),
+        /dispatchers cannot tunnel raw TCP/,
+        'an undici dispatcher must fail loudly instead of dialling g.whatsapp.net directly'
+    )
+
+    const socksAgent = Object.assign(new http.Agent(), {
+        proxy: { host: '127.0.0.1', port: 1080, type: 5 }
+    })
+    await assert.rejects(
+        buildMobileCommsConfig(socksAgent),
+        /socks proxy agents cannot tunnel raw TCP/
+    )
+    socksAgent.destroy()
+
+    const httpsProxyAgent = Object.assign(new http.Agent(), {
+        proxy: new URL('https://127.0.0.1:8443')
+    })
+    await assert.rejects(
+        buildMobileCommsConfig(httpsProxyAgent),
+        /proxy protocol https: is not supported/
+    )
+    httpsProxyAgent.destroy()
+
+    const malformedCredentialAgent = Object.assign(new http.Agent(), {
+        proxy: new URL('http://user:pa%ss@127.0.0.1:3128')
+    })
+    await assert.rejects(buildMobileCommsConfig(malformedCredentialAgent), (error: unknown) => {
+        assert.match(String(error), /proxy url password contains a malformed percent escape/)
+        assert.doesNotMatch(String(error), /pa%ss/)
+        return true
+    })
+    malformedCredentialAgent.destroy()
+
+    const plainAgent = new http.Agent()
+    await assert.rejects(buildMobileCommsConfig(plainAgent), /exposes no proxy url/)
+    plainAgent.destroy()
 })
 
 test('buildCommsConfig falls back to credentials.deviceInfo when mobileTransport option is absent', async () => {

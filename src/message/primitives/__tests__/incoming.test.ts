@@ -671,3 +671,318 @@ test('the payload is only built when the hook asks for it', async () => {
     assert.notEqual(built[0]?.plaintext, built[1]?.plaintext, 'each call copies')
     assert.deepEqual(built[0]?.plaintext, built[1]?.plaintext, 'to the same bytes')
 })
+
+test('incoming 1:1 message exposes the sender username handle', async () => {
+    const emitted: WaIncomingMessageEvent[] = []
+    await handleIncomingMessageAck(
+        {
+            tag: 'message',
+            attrs: {
+                id: 'msg-un',
+                from: '5511999999999:12@s.whatsapp.net',
+                username: '@joao',
+                t: '123'
+            },
+            content: [{ tag: 'enc', attrs: { type: 'msg' }, content: new Uint8Array([1]) }]
+        },
+        createDecryptingOptions(emitted)
+    )
+
+    assert.equal(emitted.length, 1)
+    assert.equal(emitted[0].key.senderUsername, 'joao')
+    assert.equal(emitted[0].key.recipientUsername, undefined)
+})
+
+test('group message prefers participant_username as the sender handle', async () => {
+    const emitted: WaIncomingMessageEvent[] = []
+    await handleIncomingMessageAck(
+        {
+            tag: 'message',
+            attrs: {
+                id: 'msg-grp-un',
+                from: '123456@g.us',
+                participant: '5511999999999:3@s.whatsapp.net',
+                username: 'ignored',
+                participant_username: 'joao',
+                t: '123'
+            },
+            content: [{ tag: 'enc', attrs: { type: 'msg' }, content: new Uint8Array([1]) }]
+        },
+        createDecryptingOptions(emitted)
+    )
+
+    assert.equal(emitted.length, 1)
+    assert.equal(emitted[0].key.senderUsername, 'joao')
+})
+
+test('self-sent 1:1 message carries the peer handle, not the own one', async () => {
+    const emitted: WaIncomingMessageEvent[] = []
+    await handleIncomingMessageAck(
+        {
+            tag: 'message',
+            attrs: {
+                id: 'msg-self-un',
+                from: '5511999999999:12@s.whatsapp.net',
+                recipient: '5511888888888@s.whatsapp.net',
+                username: 'me.handle',
+                peer_recipient_username: 'joao',
+                t: '123'
+            },
+            content: [{ tag: 'enc', attrs: { type: 'msg' }, content: new Uint8Array([1]) }]
+        },
+        createDecryptingOptions(emitted, {
+            getMeJid: () => '5511999999999:2@s.whatsapp.net'
+        })
+    )
+
+    assert.equal(emitted.length, 1)
+    const { key } = emitted[0]
+    assert.equal(key.fromMe, true)
+    assert.equal(key.remoteJid, '5511888888888@s.whatsapp.net')
+    assert.equal(key.recipientUsername, 'joao')
+    assert.equal(
+        key.senderUsername,
+        undefined,
+        'the own handle must not be promoted onto the peer-addressed key'
+    )
+})
+
+test('recipient_username wins over peer_recipient_username when both are present', async () => {
+    const emitted: WaIncomingMessageEvent[] = []
+    await handleIncomingMessageAck(
+        {
+            tag: 'message',
+            attrs: {
+                id: 'msg-rec-un',
+                from: '5511999999999:12@s.whatsapp.net',
+                recipient_username: 'primary',
+                peer_recipient_username: 'fallback',
+                t: '123'
+            },
+            content: [{ tag: 'enc', attrs: { type: 'msg' }, content: new Uint8Array([1]) }]
+        },
+        createDecryptingOptions(emitted)
+    )
+
+    assert.equal(emitted[0].key.recipientUsername, 'primary')
+})
+
+const DECRYPT_GROUP_JID = '120363000000000000@g.us'
+const DECRYPT_SENDER_JID = '551100000000@s.whatsapp.net'
+
+function createEncsNode(from: string, encTypes: readonly string[]): BinaryNode {
+    return {
+        tag: 'message',
+        attrs: {
+            id: 'msg-encs',
+            from,
+            ...(from === DECRYPT_GROUP_JID ? { participant: DECRYPT_SENDER_JID } : {}),
+            t: '123'
+        },
+        content: encTypes.map((type) => ({
+            tag: 'enc',
+            attrs: { type },
+            content: new Uint8Array([1])
+        }))
+    }
+}
+
+// Each call consumes the next entry: an Error is thrown, null decrypts fine.
+function scriptedDecrypt(script: ReadonlyArray<Error | null>, calls: { count: number }) {
+    return async (): Promise<Uint8Array> => {
+        const outcome = script[calls.count]
+        calls.count += 1
+        if (outcome) throw outcome
+        return paddedPlaintext({ conversation: 'hi' })
+    }
+}
+
+async function runEncsScenario(
+    node: BinaryNode,
+    script: {
+        readonly signal?: ReadonlyArray<Error | null>
+        readonly senderKey?: ReadonlyArray<Error | null>
+    }
+) {
+    const sentNodes: BinaryNode[] = []
+    const signalCalls = { count: 0 }
+    const senderKeyCalls = { count: 0 }
+    await handleIncomingMessageAck(node, {
+        logger: createNoopLogger(),
+        sendNode: async (sent) => {
+            sentNodes.push(sent)
+        },
+        signalProtocol: {
+            decryptMessage: scriptedDecrypt(script.signal ?? [], signalCalls)
+        } as never,
+        senderKeyManager: {
+            decryptGroupMessage: scriptedDecrypt(script.senderKey ?? [], senderKeyCalls),
+            processSenderKeyDistributionPayload: async () => undefined
+        } as never
+    })
+    return {
+        retries: sentNodes.filter((sent) => sent.attrs.type === 'retry'),
+        deliveries: sentNodes.filter((sent) => sent.tag === 'receipt' && !sent.attrs.type),
+        signalCalls: signalCalls.count,
+        senderKeyCalls: senderKeyCalls.count
+    }
+}
+
+const DECRYPT_ERROR = new Error('invalid message mac')
+const DUPLICATE_ERROR = new Error('duplicate message')
+
+test('group pkmsg decrypted but skmsg failing sends a retry receipt', async () => {
+    const result = await runEncsScenario(createEncsNode(DECRYPT_GROUP_JID, ['pkmsg', 'skmsg']), {
+        signal: [null],
+        senderKey: [new Error('missing sender key')]
+    })
+
+    assert.equal(result.retries.length, 1)
+    assert.equal(result.deliveries.length, 0)
+    assert.equal(result.retries[0].attrs.id, 'msg-encs')
+    assert.equal(result.retries[0].attrs.to, DECRYPT_GROUP_JID)
+})
+
+test('a stanza where no enc decrypts sends a retry receipt', async () => {
+    const pairwise = await runEncsScenario(createEncsNode(DECRYPT_SENDER_JID, ['msg']), {
+        signal: [DECRYPT_ERROR]
+    })
+    assert.equal(pairwise.retries.length, 1)
+    assert.equal(pairwise.deliveries.length, 0)
+
+    const group = await runEncsScenario(createEncsNode(DECRYPT_GROUP_JID, ['pkmsg', 'skmsg']), {
+        signal: [DECRYPT_ERROR],
+        senderKey: [DECRYPT_ERROR]
+    })
+    assert.equal(group.retries.length, 1)
+    assert.equal(group.deliveries.length, 0)
+})
+
+test('the retry is reported with the skmsg failure when both encs fail', async () => {
+    const skmsgError = new Error('missing sender key')
+    const failures: unknown[] = []
+    await handleIncomingMessageAck(createEncsNode(DECRYPT_GROUP_JID, ['pkmsg', 'skmsg']), {
+        logger: createNoopLogger(),
+        sendNode: async () => undefined,
+        signalProtocol: {
+            decryptMessage: scriptedDecrypt([DECRYPT_ERROR], { count: 0 })
+        } as never,
+        senderKeyManager: {
+            decryptGroupMessage: scriptedDecrypt([skmsgError], { count: 0 })
+        } as never,
+        onDecryptFailure: async (_context, error) => {
+            failures.push(error)
+            return true
+        }
+    })
+
+    assert.deepEqual(failures, [skmsgError])
+})
+
+test('1:1 stanza with a decrypted enc and a failing enc sends no retry receipt', async () => {
+    const result = await runEncsScenario(createEncsNode(DECRYPT_SENDER_JID, ['msg', 'msg']), {
+        signal: [null, DECRYPT_ERROR]
+    })
+
+    assert.equal(result.signalCalls, 2)
+    assert.equal(result.retries.length, 0)
+    assert.equal(result.deliveries.length, 1)
+})
+
+test('a stanza whose encs all decrypt sends the standard receipt only', async () => {
+    const result = await runEncsScenario(createEncsNode(DECRYPT_GROUP_JID, ['pkmsg', 'skmsg']), {
+        signal: [null],
+        senderKey: [null]
+    })
+
+    assert.equal(result.signalCalls, 1)
+    assert.equal(result.senderKeyCalls, 1)
+    assert.equal(result.retries.length, 0)
+    assert.equal(result.deliveries.length, 1)
+})
+
+test('group skmsg decrypted but pkmsg failing sends no retry receipt', async () => {
+    const result = await runEncsScenario(createEncsNode(DECRYPT_GROUP_JID, ['pkmsg', 'skmsg']), {
+        signal: [DECRYPT_ERROR],
+        senderKey: [null]
+    })
+
+    assert.equal(result.senderKeyCalls, 1)
+    assert.equal(result.retries.length, 0)
+    assert.equal(result.deliveries.length, 1)
+})
+
+test('a duplicate failure with no decrypted enc still sends a retry receipt', async () => {
+    const result = await runEncsScenario(createEncsNode(DECRYPT_SENDER_JID, ['msg']), {
+        signal: [DUPLICATE_ERROR]
+    })
+
+    assert.equal(result.retries.length, 1)
+    assert.equal(result.deliveries.length, 0)
+})
+
+const SENDER_KEY_DISTRIBUTION = {
+    groupId: DECRYPT_GROUP_JID,
+    axolotlSenderKeyDistributionMessage: new Uint8Array([1, 2, 3])
+}
+
+test('a sender key distribution carrying only the message context is not emitted', async () => {
+    const emitted: WaIncomingMessageEvent[] = []
+
+    await handleIncomingMessageAck(
+        createEncryptedMessageNode(),
+        createDecryptingOptions(emitted, {
+            message: {
+                senderKeyDistributionMessage: SENDER_KEY_DISTRIBUTION,
+                messageContextInfo: {}
+            }
+        })
+    )
+
+    assert.equal(emitted.length, 0)
+})
+
+test('a fast ratchet sender key distribution carrying only the message context is not emitted', async () => {
+    const emitted: WaIncomingMessageEvent[] = []
+
+    await handleIncomingMessageAck(
+        createEncryptedMessageNode(),
+        createDecryptingOptions(emitted, {
+            message: {
+                fastRatchetKeySenderKeyDistributionMessage: SENDER_KEY_DISTRIBUTION,
+                messageContextInfo: {}
+            }
+        })
+    )
+
+    assert.equal(emitted.length, 0)
+})
+
+test('a sender key distribution next to real content is still emitted', async () => {
+    const emitted: WaIncomingMessageEvent[] = []
+
+    await handleIncomingMessageAck(
+        createEncryptedMessageNode(),
+        createDecryptingOptions(emitted, {
+            message: {
+                senderKeyDistributionMessage: SENDER_KEY_DISTRIBUTION,
+                messageContextInfo: {},
+                stickerMessage: {}
+            }
+        })
+    )
+
+    assert.equal(emitted.length, 1)
+    assert.ok(emitted[0].message?.stickerMessage)
+})
+
+test('a message with the context but no sender key distribution is still emitted', async () => {
+    const emitted: WaIncomingMessageEvent[] = []
+
+    await handleIncomingMessageAck(
+        createEncryptedMessageNode(),
+        createDecryptingOptions(emitted, { message: { messageContextInfo: {} } })
+    )
+
+    assert.equal(emitted.length, 1)
+})

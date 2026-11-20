@@ -28,6 +28,7 @@ interface AuthDoc {
     server_static_key: Binary | null
     server_has_prekeys: boolean | null
     routing_info: Binary | null
+    login_counter?: number | null
     last_success_ts: number | null
     props_version: number | null
     ab_props_version: number | null
@@ -90,6 +91,7 @@ export class WaAuthMongoStore extends BaseMongoStore implements WaAuthStore {
                     : Boolean(doc.server_has_prekeys),
             routingInfo: fromBinaryOrNull(doc.routing_info) ?? undefined,
             lastSuccessTs: doc.last_success_ts !== null ? Number(doc.last_success_ts) : undefined,
+            loginCounter: doc.login_counter ?? undefined,
             propsVersion: doc.props_version !== null ? Number(doc.props_version) : undefined,
             abPropsVersion:
                 doc.ab_props_version !== null ? Number(doc.ab_props_version) : undefined,
@@ -149,6 +151,7 @@ export class WaAuthMongoStore extends BaseMongoStore implements WaAuthStore {
                         ? toBinary(credentials.routingInfo)
                         : null,
                     last_success_ts: credentials.lastSuccessTs ?? null,
+                    login_counter: credentials.loginCounter ?? null,
                     props_version: credentials.propsVersion ?? null,
                     ab_props_version: credentials.abPropsVersion ?? null,
                     connection_location: credentials.connectionLocation ?? null,

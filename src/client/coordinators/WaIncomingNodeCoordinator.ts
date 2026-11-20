@@ -72,6 +72,7 @@ interface WaIncomingNodeRuntime {
     readonly warmupMediaConn: () => Promise<void>
     readonly persistRoutingInfo: (routingInfo: Uint8Array) => Promise<void>
     readonly tryResolvePendingNode: (node: BinaryNode) => boolean
+    readonly isPendingIqResponse?: (node: BinaryNode) => boolean
     readonly handleGenericIncomingNode: (node: BinaryNode) => Promise<boolean>
     readonly handleIncomingIqSetNode: (node: BinaryNode) => Promise<boolean>
     readonly handleLinkCodeNotificationNode: (node: BinaryNode) => Promise<boolean>
@@ -126,6 +127,11 @@ const INFO_BULLETIN_CHILD_TAGS = new Set<string>([
 
 const FILTER_PROTECTED_TAGS = new Set<string>([WA_NODE_TAGS.SUCCESS, 'failure'])
 
+interface StanzaFilterEntry {
+    readonly filter: WaIncomingStanzaFilter
+    readonly affectsIqResponses: boolean
+}
+
 export class WaIncomingNodeCoordinator {
     private readonly logger: Logger
     private readonly runtime: WaIncomingNodeRuntime
@@ -134,7 +140,8 @@ export class WaIncomingNodeCoordinator {
         string,
         { readonly subtype?: string; readonly handler: WaIncomingNodeHandler }[]
     >
-    private readonly stanzaFilters: WaIncomingStanzaFilter[]
+    private readonly stanzaFilters: StanzaFilterEntry[]
+    private iqResponseFilterCount = 0
     private mediaConnWarmupPromise: Promise<void> | null
 
     public constructor(options: WaIncomingNodeCoordinatorOptions) {
@@ -145,6 +152,20 @@ export class WaIncomingNodeCoordinator {
         this.stanzaFilters = []
         this.registerDefaultIncomingHandlers()
         this.mediaConnWarmupPromise = null
+    }
+
+    /**
+     * Consumes eligible pending IQ replies before the ordinary handler queue.
+     * Arbitrary raw filters retain their existing pre-dispatch authority, so registering
+     * one disables this shortcut. Built-in filters restricted to non-IQ tags do not.
+     * Receipts and other nodes never enter this path.
+     * The caller owns connection-generation validation around asynchronous decoding.
+     */
+    public tryResolvePendingIqResponse(node: BinaryNode): boolean {
+        if (this.iqResponseFilterCount > 0 || !this.runtime.isPendingIqResponse?.(node))
+            return false
+        if (node.attrs.offline !== undefined) this.offlineResume.trackOfflineStanza()
+        return this.runtime.tryResolvePendingNode(node)
     }
 
     public async handleIncomingNode(node: BinaryNode): Promise<void> {
@@ -177,12 +198,23 @@ export class WaIncomingNodeCoordinator {
         this.runtime.emitUnhandledIncomingNode(createUnhandledIncomingNodeEvent(node))
     }
 
-    public registerIncomingStanzaFilter(filter: WaIncomingStanzaFilter): () => void {
-        this.stanzaFilters.push(filter)
+    /**
+     * Registers a pre-dispatch filter, preserving raw IQ filtering by default.
+     * `affectsIqResponses: false` is reserved for built-in filters whose tag admission
+     * excludes IQ before invoking user code. Raw lowlevel registrations use the default.
+     */
+    public registerIncomingStanzaFilter(
+        filter: WaIncomingStanzaFilter,
+        options: { readonly affectsIqResponses?: boolean } = {}
+    ): () => void {
+        const entry = { filter, affectsIqResponses: options.affectsIqResponses !== false }
+        this.stanzaFilters.push(entry)
+        if (entry.affectsIqResponses) this.iqResponseFilterCount++
         return () => {
-            const index = this.stanzaFilters.indexOf(filter)
+            const index = this.stanzaFilters.indexOf(entry)
             if (index !== -1) {
                 this.stanzaFilters.splice(index, 1)
+                if (entry.affectsIqResponses) this.iqResponseFilterCount--
             }
         }
     }
@@ -195,7 +227,7 @@ export class WaIncomingNodeCoordinator {
         for (let i = 0; i < this.stanzaFilters.length; i += 1) {
             let verdict: boolean
             try {
-                verdict = await this.stanzaFilters[i](node)
+                verdict = await this.stanzaFilters[i].filter(node)
             } catch (error) {
                 filterLogger.warn('incoming stanza filter threw', {
                     message: toError(error).message

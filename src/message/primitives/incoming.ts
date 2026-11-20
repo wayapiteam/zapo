@@ -24,6 +24,7 @@ import {
     parseSignalAddressFromJid,
     toUserJid
 } from '@protocol/jid'
+import { normalizeUsername } from '@protocol/username'
 import type { WaRetryDecryptFailureContext } from '@retry/types'
 import type { SenderKeyManager } from '@signal/group/SenderKeyManager'
 import type { SignalProtocol } from '@signal/session/SignalProtocol'
@@ -62,6 +63,7 @@ interface MessageIdentityAttrs {
     readonly senderUsername?: string
     readonly recipientJid?: string
     readonly recipientAlt?: string
+    readonly recipientUsername?: string
     readonly pushName: string | undefined
 }
 
@@ -74,13 +76,19 @@ function extractMessageIdentityAttrs(attrs: BinaryNode['attrs']): MessageIdentit
     const rawParticipantAlt = attrs.participant_pn ?? attrs.participant_lid
     const rawRecipientAlt = attrs.peer_recipient_pn ?? attrs.peer_recipient_lid
     const rawRecipient = attrs.recipient
-    const senderUsername = attrs.participant_username ?? attrs.username
+    const rawSenderUsername = attrs.participant_username ?? attrs.username
+    const rawRecipientUsername = attrs.recipient_username ?? attrs.peer_recipient_username
+    const senderUsername =
+        rawSenderUsername !== undefined ? normalizeUsername(rawSenderUsername) : undefined
+    const recipientUsername =
+        rawRecipientUsername !== undefined ? normalizeUsername(rawRecipientUsername) : undefined
     return {
         ...(rawRemoteJidAlt ? { remoteJidAlt: toUserJid(rawRemoteJidAlt) } : {}),
         ...(rawParticipantAlt ? { participantAlt: toUserJid(rawParticipantAlt) } : {}),
         ...(senderUsername !== undefined ? { senderUsername } : {}),
         ...(rawRecipient ? { recipientJid: toUserJid(rawRecipient) } : {}),
         ...(rawRecipientAlt ? { recipientAlt: toUserJid(rawRecipientAlt) } : {}),
+        ...(recipientUsername !== undefined ? { recipientUsername } : {}),
         pushName: attrs.notify
     }
 }
@@ -94,12 +102,13 @@ type MessageKeyIdentity = Omit<MessageIdentityAttrs, 'pushName'>
  * whenever the stanza is self-authored 1:1, even when the chat itself did not
  * resolve: the sender attrs always describe the own account there, so letting
  * them through would address the message to the connection's own number.
+ * `senderUsername` goes with them; the peer's is in `recipientUsername`.
  */
 function promoteRecipientAddressing(identity: MessageKeyIdentity): MessageKeyIdentity {
     return {
         ...(identity.recipientAlt ? { remoteJidAlt: identity.recipientAlt } : {}),
-        ...(identity.senderUsername !== undefined
-            ? { senderUsername: identity.senderUsername }
+        ...(identity.recipientUsername !== undefined
+            ? { recipientUsername: identity.recipientUsername }
             : {})
     }
 }
@@ -191,6 +200,38 @@ function buildIncomingEventRawNode(node: BinaryNode): BinaryNode {
 }
 
 /**
+ * Resolves who authored a {@link proto.IWebMessageInfo}. The top-level
+ * `participant` wins over `key.participant` - history sync carries the group
+ * sender in the former and leaves the latter empty on a large share of records.
+ * A self-sent group/broadcast message with neither falls back to this account,
+ * preferring `originalSelfAuthorUserJidString` over `meJid` (the current account
+ * user JID) so a message authored under a previous identity keeps its author.
+ *
+ * The participant fields are read whatever the thread type is, matching how
+ * WhatsApp Web builds the author: only the self-sent fallback is gated on
+ * group/broadcast. A 1:1 record normally carries neither, so this returns
+ * `undefined` there and the caller supplies the thread JID instead.
+ *
+ * `threadJid` overrides `key.remoteJid` for carriers that know the thread out
+ * of band, such as a group history bundle whose records may omit it.
+ */
+export function resolveWebMessageInfoAuthor(
+    webMessageInfo: proto.IWebMessageInfo,
+    meJid?: string | null,
+    threadJid?: string
+): string | undefined {
+    const key = webMessageInfo.key ?? {}
+    const chatJid = threadJid ?? key.remoteJid ?? undefined
+    const isGroupOrBroadcast = chatJid ? isGroupJid(chatJid) || isBroadcastJid(chatJid) : false
+    const rawSelfAuthor = webMessageInfo.originalSelfAuthorUserJidString ?? meJid ?? undefined
+    const selfAuthor =
+        key.fromMe === true && isGroupOrBroadcast && rawSelfAuthor
+            ? toUserJid(rawSelfAuthor)
+            : undefined
+    return webMessageInfo.participant ?? key.participant ?? selfAuthor ?? undefined
+}
+
+/**
  * Rebuilds a `message` event from a recovered {@link proto.IWebMessageInfo}
  * (placeholder resend). `meJid` is the current account user JID, used as the
  * author fallback for self-sent group messages when the proto carries no
@@ -205,10 +246,7 @@ export function buildRecoveredIncomingEvent(
     const fromMe = key.fromMe === true
     const isGroup = chatJid ? isGroupJid(chatJid) : false
     const isBroadcast = chatJid ? isBroadcastJid(chatJid) : false
-    const rawSelfAuthor = webMessageInfo.originalSelfAuthorUserJidString ?? meJid ?? undefined
-    const selfAuthor =
-        fromMe && (isGroup || isBroadcast) && rawSelfAuthor ? toUserJid(rawSelfAuthor) : undefined
-    const participant = webMessageInfo.participant ?? key.participant ?? selfAuthor
+    const participant = resolveWebMessageInfoAuthor(webMessageInfo, meJid)
     const pushName = webMessageInfo.pushName ?? undefined
     const rawSender = fromMe ? undefined : isGroup || isBroadcast ? participant : chatJid
     const sender = rawSender ? parseJidFull(rawSender) : null
@@ -301,6 +339,7 @@ function shouldEmitIncomingMessage(message: proto.IMessage): boolean {
         if (
             field === 'senderKeyDistributionMessage' ||
             field === 'fastRatchetKeySenderKeyDistributionMessage' ||
+            field === 'messageContextInfo' ||
             field === '$$unknownFieldCount'
         ) {
             continue
@@ -582,6 +621,7 @@ export async function handleIncomingMessageAck(
         const senderJid = node.attrs.participant ?? node.attrs.from
         let hasSuccessfulDecrypt = false
         let firstDecryptFailure: DecryptEncNodeResult | null = null
+        let skmsgFailure: DecryptEncNodeResult | null = null
         let encCount = 0
         let firstEncType: string | undefined
 
@@ -667,8 +707,12 @@ export async function handleIncomingMessageAck(
                 default:
                     continue
             }
-            if (result.success) hasSuccessfulDecrypt = true
-            else if (!firstDecryptFailure) firstDecryptFailure = result
+            if (result.success) {
+                hasSuccessfulDecrypt = true
+            } else {
+                firstDecryptFailure ??= result
+                if (child.attrs.type === 'skmsg') skmsgFailure ??= result
+            }
         }
 
         if (encCount > 1 && firstEncType === 'skmsg') {
@@ -679,12 +723,13 @@ export async function handleIncomingMessageAck(
                 encCount
             })
         }
-        if (encCount > 0 && !hasSuccessfulDecrypt && firstDecryptFailure) {
+        const decryptFailure = skmsgFailure ?? firstDecryptFailure
+        if (decryptFailure && (!hasSuccessfulDecrypt || skmsgFailure)) {
             await sendRetryReceiptForDecryptFailure(
                 node,
                 options,
-                firstDecryptFailure.error,
-                firstDecryptFailure.encType
+                decryptFailure.error,
+                decryptFailure.encType
             )
             shouldSendStandardReceipt = false
         }

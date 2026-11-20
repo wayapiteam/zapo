@@ -175,6 +175,35 @@ test('media reupload resolves with the fresh direct path', async () => {
     assert.equal(result.directPath, '/v/t62.7118-24/reuploaded')
 })
 
+test('the error form of the notification settles with only the result code', async () => {
+    const { requester, waitForSends } = createRequester({})
+
+    const pending = requester.request({
+        messageId: MESSAGE_ID,
+        chatJid: CHAT_JID,
+        mediaKey: mediaKey(),
+        fromMe: false
+    })
+    await waitForSends(1)
+
+    requester.handleNotification({
+        tag: 'notification',
+        attrs: { id: MESSAGE_ID, from: ME_LID, type: 'mediaretry' },
+        content: [
+            {
+                tag: 'error',
+                attrs: { code: String(proto.MediaRetryNotification.ResultType.NOT_FOUND) }
+            }
+        ]
+    })
+
+    assert.deepEqual(await pending, {
+        messageId: MESSAGE_ID,
+        result: 'not_found',
+        resultCode: proto.MediaRetryNotification.ResultType.NOT_FOUND
+    })
+})
+
 test('media reupload maps a not-found answer without rejecting', async () => {
     const { requester, waitForSends } = createRequester({})
 
@@ -430,7 +459,10 @@ test('rejects a mediaretry notification with no id, payload, or error code', () 
 })
 
 test('two concurrent requests for the same message share one receipt', async () => {
-    const { requester, sent } = createRequester({ defaultTimeoutMs: 200 })
+    // Default timeout on purpose: a short one races the assertions, and a
+    // pending entry that times out rejects both promises instead of sharing a
+    // receipt. The notification below clears the timer, so nothing dangles.
+    const { requester, sent, waitForSends } = createRequester({})
     const input = {
         messageId: MESSAGE_ID,
         chatJid: CHAT_JID,
@@ -440,7 +472,7 @@ test('two concurrent requests for the same message share one receipt', async () 
 
     const first = requester.request(input)
     const second = requester.request(input)
-    await new Promise((resolve) => setTimeout(resolve, 50))
+    await waitForSends(1)
 
     assert.equal(sent.length, 1)
     requester.handleNotification(
@@ -452,6 +484,9 @@ test('two concurrent requests for the same message share one receipt', async () 
     )
     assert.equal((await first).result, 'success')
     assert.equal((await second).result, 'success')
+    // Re-checked after both settle: `waitForSends(1)` returns on the first send,
+    // so a second one could still have been in flight at the earlier assert.
+    assert.equal(sent.length, 1, 'the joined request must not send its own receipt')
 })
 
 test('rejects a mediaretry notification whose sealed payload is empty', () => {

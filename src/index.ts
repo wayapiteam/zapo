@@ -8,7 +8,10 @@ export type {
     WaDownloadMediaOptions,
     WaGroupHistoryBundleEvent,
     WaHistorySyncChunkEvent,
+    WaHistorySyncChunkRef,
+    WaHistorySyncItem,
     WaHistorySyncOptions,
+    WaHistorySyncSink,
     WaWriteBehindOptions
 } from '@client/types'
 export type { WaClientPluginContext, WaClientPluginDefinition } from '@client/plugins'
@@ -17,6 +20,7 @@ export type {
     WaMessageCoordinator,
     WaShareGroupHistoryInput,
     WaShareGroupHistoryResult,
+    WaSyncSignalSessionOptions,
     WaUploadMediaOptions,
     WaUploadMediaType
 } from '@client/coordinators/WaMessageCoordinator'
@@ -77,6 +81,7 @@ export type {
     WaOfflineThreadPreview,
     WaOfflineThreadReadWatermark,
     WaOutgoingMessageEvent,
+    WaOwnUsernameNotificationEvent,
     WaPictureEvent,
     WaPictureEventAction,
     WaPrivacyTokenUpdateEvent,
@@ -206,6 +211,7 @@ export type {
 export type {
     WaBlocklistResult,
     WaPrivacyDisallowedListResult,
+    WaPrivacyListEntry,
     WaPrivacySettings
 } from '@client/events/privacy'
 export type {
@@ -215,9 +221,11 @@ export type {
     WaProfileInfo,
     WaProfilePictureResult,
     WaProfileStatusResult,
+    WaResolveUsernameInput,
     WaSetTextStatusInput,
     WaSetUsernameInput,
     WaTextStatusResult,
+    WaUsernameLookupResult,
     WaUsernameResult
 } from '@client/coordinators/WaProfileCoordinator'
 export type { WaProfilePictureType } from '@transport/node/builders/profile'
@@ -290,7 +298,11 @@ export type {
     WaLinkPreviewThumbnailStream,
     WaLinkPreviewType
 } from '@message/addons/link-preview/types'
-export type { SignalLidSyncResult } from '@signal/api/SignalDeviceSyncApi'
+export type {
+    SignalLidSyncError,
+    SignalLidSyncResult,
+    SignalLidSyncStatus
+} from '@signal/api/SignalDeviceSyncApi'
 export type { WaAuthCredentials, WaVersionResolver } from '@auth/types'
 export type { WaShortcakeAssertionSigner } from '@auth/pairing/WaShortcakeFlow'
 export type { BinaryNode } from '@transport/types'

@@ -10,7 +10,8 @@ import type {
     WaSendPollVoteMessage,
     WaSendReactionMessage,
     WaSendRevokeMessage,
-    WaSendTextMessage
+    WaSendTextMessage,
+    WaSendTypedMessage
 } from '@message/types'
 import { proto, type Proto } from '@proto'
 import {
@@ -174,6 +175,21 @@ export function isSendEventResponseMessage(
     )
 }
 
+export function isSendTypedMessage(content: unknown): content is WaSendTypedMessage {
+    return (
+        isSendTextMessage(content) ||
+        isSendReactionMessage(content) ||
+        isSendRevokeMessage(content) ||
+        isSendPinMessage(content) ||
+        isSendKeepMessage(content) ||
+        isSendPollMessage(content) ||
+        isSendPollVoteMessage(content) ||
+        isSendEventMessage(content) ||
+        isSendEventResponseMessage(content) ||
+        isSendMediaMessage(content)
+    )
+}
+
 export function isSendAddonCryptoMessage(
     content: unknown
 ): content is WaSendPollVoteMessage | WaSendEventResponseMessage {
@@ -212,7 +228,10 @@ export function unwrapMessage(message: Proto.IMessage): Proto.IMessage {
             msg.deviceSentMessage?.message ??
             msg.viewOnceMessage?.message ??
             msg.viewOnceMessageV2?.message ??
-            msg.documentWithCaptionMessage?.message
+            msg.documentWithCaptionMessage?.message ??
+            msg.groupStatusMessage?.message ??
+            msg.groupStatusMessageV2?.message ??
+            msg.botForwardedMessage?.message
         if (!inner) return msg
         msg = inner
     }
@@ -270,6 +289,8 @@ function resolveMessageTypeAttrFrom(msg: Proto.IMessage): string {
         msg.pollResultSnapshotMessageV3 ||
         msg.templateButtonReplyMessage ||
         msg.messageHistoryNotice ||
+        msg.richResponseMessage ||
+        msg.botForwardedMessage ||
         msg.secretEncryptedMessage?.secretEncType ===
             proto.Message.SecretEncryptedMessage.SecretEncType.MESSAGE_EDIT ||
         msg.secretEncryptedMessage?.secretEncType ===
@@ -425,6 +446,7 @@ function resolveEncMediaTypeFrom(msg: Proto.IMessage): string | null {
     if (msg.groupInviteMessage) return WA_ENC_MEDIA_TYPES.URL
     if (msg.interactiveResponseMessage) return WA_ENC_MEDIA_TYPES.NATIVE_FLOW_RESPONSE
     if (msg.messageHistoryBundle) return WA_ENC_MEDIA_TYPES.GROUP_HISTORY
+    if (msg.albumMessage) return WA_ENC_MEDIA_TYPES.COLLECTION
     if (msg.extendedTextMessage?.matchedText && msg.extendedTextMessage.matchedText.trim() !== '') {
         return WA_ENC_MEDIA_TYPES.URL
     }
@@ -432,7 +454,12 @@ function resolveEncMediaTypeFrom(msg: Proto.IMessage): string | null {
 }
 
 /** Companion business node kind for list and native-flow messages. */
-export type WaButtonAddonKind = 'list' | 'interactive' | 'payment_info' | 'order_details'
+export type WaButtonAddonKind =
+    | 'list'
+    | 'interactive'
+    | 'payment_info'
+    | 'order_details'
+    | 'form_message'
 
 export function resolveButtonAddonKind(message: Proto.IMessage): WaButtonAddonKind | null {
     return resolveButtonAddonKindFrom(unwrapMessage(message))
@@ -444,6 +471,7 @@ function resolveNativeFlowAddonKind(
     const firstButtonName = nativeFlow.buttons?.[0]?.name
     if (firstButtonName === 'payment_info') return 'payment_info'
     if (firstButtonName === 'review_and_pay') return 'order_details'
+    if (firstButtonName === 'form_message') return 'form_message'
     return 'interactive'
 }
 

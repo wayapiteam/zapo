@@ -3,9 +3,9 @@ import {
     type PreKeyRecord,
     type SignalMetaRow,
     type SignalPreKeyRow
-} from 'zapo-js/signal'
-import type { WaPreKeyStore as WaPreKeyStoreContract } from 'zapo-js/store'
-import { asNumber, resolvePositive, toBoolOrUndef } from 'zapo-js/util'
+} from '@wayapiteam/zapo/signal'
+import type { WaPreKeyStore as WaPreKeyStoreContract } from '@wayapiteam/zapo/store'
+import { asNumber, resolvePositive, toBoolOrUndef } from '@wayapiteam/zapo/util'
 
 import { BaseSqliteStore } from './BaseSqliteStore'
 import type { WaSqliteConnection } from './connection'

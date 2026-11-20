@@ -16,7 +16,7 @@ import type { WaSignalStore } from '@store/contracts/signal.store'
 import { WaMobileTcpSocketCtor } from '@transport/node/WaMobileTcpSocket'
 import { buildMobileLoginPayload } from '@transport/noise/WaMobileClientPayload'
 import type { WaNoiseRootCa } from '@transport/noise/WaNoiseCert'
-import { toProxyAgent, toProxyDispatcher } from '@transport/proxy'
+import { assertTcpProxySupported, toProxyAgent, toProxyDispatcher } from '@transport/proxy'
 import type { WaCommsConfig } from '@transport/types'
 import { parseOptionalInt, toError } from '@util/primitives'
 
@@ -180,11 +180,7 @@ export async function buildCommsConfig(
     }
 
     if (effectiveMobileTransport) {
-        if (wsProxy) {
-            throw new Error(
-                'mobileTransport does not support socketOptions.proxy.ws – remove the proxy option or open an issue to add TCP proxy support'
-            )
-        }
+        assertTcpProxySupported(wsProxy)
         if (!loginIdentity) {
             throw new Error(
                 'mobileTransport requires registered credentials (meJid) – run the mobile bridge flow first'
@@ -209,6 +205,7 @@ export async function buildCommsConfig(
         return {
             url: effectiveMobileTransport.tcpUrl ?? 'tcp://g.whatsapp.net:443',
             rawWebSocketConstructor: WaMobileTcpSocketCtor,
+            agent: toProxyAgent(wsProxy),
             connectTimeoutMs: socketOptions.connectTimeoutMs,
             reconnectIntervalMs: socketOptions.reconnectIntervalMs,
             timeoutIntervalMs: socketOptions.timeoutIntervalMs,

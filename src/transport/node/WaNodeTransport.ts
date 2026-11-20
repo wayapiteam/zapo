@@ -57,21 +57,43 @@ export class WaNodeTransport extends EventEmitter {
         frame: Uint8Array,
         onNode: (node: BinaryNode) => Promise<void> | void
     ): Promise<void> {
+        const node = await this.decodeIncomingFrame(frame)
+        if (node) await onNode(node)
+    }
+
+    /**
+     * Decodes once before ordinary handler admission, preserving observation events.
+     * Returns `null` for stream-end, invalid input or a replaced connection. The optional
+     * generation predicate is rechecked after async decompression and before node events.
+     * Decode failures keep the existing logged `decode_error` behavior.
+     * @param frame Stanza payload after Noise decryption.
+     * @param isCurrent Optional connection-generation predicate for obsolete input.
+     * @param onDecodedByteLength Receives the expanded body size for queue accounting.
+     * @returns A decoded node, or `null` when dropped, invalid or obsolete.
+     */
+    public async decodeIncomingFrame(
+        frame: Uint8Array,
+        isCurrent?: () => boolean,
+        onDecodedByteLength?: (byteLength: number) => void
+    ): Promise<BinaryNode | null> {
+        if (isCurrent?.() === false) return null
         this.emit('frame_in', frame)
         let node: BinaryNode
         try {
-            node = await decodeBinaryNodeStanza(frame)
+            node = await decodeBinaryNodeStanza(frame, onDecodedByteLength)
         } catch (error) {
+            if (isCurrent?.() === false) return null
             const normalized = toError(error)
             if (normalized.message === 'stream end stanza is not a binary node') {
-                return
+                return null
             }
             this.logger.warn('failed to decode binary node frame', {
                 message: normalized.message
             })
             this.emit('decode_error', normalized, frame)
-            return
+            return null
         }
+        if (isCurrent?.() === false) return null
         this.emit('node_in', node, frame)
         this.logger.trace('node transport node in', {
             tag: node.tag,
@@ -79,7 +101,7 @@ export class WaNodeTransport extends EventEmitter {
             type: node.attrs.type,
             xml: this.shouldIncludeTraceXml() ? formatBinaryNodeAsXml(node) : undefined
         })
-        await onNode(node)
+        return node
     }
 
     private shouldIncludeTraceXml(): boolean {

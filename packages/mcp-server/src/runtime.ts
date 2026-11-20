@@ -13,8 +13,8 @@ import {
 } from 'zapo-js'
 import { hexToBytes, resolvePositive, toError } from 'zapo-js/util'
 
+import { createSqliteStore } from '@wayapiteam/zapo-store-sqlite'
 import { createMediaProcessor } from '@zapo-js/media-utils'
-import { createSqliteStore } from '@zapo-js/store-sqlite'
 import { wamPlugin } from '@zapo-js/wam'
 
 import { encodeForJson } from './serializer'

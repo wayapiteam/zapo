@@ -1,4 +1,4 @@
-import type { Logger } from 'zapo-js'
+import type { Logger } from '@wayapiteam/zapo'
 
 import type { WaSqliteConnection } from './connection'
 
@@ -462,6 +462,22 @@ const SQLITE_MIGRATIONS: readonly WaSqliteMigration[] = [
                 CREATE INDEX IF NOT EXISTS chat_metadata_cache_by_expiry
                     ON chat_metadata_cache (session_id, expires_at_ms);
             `)
+        }
+    },
+    {
+        id: '0020_mailbox_contacts_username',
+        domain: 'mailbox',
+        up: (db) => {
+            db.exec(`
+                ALTER TABLE mailbox_contacts ADD COLUMN username TEXT;
+            `)
+        }
+    },
+    {
+        id: '0021_auth_login_counter',
+        domain: 'auth',
+        up: (db) => {
+            db.exec('ALTER TABLE auth_credentials ADD COLUMN login_counter INTEGER')
         }
     }
 ]

@@ -96,14 +96,14 @@ Other important directories:
 - `examples/` runnable example scripts (can import `zapo-js` and `@zapo-js/*` by name)
 - `.github/workflows/ci.yml` lint + format + typecheck + build-core + typecheck-packages + per-provider tests (core, fake-server, media-utils, sqlite, mcp-server, mysql, postgres, redis, mongo) gated by an `all-checks` job
 - `.github/workflows/github-release.yml` auto-generates release notes when a `v*` tag is pushed (categories in `.github/release.yml`)
-- `.github/workflows/release.yml` publishes to npm on a `v*` tag via trusted publishing (OIDC, no `NPM_TOKEN`): core (`zapo-js`) through a guarded `npm publish`, add-ons (`@zapo-js/*`) through `changeset publish`
+- `.github/workflows/release.yml` publishes only `@wayapiteam/zapo` and `@wayapiteam/zapo-store-sqlite` to GitHub Packages with `GITHUB_TOKEN`. See `docs/fork-release.md`; it does not publish upstream-scoped add-ons.
 - `.github/workflows/pr-auto-label.yml` labels PRs from conventional-commit prefixes in the title
 - `.github/workflows/pr-validate-title.yml` enforces a conventional-commit PR title (`amannn/action-semantic-pull-request`)
 - `.changeset/` release management config (Changesets)
 
 ### Monorepo conventions
 
-- **Core** (`zapo-js`): published from the root. Build with `npm run build`.
+- **Fork core** (`@wayapiteam/zapo`): published from the root. Build with `npm run build`. SQLite is published from `packages/store-sqlite` as `@wayapiteam/zapo-store-sqlite`, with the fork core as peer. Other add-ons retain their upstream names for workspace compatibility and are not published by the fork release.
 - **Optional packages** (`@zapo-js/*`): live in `packages/<name>/`. Build all with `npx turbo run build`.
 - Optional packages declare `zapo-js` as a `peerDependency` – the end user installs core + the modules they want.
 - Each optional package extends `tsconfig.packages.json` (+ `tsconfig.build.paths.json`) and publishes with `"publishConfig": { "access": "public" }`.
@@ -221,8 +221,10 @@ import { toError } from '@util/primitives'
 Dynamic imports are reserved for optional runtime dependencies already implemented in the project:
 
 - `src/infra/log/PinoLogger.ts` (`pino`, `pino-pretty`)
-- `src/store/providers/sqlite/connection.ts` (`better-sqlite3`, `bun:sqlite`)
+- `packages/store-sqlite/src/connection.ts` (`better-sqlite3`, `bun:sqlite`, `node:sqlite`)
 - `src/transport/node/mex/argo-decoder.ts` (`argo-codec`)
+- `packages/voip-media/src/media/mlow-binding.ts` (`libmlow-wasm-fork`, an optional peer loaded when a call's media starts: a host carrying media installs it, signaling alone never needs it)
+- `packages/voip-media/src/node/peer-connection.ts` (`@roamhq/wrtc`, loaded on the first relay leg so a process that never dials does not load the native addon)
 
 Avoid introducing dynamic imports outside this pattern.
 
@@ -919,10 +921,10 @@ This project follows [Semantic Versioning](https://semver.org/). From `1.0.0` th
 
 ### Two version tracks
 
-Changesets tracks the optional packages **only**, not the core. The root `package.json` (`zapo-js`) is the workspace anchor, so `@manypkg`/Changesets exclude it from the releasable set – `npx changeset add` does not even list it.
+Changesets tracks the optional packages **only**, not the core. The root `package.json` (`@wayapiteam/zapo`) is the workspace anchor, so `@manypkg`/Changesets exclude it from the releasable set – `npx changeset add` does not even list it.
 
-- **Optional packages (`@zapo-js/*`)** – versioned with Changesets. Add a changeset in the PR that changes them: `npx changeset`, pick the packages and bump levels, write the summary. The file lands in `.changeset/`.
-- **Core (`zapo-js`)** – versioned by hand. Bump the root `version` directly with `npm version <patch|minor|major> --no-git-tag-version` (bumps the root only); Changesets never touches it. Its root `CHANGELOG.md` is likewise hand-maintained (see the release process below); `changeset version` only writes the add-on `packages/<name>/CHANGELOG.md` files, never the core's.
+- **Optional packages (`@zapo-js/*` and fork SQLite)** – versioned with Changesets. Add a changeset in the PR that changes them: `npx changeset`, pick the packages and bump levels, write the summary. The file lands in `.changeset/`.
+- **Core (`@wayapiteam/zapo`)** – versioned by hand. Bump the root `version` directly with `npm version <patch|minor|major> --no-git-tag-version` (bumps the root only); Changesets never touches it. Its root `CHANGELOG.md` is likewise hand-maintained (see the release process below); `changeset version` only writes the add-on `packages/<name>/CHANGELOG.md` files, never the core's.
 
 ### Release process (on `master`, before pushing the tag)
 
@@ -940,9 +942,15 @@ Changesets tracks the optional packages **only**, not the core. The root `packag
 6. Commit everything as one release commit: `chore: release vX.Y.Z`, where `X.Y.Z` is the core version. One commit carries the core version bump, the `CHANGELOG.md` entry, and the add-on changeset bumps together.
 7. Tag with the core version and push it: `git tag vX.Y.Z && git push && git push origin vX.Y.Z`.
 
-Pushing the `v*` tag triggers `.github/workflows/release.yml`, which publishes via npm trusted publishing (OIDC, no `NPM_TOKEN`): the core through a guarded `npm publish` (skipped when its version is already on the registry) and the add-ons through `changeset publish` (only the `@zapo-js/*` whose version is not yet on npm). `.github/workflows/github-release.yml` creates the GitHub Release from the same tag, with notes auto-generated from merged PRs (categories in `.github/release.yml`) – these are separate from, and not a replacement for, the hand-written root `CHANGELOG.md` from step 5.
-
-Every published package must be registered as a trusted publisher on npmjs.com (repo `vinikjkkj/zapo`, workflow `release.yml`) before its first CI publish. A brand new package name cannot be pre-configured – publish it once manually, then switch to trusted publishing.
+Pushing a `v*` tag triggers `.github/workflows/release.yml`. The fork release publishes
+only `@wayapiteam/zapo` and `@wayapiteam/zapo-store-sqlite` to GitHub Packages using
+`GITHUB_TOKEN` with `packages: write`. The publisher reads names and versions from their
+manifests, skips existing versions and aborts registry errors other than `E404`.
+Both packages link to `wayapiteam/zapo`; no upstream package is published. SQLite remains
+an independent package in this monorepo and declares the fork core as its peer.
+See [fork release](docs/fork-release.md) for publication, consumer access and tarball tests.
+Upstream add-on changesets can remain pending until their fork distribution is explicitly
+scoped; do not run a broad publisher against upstream namespaces.
 
 ### Core major bumps and peer ranges
 

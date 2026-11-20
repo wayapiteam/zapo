@@ -1,4 +1,4 @@
-import type { Logger } from 'zapo-js'
+import type { Logger } from '@wayapiteam/zapo'
 
 import { type NonPromise, openSqliteConnection, type WaSqliteConnection } from './connection'
 import { ensureSqliteMigrations, type WaSqliteMigrationDomain } from './migrations'

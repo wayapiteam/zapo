@@ -133,7 +133,8 @@ export const WA_ENC_MEDIA_TYPES = Object.freeze({
     ORDER: 'order',
     PRODUCT: 'product',
     NATIVE_FLOW_RESPONSE: 'native_flow_response',
-    GROUP_HISTORY: 'group_history'
+    GROUP_HISTORY: 'group_history',
+    COLLECTION: 'collection'
 } as const)
 
 /**

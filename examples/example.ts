@@ -1,7 +1,7 @@
 import { mkdir, rm } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 
-import { createSqliteStore } from '@zapo-js/store-sqlite'
+import { createSqliteStore } from '@wayapiteam/zapo-store-sqlite'
 
 import { createPinoLogger, createStore, type LogLevel, WaClient } from '../src'
 

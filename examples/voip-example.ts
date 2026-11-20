@@ -37,7 +37,7 @@ import { dirname, resolve } from 'node:path'
 
 import { createPinoLogger, createStore, type LogLevel, WaClient } from 'zapo-js'
 
-import { createSqliteStore } from '@zapo-js/store-sqlite'
+import { createSqliteStore } from '@wayapiteam/zapo-store-sqlite'
 import { CallState, EndCallReason, voipPlugin } from '@zapo-js/voip'
 
 const SAMPLE_RATE = 16_000

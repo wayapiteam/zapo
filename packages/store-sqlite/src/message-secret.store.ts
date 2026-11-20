@@ -1,5 +1,5 @@
-import type { WaMessageSecretEntry, WaMessageSecretStore } from 'zapo-js/store'
-import { asBytes, asNumber, asString } from 'zapo-js/util'
+import type { WaMessageSecretEntry, WaMessageSecretStore } from '@wayapiteam/zapo/store'
+import { asBytes, asNumber, asString } from '@wayapiteam/zapo/util'
 
 import { BaseSqliteStore } from './BaseSqliteStore'
 import type { WaSqliteConnection } from './connection'

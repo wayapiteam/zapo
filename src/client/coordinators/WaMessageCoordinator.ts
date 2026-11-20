@@ -177,6 +177,14 @@ export interface WaRequestHistorySyncInput {
     readonly count?: number
 }
 
+/** Options for {@link WaMessageCoordinator.syncSignalSession}. */
+export interface WaSyncSignalSessionOptions {
+    /** Drops the session, keeping the identity, and fetches a fresh one. */
+    readonly force?: boolean
+    /** The identity changed: drops the session and fetches with `reason="identity"`. */
+    readonly reasonIdentity?: boolean
+}
+
 export interface WaReachoutTimelock {
     readonly isActive: boolean
     readonly enforcementType: string | null
@@ -564,13 +572,23 @@ export class WaMessageCoordinator {
     }
 
     /**
-     * Force-refreshes the Signal session(s) for `jid`. Set `reasonIdentity` to
-     * `true` when the trigger was an identity change – this also queues a
-     * trusted-contact-token reissue.
+     * Syncs the Signal session of the device `jid` resolves to (a user JID is
+     * device 0). With no options it only ensures a session exists. `force`
+     * rebuilds it, keeping the identity. `reasonIdentity` rebuilds it as an
+     * identity change and reissues the trusted-contact token; it wins over
+     * `force`. Throws for group JIDs and when the key-bundle fetch fails, in
+     * which case the old session is already gone.
      */
-    public async syncSignalSession(jid: string, reasonIdentity = false): Promise<void> {
-        await this.messageDispatch.syncSignalSession(jid, reasonIdentity)
-        if (reasonIdentity) {
+    public syncSignalSession(jid: string, options?: WaSyncSignalSessionOptions): Promise<void>
+    /** @deprecated Pass `{ reasonIdentity: true }` instead. */
+    public syncSignalSession(jid: string, reasonIdentity: boolean): Promise<void>
+    public async syncSignalSession(
+        jid: string,
+        options: boolean | WaSyncSignalSessionOptions = {}
+    ): Promise<void> {
+        const normalized = typeof options === 'boolean' ? { reasonIdentity: options } : options
+        await this.messageDispatch.syncSignalSession(jid, normalized)
+        if (normalized.reasonIdentity) {
             this.trustedContactToken.reissueOnIdentityChange(jid).catch((err) =>
                 this.logger.warn('tc token reissue on identity change failed', {
                     jid,
@@ -816,10 +834,17 @@ export class WaMessageCoordinator {
      * the sealed request and resolves once the server answers with a
      * `mediaretry` notification, usually within a couple of seconds.
      *
-     * On `result: 'success'` only the `directPath` changes - the media key,
-     * hashes, and length of the original message stay valid, so patch the path
-     * into the message and download again. A second call for a message already
-     * in flight joins the first request instead of sending another receipt.
+     * On `result: 'success'` the media key, hashes, and length of the original
+     * message normally stay valid, so patch the fresh `directPath` into the
+     * message and download again. A second call for a message already in
+     * flight joins the first request instead of sending another receipt.
+     *
+     * A `success` is not a guarantee that the original key still opens the
+     * blob. Some primaries re-encrypt the file on every re-upload, and the
+     * re-served bytes then fail `fileEncSha256` and make `downloadBytes()`
+     * throw a MAC mismatch. Nothing in the round-trip carries key material for
+     * the new ciphertext, so the message cannot be recovered through this API
+     * and requesting another reupload will not help.
      *
      * The other three `result` values are answers too, not thrown errors:
      * `not_found` means the sender no longer holds the file and nothing can
